@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -57,6 +58,9 @@ func loadConfig(path string) (Config, error) {
 	if err := dec.Decode(&cfg); err != nil {
 		return cfg, fmt.Errorf("config file %s: %w", path, err)
 	}
+	if dec.Decode(&struct{}{}) != io.EOF {
+		return cfg, fmt.Errorf("config file %s: unexpected data after the JSON object", path)
+	}
 	if cfg.Priority != "" && cfg.Priority != "default" && cfg.Priority != "high" {
 		return cfg, fmt.Errorf(`config file %s: priority must be "default" or "high"`, path)
 	}
@@ -73,11 +77,16 @@ func loadConfig(path string) (Config, error) {
 }
 
 // saveConfig writes cfg to path, readable only by its owner. It replaces the
-// file atomically, so a failed write never leaves half a config behind.
+// file atomically and durably, so a failed write or a crash never leaves half
+// a config (or a lost token) behind. A symlinked config (from a dotfile
+// manager, say) is written through, not replaced.
 func saveConfig(path string, cfg Config) error {
 	raw, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
+	}
+	if target, err := filepath.EvalSymlinks(path); err == nil {
+		path = target
 	}
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -92,8 +101,19 @@ func saveConfig(path string, cfg Config) error {
 		f.Close()
 		return err
 	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(f.Name(), path)
+	if err := os.Rename(f.Name(), path); err != nil {
+		return err
+	}
+	if d, err := os.Open(dir); err == nil {
+		d.Sync() // best effort: not every platform syncs directories
+		d.Close()
+	}
+	return nil
 }

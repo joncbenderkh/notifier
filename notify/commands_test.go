@@ -164,16 +164,20 @@ func TestSignupSavesTheToken(t *testing.T) {
 	f := newFakeAPI(t, map[string]any{
 		"POST /v1/users": Signup{UserID: "usr_carol", Name: "carol", Token: "nu_carol"},
 	})
-	path := useConfig(t, &Config{Channels: []string{"ci"}}, 0o600)
+	// The previous account's key and targets must not outlive it.
+	path := useConfig(t, &Config{APIKey: "nk_old", Channels: []string{"ci"}, Priority: "high"}, 0o600)
 	code, stdout, stderr := f.run("signup", "0Z5H-QCEA-3JX4", "carol")
-	if code != 0 || !strings.Contains(stdout, "usr_carol") || strings.Contains(stdout+stderr, "nu_carol") {
+	if code != 0 || !strings.Contains(stdout, "usr_carol") || strings.Contains(stdout+stderr, "nu_carol") ||
+		!strings.Contains(stderr, "removed the previous account's") {
 		t.Fatalf("exit %d, stdout %q, stderr %q", code, stdout, stderr)
 	}
 	if got := f.got[0]; got.Auth != "" || got.Body["invite"] != "0Z5H-QCEA-3JX4" || got.Body["name"] != "carol" {
 		t.Fatalf("got %+v", got)
 	}
 	cfg, err := loadConfig(path)
-	if err != nil || cfg.Token != "nu_carol" || cfg.URL != f.URL || cfg.Channels[0] != "ci" {
+	want := Config{URL: f.URL, Token: "nu_carol", Priority: "high"}
+	if err != nil || cfg.URL != want.URL || cfg.Token != want.Token || cfg.Priority != want.Priority ||
+		cfg.APIKey != "" || len(cfg.Channels) != 0 {
 		t.Fatalf("config %+v, %v", cfg, err)
 	}
 	// A second sign-up would lose the first token.
@@ -277,5 +281,103 @@ func TestSubcommandsNeedTheUserToken(t *testing.T) {
 	}
 	if len(f.got) != 0 {
 		t.Fatalf("sent %v", f.routesCalled())
+	}
+}
+
+func TestAmbiguousChannelNamesNeedAnID(t *testing.T) {
+	// Owner names are not unique, so two joined channels can look alike.
+	f := newFakeAPI(t, map[string]any{
+		"GET /v1/channels": []Channel{
+			{ID: "ch_1", Name: "alice/alerts"}, {ID: "ch_2", Name: "alice/alerts"}, {ID: "ch_mine", Name: "mine", Owned: true},
+		},
+		"GET /v1/user": User{ID: "usr_me"},
+		"DELETE /v1/channels/ch_2/members/usr_me": nil,
+	})
+	if code, _, stderr := f.run("-token", testToken, "channel", "leave", "alice/alerts"); code != exitError ||
+		!strings.Contains(stderr, "use an ID") {
+		t.Fatalf("exit %d, stderr %q", code, stderr)
+	}
+	if code, _, stderr := f.run("-token", testToken, "channel", "leave", "ch_2"); code != 0 {
+		t.Fatalf("leave by ID: exit %d, %s", code, stderr)
+	}
+	if code, _, stderr := f.run("-token", testToken, "channel", "leave", "mine"); code != exitError ||
+		!strings.Contains(stderr, "channel delete") {
+		t.Fatalf("leave own: exit %d, stderr %q", code, stderr)
+	}
+}
+
+func TestSubcommandWordsStayTitlesUnlessShapedLikeCommands(t *testing.T) {
+	f := newFakeAPI(t, map[string]any{"POST /v1/notifications": sent})
+	// A lone argument-taking word, or a no-argument word with a body, is a message.
+	for _, args := range [][]string{{"channel"}, {"signup"}, {"invite", "sent"}, {"keys", "rotated"}} {
+		if code, _, stderr := f.run(append([]string{"-key", testKey}, args...)...); code != 0 {
+			t.Errorf("%v: exit %d, %s", args, code, stderr)
+		}
+	}
+	// An argument-taking word with a body could be either: refuse to guess.
+	if code, _, _ := f.run("-key", testKey, "channel", "busy"); code != exitUsage {
+		t.Errorf("channel busy: exit %d", code)
+	}
+	if len(f.got) != 4 {
+		t.Fatalf("sent %v", f.routesCalled())
+	}
+}
+
+func TestLegacyAdminTokenIsNeverSentUnlessAUserToken(t *testing.T) {
+	f := newFakeAPI(t, map[string]any{"POST /v1/notifications": sent})
+	useConfig(t, &Config{URL: f.URL, APIKey: "nk_file"}, 0o600)
+	t.Setenv("NOTIFIER_ADMIN_TOKEN", "operator-secret-operator-secret-operator")
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"Hi"}, strings.NewReader(""), &stdout, &stderr, nil); code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr.String())
+	}
+	if f.got[0].Auth != "Bearer nk_file" || !strings.Contains(stderr.String(), "ignoring NOTIFIER_ADMIN_TOKEN") {
+		t.Fatalf("auth %q, stderr %q", f.got[0].Auth, stderr.String())
+	}
+}
+
+func TestHighFalseOverridesConfigPriority(t *testing.T) {
+	f := newFakeAPI(t, map[string]any{"POST /v1/notifications": sent})
+	useConfig(t, &Config{URL: f.URL, APIKey: "nk_file", Priority: "high"}, 0o600)
+	var stdout, stderr bytes.Buffer
+	run([]string{"-high=false", "Hi"}, strings.NewReader(""), &stdout, &stderr, nil)
+	if p, _ := f.got[0].Body["priority"].(string); p == "high" {
+		t.Fatalf("priority %q", p)
+	}
+}
+
+func TestConfigRejectsTrailingDataButInitCanReplaceIt(t *testing.T) {
+	path := useConfig(t, nil, 0)
+	os.MkdirAll(filepath.Dir(path), 0o700)
+	os.WriteFile(path, []byte(`{"url": "https://example.com"} {"api_key": "nk_x"}`), 0o600)
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"Hi"}, strings.NewReader(""), &stdout, &stderr, nil); code != exitUsage ||
+		!strings.Contains(stderr.String(), "after the JSON object") {
+		t.Fatalf("exit %d, stderr %q", code, stderr.String())
+	}
+	args := []string{"-url", "https://example.com", "config", "init", "-force"}
+	if code := run(args, strings.NewReader(""), &stdout, &stderr, nil); code != 0 {
+		t.Fatalf("init -force: exit %d, %s", code, stderr.String())
+	}
+	if _, err := loadConfig(path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSaveConfigWritesThroughSymlinks(t *testing.T) {
+	dir := t.TempDir()
+	real, link := filepath.Join(dir, "dotfiles.json"), filepath.Join(dir, "config.json")
+	os.WriteFile(real, []byte("{}"), 0o600)
+	if err := os.Symlink(real, link); err != nil {
+		t.Skip(err)
+	}
+	if err := saveConfig(link, Config{URL: "https://example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Lstat(link); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("link replaced: %v, %v", info, err)
+	}
+	if cfg, err := loadConfig(real); err != nil || cfg.URL != "https://example.com" {
+		t.Fatalf("config %+v, %v", cfg, err)
 	}
 }

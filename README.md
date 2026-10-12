@@ -218,8 +218,9 @@ Settings come from flags, then the environment (`NOTIFIER_URL`,
 `~/.config/notifier/config.json` (`$XDG_CONFIG_HOME` is honoured, and
 `$NOTIFIER_CONFIG` names another file). Sending uses an API key if one is
 set at the highest level that sets any credential, else the user token.
-`NOTIFIER_ADMIN_TOKEN` is still read as a user token, the name `notify pair`
-used before users existed.
+`NOTIFIER_ADMIN_TOKEN`, the name `notify pair` used before users existed,
+is still read as a user token (with a warning), but only when it holds one
+(`nu_...`); an operator token there is ignored, never sent.
 
 ```json
 {
@@ -234,7 +235,9 @@ used before users existed.
 
 Every field is optional and unknown ones are rejected. A file holding a
 token or key must be readable only by you (`chmod 600`); `notify signup` and
-`notify config init` write it that way. The desktop daemon (#7) will read
+`notify config init` write it that way. `notify signup` replaces the
+previous account's `api_key`, `to` and `channels`, which belong to that
+account. The desktop daemon (#7) will read
 the same file.
 
 A new user's whole setup, with an invite from the operator or another user:
@@ -248,9 +251,13 @@ notify -c homelab "disk full"
 ```
 
 Flags must come before TITLE or the subcommand; everything from TITLE on is
-message text, so a body taken from a variable can never act as a flag. Put
-`--` before a title that starts with `-` or is a subcommand name (`devices`,
-`pair`, `channel`, …).
+message text, so a body taken from a variable can never act as a flag. A
+subcommand word counts only in a command's shape: `devices`, `pair`,
+`invite`, `keys`, `channels` and `version` alone, and `signup`, `config`,
+`key` and `channel` with arguments; so `notify channel` sends a message,
+while `notify channel "$BODY"` is refused rather than guessed. Put `--`
+before a title that starts with `-` or is meant as a message in one of
+those shapes.
 
 A `BODY` of `-` reads standard input, so a long job can report when it
 finishes: `make test 2>&1 | tail -5 | notify "Tests" -`. Only the last 8 KiB

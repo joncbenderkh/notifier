@@ -41,13 +41,18 @@ See `README.md` for the user-facing setup and API table.
   ANSI colours so it scans on dark terminals too. `-to` accepts names or IDs;
   names resolve through `GET /v1/devices`, which API keys may call.
   Settings: flags > env (`NOTIFIER_URL`, `NOTIFIER_API_KEY`,
-  `NOTIFIER_TOKEN`; `NOTIFIER_ADMIN_TOKEN` as a legacy alias) > JSON config
+  `NOTIFIER_TOKEN`; `NOTIFIER_ADMIN_TOKEN` as a legacy alias, honoured only
+  when it starts with `nu_`, since it once held the operator secret) > JSON config
   at `$XDG_CONFIG_HOME/notifier/config.json` (issue #8; the daemon of #7
   shares it). Unknown fields are rejected, and a file with credentials must
   be 0600; writes are atomic and 0600. Flags default to empty and resolve
   after parsing, so `-h` never prints a secret. Sending uses the API key or
   user token from the highest level that sets one; other commands need the
-  user token. Subcommand flags come before their arguments.
+  user token. Subcommand flags come before their arguments. Subcommand
+  words are reserved only in a command's shape (no-argument commands alone,
+  the rest with arguments), so scripts sending arbitrary titles keep
+  working. Sign-up rewrites the config with only the new account's
+  settings.
 - **QR pairing:** the link is `notifier://pair?server=<origin>&code=<code>`,
   built by `server/src/pairing.ts` and parsed by Android's `PairingLink.kt`
   (keep them in step). The Worker's `/pair` page (`src/pairPage.ts`) is

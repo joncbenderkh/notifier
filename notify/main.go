@@ -91,10 +91,22 @@ Flags:
 `
 
 // subcommands are the words that start a command instead of a title,
-// unless they come after "--".
+// unless they come after "--". Those that take no arguments (false) count
+// only alone, so `notify "$TITLE"` stays a message for any other title; the
+// others need arguments, so `notify "$TITLE" "$BODY"` with such a title fails
+// with a usage error instead of acting.
 var subcommands = map[string]bool{
-	"version": true, "config": true, "signup": true, "invite": true, "devices": true, "pair": true,
-	"keys": true, "key": true, "channels": true, "channel": true,
+	"version": false, "invite": false, "devices": false, "pair": false, "keys": false, "channels": false,
+	"config": true, "signup": true, "key": true, "channel": true,
+}
+
+// isSubcommand reports whether rest starts a command rather than a message.
+func isSubcommand(rest []string) bool {
+	if len(rest) == 0 {
+		return false
+	}
+	takesArgs, ok := subcommands[rest[0]]
+	return ok && (len(rest) == 1) != takesArgs
 }
 
 // cli holds what every command needs: resolved settings and the outputs.
@@ -137,7 +149,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, transport htt
 	}
 	rest := fs.Args()
 	cmd := ""
-	if !endedByDoubleDash(fs, args, rest) && len(rest) > 0 && subcommands[rest[0]] {
+	if !endedByDoubleDash(fs, args, rest) && isSubcommand(rest) {
 		cmd, rest = rest[0], rest[1:]
 	}
 	if cmd == "version" {
@@ -147,7 +159,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, transport htt
 
 	c := &cli{stdin: stdin, stdout: stdout, stderr: stderr, transport: transport, timeout: *timeout}
 	var err error
-	if c.configPath, err = configPath(); err == nil {
+	// `config init` replaces the file, so it must work on one it cannot read.
+	if c.configPath, err = configPath(); err == nil && cmd != "config" {
 		c.config, err = loadConfig(c.configPath)
 	}
 	if err != nil {
@@ -156,8 +169,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, transport htt
 	}
 	cfg := c.config
 	c.url = first(*urlFlag, os.Getenv("NOTIFIER_URL"), cfg.URL)
-	// NOTIFIER_ADMIN_TOKEN is what `notify pair` read before users existed.
-	envToken := first(os.Getenv("NOTIFIER_TOKEN"), os.Getenv("NOTIFIER_ADMIN_TOKEN"))
+	envToken := first(os.Getenv("NOTIFIER_TOKEN"), legacyToken(stderr))
 	c.givenToken = first(*tokenFlag, envToken)
 	c.givenKey = first(*keyFlag, os.Getenv("NOTIFIER_API_KEY"))
 	c.token = first(c.givenToken, cfg.Token)
@@ -203,11 +215,31 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, transport htt
 		to, channels = cfg.To, cfg.Channels
 	}
 	n := Notification{Title: fitTitle(rest[0]), Channels: channels}
-	if *high || cfg.Priority == "high" {
+	highSet := false
+	fs.Visit(func(f *flag.Flag) { highSet = highSet || f.Name == "high" })
+	if *high || !highSet && cfg.Priority == "high" {
 		n.Priority = "high"
 	}
 	return c.send(n, to, rest[1:])
 }
+
+// legacyToken is NOTIFIER_ADMIN_TOKEN, which `notify pair` read before users
+// existed, when it holds a user token. It used to hold the operator's
+// ADMIN_TOKEN, which must never be sent as a user's credential.
+func legacyToken(stderr io.Writer) string {
+	v := os.Getenv("NOTIFIER_ADMIN_TOKEN")
+	if v == "" || os.Getenv("NOTIFIER_TOKEN") != "" {
+		return ""
+	}
+	if !strings.HasPrefix(v, userTokenPrefix) {
+		fmt.Fprintln(stderr, "notify: ignoring NOTIFIER_ADMIN_TOKEN, which is not a user token; set NOTIFIER_TOKEN")
+		return ""
+	}
+	fmt.Fprintln(stderr, "notify: NOTIFIER_ADMIN_TOKEN is deprecated; rename it to NOTIFIER_TOKEN")
+	return v
+}
+
+const userTokenPrefix = "nu_"
 
 // first returns the first non-empty value.
 func first(values ...string) string {

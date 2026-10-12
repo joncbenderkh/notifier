@@ -90,14 +90,17 @@ func (c *cli) signup(argv []string) int {
 	if err != nil {
 		return fail(c.stderr, err, "invite")
 	}
-	cfg := c.config
-	cfg.URL, cfg.Token = c.url, s.Token
+	// The old key and targets belong to the previous account (or server).
+	cfg := Config{URL: c.url, Token: s.Token, Priority: c.config.Priority}
 	if err := saveConfig(c.configPath, cfg); err != nil {
 		// The token exists only in this response: never lose it.
 		fmt.Fprintf(c.stderr, "notify: could not save the token: %v\nYour token (shown once): %s\n", err, s.Token)
 		return exitError
 	}
 	fmt.Fprintf(c.stdout, "Signed up as %s (%s); token saved to %s\n", s.Name, s.UserID, c.configPath)
+	if c.config.APIKey != "" || len(c.config.To) > 0 || len(c.config.Channels) > 0 {
+		fmt.Fprintln(c.stderr, "notify: removed the previous account's api_key, to and channels from the config file")
+	}
 	return 0
 }
 
@@ -363,6 +366,10 @@ func (c *cli) channel(argv []string) int {
 			w.Flush()
 		}
 	case "leave":
+		if ch.Owned {
+			fmt.Fprintf(c.stderr, "notify: you own %s; delete it instead (`notify channel delete %s`)\n", ch.Name, ch.Name)
+			return exitError
+		}
 		var me User
 		if me, err = client.Me(ctx); err == nil {
 			if err = client.RemoveMember(ctx, ch.ID, me.ID); err == nil {
@@ -400,17 +407,29 @@ func (c *cli) findChannel(ctx context.Context, client *Client, sel string, owned
 	if err != nil {
 		return Channel{}, fail(c.stderr, err, "user token")
 	}
+	// Owner names are not unique, so two joined channels can share a label.
+	var matches []Channel
 	for _, ch := range channels {
-		if ch.ID == sel || ch.Name == sel {
-			if owned && !ch.Owned {
-				fmt.Fprintf(c.stderr, "notify: %s is not your channel\n", ch.Name)
-				return Channel{}, exitError
-			}
-			return ch, 0
+		if ch.ID == sel {
+			matches = []Channel{ch}
+			break
+		}
+		if ch.Name == sel {
+			matches = append(matches, ch)
 		}
 	}
-	fmt.Fprintf(c.stderr, "notify: no channel %q (see `notify channels`)\n", sel)
-	return Channel{}, exitError
+	switch {
+	case len(matches) == 0:
+		fmt.Fprintf(c.stderr, "notify: no channel %q (see `notify channels`)\n", sel)
+		return Channel{}, exitError
+	case len(matches) > 1:
+		fmt.Fprintf(c.stderr, "notify: %d channels are named %q; use an ID from `notify channels`\n", len(matches), sel)
+		return Channel{}, exitError
+	case owned && !matches[0].Owned:
+		fmt.Fprintf(c.stderr, "notify: %s is not your channel\n", matches[0].Name)
+		return Channel{}, exitError
+	}
+	return matches[0], 0
 }
 
 func table(w io.Writer, header string) *tabwriter.Writer {
