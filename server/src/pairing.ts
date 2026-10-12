@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // The links a phone scans: notifier://pair?server=<origin>&code=<code> to
 // pair, and notifier://join?... to join a channel. The Android app parses
-// pair links (PairingLink.kt); join links are not handled there yet.
+// both (NotifierLink.kt).
 
 import { renderSVG } from "uqr";
 

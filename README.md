@@ -180,6 +180,11 @@ curl -X POST $S/v1/notifications -H "$T" -d '{"title": "disk full", "channels": 
 - **The payload:** each delivered message carries the channel it came
   through, named as the receiving user sees it (`homelab`, or
   `alice/homelab` for a channel joined from Alice).
+- **In the app:** the paired screen lists the channels you belong to, with a
+  switch each (`default` is always on), and joins a channel by scanning an
+  invite's QR code, opening its `notifier://join` link (it asks first), or
+  typing the code. Each channel other than `default` gets its own group in
+  Android's notification settings, so it can be muted or given a sound.
 
 ## `notify` CLI
 
