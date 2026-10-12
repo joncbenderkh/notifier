@@ -17,6 +17,9 @@ data class Payload(
     val body: String = "",
     val priority: String = "default",
     @SerialName("sent_at") val sentAt: Long,
+    /** The channel it came through, as this user names it ("homelab", "alice/homelab"). */
+    val channel: String? = null,
+    @SerialName("channel_id") val channelId: String? = null,
 )
 
 /**

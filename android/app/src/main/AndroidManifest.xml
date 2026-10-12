@@ -25,14 +25,18 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-            <!-- Pairing QR codes encode notifier://pair?server=...&code=...;
-                 opening one only pre-fills the form, it never pairs by itself. -->
+            <!-- QR codes encode notifier://pair?server=...&code=... (pairing) and
+                 notifier://join?... (channel invites). Opening one never acts by
+                 itself: a pair link pre-fills the form, a join link asks first. -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data
                     android:host="pair"
+                    android:scheme="notifier" />
+                <data
+                    android:host="join"
                     android:scheme="notifier" />
             </intent-filter>
         </activity>

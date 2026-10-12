@@ -53,15 +53,24 @@ See `README.md` for the user-facing setup and API table.
   the rest with arguments), so scripts sending arbitrary titles keep
   working. Sign-up rewrites the config with only the new account's
   settings.
-- **QR pairing:** the link is `notifier://pair?server=<origin>&code=<code>`,
-  built by `server/src/pairing.ts` and parsed by Android's `PairingLink.kt`
-  (keep them in step). The Worker's `/pair` page (`src/pairPage.ts`) is
+- **QR pairing:** the link is `notifier://pair?server=<origin>&code=<code>`
+  (and `notifier://join?...` for a channel invite), built by
+  `server/src/pairing.ts` and parsed by Android's `NotifierLink.kt` (keep
+  them in step). The Worker's `/pair` page (`src/pairPage.ts`) is
   static and secret-free under a strict CSP (no inline script or style);
   the user pastes their token, which never leaves page memory. The
   app scans with Google's code scanner (`play-services-code-scanner`; no
   camera permission) and also handles the link as a deep link. Either way
   it only pre-fills the form — never pair without the user tapping Pair, or
-  a hostile QR code could silently point the phone at another server.
+  a hostile QR code could silently point the phone at another server. A
+  join link likewise asks before joining, and only for the paired server.
+- **Android channels:** each Notifier channel except the user's `default`
+  gets an Android `NotificationChannelGroup` (`ch:<channel id>`) holding
+  `<channel id>` and `<channel id>.high`, created on first message, so it
+  can be muted or given a sound in system settings; `default` and direct
+  sends keep the original `default`/`high` channels (`push/ChannelRoute.kt`).
+  Keyed by channel ID, never the label, which is not unique. Loading the
+  channel list deletes groups of channels the user no longer belongs to.
 - **Android stack:** Kotlin + Jetpack Compose, AGP 9 with built-in Kotlin
   (no `org.jetbrains.kotlin.android` plugin), Gradle Kotlin DSL with a version
   catalog. `minSdk = 26`, `compileSdk = 37.2`, `targetSdk = 37`. OkHttp +
@@ -161,9 +170,10 @@ See `README.md` for the user-facing setup and API table.
   `commands_test.go` run it against `httptest` servers; `TestMain` clears
   `NOTIFIER_*` and points `NOTIFIER_CONFIG` at a missing file.
 - `android/app/src/main/java/com/joncbenderkh/notifier/`
-  - `data/` — `PairingStore`, `ServerClient` (blocking; callers pick the thread).
-  - `push/` — `PushService` (FCM), `SealedMessage` (pure JVM, unit-tested),
-    `Notifications` (channels `default` and `high`).
+  - `data/` — `PairingStore`, `ServerClient` (blocking; callers pick the
+    thread), `NotifierLink` (pure JVM, unit-tested).
+  - `push/` — `PushService` (FCM), `SealedMessage` and `ChannelRoute` (pure
+    JVM, unit-tested), `Notifications` (Android channels and groups).
   - `ui/` — `MainViewModel`, `NotifierScreen`, theme.
 
 ## Commands

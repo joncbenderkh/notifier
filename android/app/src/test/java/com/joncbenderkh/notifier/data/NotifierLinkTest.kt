@@ -5,29 +5,29 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
 
-class PairingLinkTest {
+class NotifierLinkTest {
     @Test
     fun parsesTheServerFormat() {
         // Exactly what server/src/pairing.ts produces.
-        val link = PairingLink.parse(
+        val link = NotifierLink.parse(
             "notifier://pair?server=https%3A%2F%2Fnotifier.joncbender.workers.dev&code=7KQ2-MX9D",
             allowHttp = false,
         )
-        assertEquals(PairingLink("https://notifier.joncbender.workers.dev", "7KQ2-MX9D"), link)
+        assertEquals(NotifierLink.Pair("https://notifier.joncbender.workers.dev", "7KQ2-MX9D"), link)
     }
 
     @Test
     fun allowsHttpOnlyWhenPermitted() {
         val raw = "notifier://pair?server=http%3A%2F%2F127.0.0.1%3A8788&code=82VN-45JA"
-        assertNull(PairingLink.parse(raw, allowHttp = false))
-        assertEquals(PairingLink("http://127.0.0.1:8788", "82VN-45JA"), PairingLink.parse(raw, allowHttp = true))
+        assertNull(NotifierLink.parse(raw, allowHttp = false))
+        assertEquals(NotifierLink.Pair("http://127.0.0.1:8788", "82VN-45JA"), NotifierLink.parse(raw, allowHttp = true))
     }
 
     @Test
     fun normalizesTheOrigin() {
         assertEquals(
-            PairingLink("https://x.dev:8443", "A"),
-            PairingLink.parse("notifier://pair?server=HTTPS%3A%2F%2FX.dev%3A8443%2F&code=A", allowHttp = false),
+            NotifierLink.Pair("https://x.dev:8443", "A"),
+            NotifierLink.parse("notifier://pair?server=HTTPS%3A%2F%2FX.dev%3A8443%2F&code=A", allowHttp = false),
         )
     }
 
@@ -36,6 +36,7 @@ class PairingLinkTest {
         for (raw in listOf(
             "https://notifier.joncbender.workers.dev",
             "notifier://unpair?server=https%3A%2F%2Fx.dev&code=A",
+            "notifier://join?server=https%3A%2F%2Fx.dev%2Fpath&code=A",
             "notifier://pair?server=https%3A%2F%2Fx.dev",
             "notifier://pair?code=7KQ2-MX9D",
             "notifier://pair?server=ftp%3A%2F%2Fx.dev&code=A",
@@ -49,7 +50,28 @@ class PairingLinkTest {
             "notifier://pair?server=https%3A%2F%2F%40x.dev&code=A",
             "notifier://pair?server=https%3A%2F%2Fx.dev%3A99999&code=A",
         )) {
-            assertNull(raw, PairingLink.parse(raw, allowHttp = true))
+            assertNull(raw, NotifierLink.parse(raw, allowHttp = true))
         }
+    }
+
+    @Test
+    fun normalizesTypedServerURLsLikeTheServer() {
+        assertEquals("https://notifier.joncbender.workers.dev", NotifierLink.origin(" HTTPS://Notifier.JonCBender.workers.dev/ ", false))
+        assertEquals("https://x.dev", NotifierLink.origin("https://x.dev:443", false))
+        assertEquals("http://10.0.2.2:8787", NotifierLink.origin("http://10.0.2.2:8787", true))
+        assertNull(NotifierLink.origin("http://x.dev", false))
+        assertNull(NotifierLink.origin("https://x.dev/notifier", false))
+    }
+
+    @Test
+    fun parsesJoinLinks() {
+        // Exactly what server/src/pairing.ts produces for a channel invite.
+        assertEquals(
+            NotifierLink.Join("https://notifier.joncbender.workers.dev", "ABCD-EFGH-JKMN"),
+            NotifierLink.parse(
+                "notifier://join?server=https%3A%2F%2Fnotifier.joncbender.workers.dev&code=ABCD-EFGH-JKMN",
+                allowHttp = false,
+            ),
+        )
     }
 }
