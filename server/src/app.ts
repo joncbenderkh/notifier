@@ -1,34 +1,45 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// notifier's HTTP API. Three credentials guard it: the operator's admin
-// token (pairing, key and device management), per-sender API keys (sending
-// notifications, listing devices), and per-device tokens (a paired phone
-// managing its own registration).
+// notifier's HTTP API. Four credentials guard it:
+// - the operator's admin token (the ADMIN_TOKEN secret): user management
+//   and invites, nothing else;
+// - a user's token (nu_): pairing, keys, devices, invites, and sending, all
+//   within that user's own devices;
+// - a user's API keys (nk_): sending and listing devices, for scripts;
+// - a device's token (nd_): a paired phone managing its own registration.
 
 import { Hono } from "hono";
 import type { Context, MiddlewareHandler } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { HTTPException } from "hono/http-exception";
-import { adminRoutes } from "./admin";
+import { pairPageRoutes } from "./pairPage";
 import { fromBase64, toBase64 } from "./encoding";
 import { pairingUri, qrSvg } from "./pairing";
 import { UnregisteredError } from "./push";
 import type { Sender } from "./push";
 import { newSealKey, seal } from "./seal";
 import * as store from "./store";
-import type { Device } from "./store";
+import type { Device, User } from "./store";
 import {
   API_KEY_PREFIX,
   DEVICE_TOKEN_PREFIX,
   newId,
+  newInviteCode,
   newPairingCode,
   newSecret,
+  normalizeInviteCode,
   normalizePairingCode,
   sha256Hex,
+  USER_TOKEN_PREFIX,
 } from "./token";
 
 export const PAIRING_TTL_SECONDS = 10 * 60;
+export const INVITE_TTL_SECONDS = 7 * 24 * 60 * 60;
 export const MESSAGE_TTL_SECONDS = 24 * 60 * 60;
+export const MAX_DEVICES_PER_USER = 20;
+export const MAX_API_KEYS_PER_USER = 20;
+export const MAX_PENDING_INVITES_PER_USER = 10;
+export const MAX_PENDING_PAIRINGS_PER_USER = 5;
 const MAX_REQUEST_BYTES = 16 * 1024;
 const MAX_TITLE_BYTES = 256;
 const MAX_BODY_BYTES = 2048;
@@ -42,7 +53,17 @@ export interface Deps {
   now: () => number;
 }
 
-type AppEnv = { Bindings: Env; Variables: { device: Device; admin: boolean } };
+type AppEnv = {
+  Bindings: Env;
+  Variables: {
+    /** The caller's user; "" when the operator acts. */
+    userId: string;
+    user: User;
+    device: Device;
+    /** True for a user token, false for an API key. */
+    viaUserToken: boolean;
+  };
+};
 
 /** The plaintext sealed into each push; the Android app decodes the same shape. */
 export interface Payload {
@@ -62,7 +83,7 @@ export interface Delivery {
 const utf8Length = (s: string) => new TextEncoder().encode(s).length;
 const iso = (seconds: number) => new Date(seconds * 1000).toISOString().replace(".000Z", "Z");
 
-function fail(status: 400 | 401 | 403 | 404, message: string): never {
+function fail(status: 400 | 401 | 403 | 404 | 429, message: string): never {
   throw new HTTPException(status, { message });
 }
 
@@ -113,29 +134,54 @@ async function isAdmin(c: Context<AppEnv>): Promise<boolean> {
   return crypto.subtle.timingSafeEqual(got!, want!);
 }
 
-async function isApiKey(c: Context<AppEnv>, now: number): Promise<boolean> {
+async function userFromToken(c: Context<AppEnv>, now: number): Promise<User | null> {
   const secret = bearer(c);
-  if (!secret.startsWith(API_KEY_PREFIX)) return false;
-  return (await store.apiKeyByHash(c.env.DB, await sha256Hex(secret), now)) !== null;
+  if (!secret.startsWith(USER_TOKEN_PREFIX)) return null;
+  return store.userByTokenHash(c.env.DB, await sha256Hex(secret), now);
 }
+
+async function userIdFromApiKey(c: Context<AppEnv>, now: number): Promise<string | null> {
+  const secret = bearer(c);
+  if (!secret.startsWith(API_KEY_PREFIX)) return null;
+  return (await store.apiKeyByHash(c.env.DB, await sha256Hex(secret), now))?.user_id ?? null;
+}
+
+/** Invites share the code alphabet with pairing codes; the prefix keeps the two apart. */
+const inviteHash = (code: string) => sha256Hex(`invite:${normalizeInviteCode(code)}`);
 
 export function createApp(deps: Deps): Hono<AppEnv> {
   const app = new Hono<AppEnv>();
 
-  const admin: MiddlewareHandler<AppEnv> = async (c, next) => {
+  const operator: MiddlewareHandler<AppEnv> = async (c, next) => {
     if (!(await isAdmin(c))) fail(401, "invalid admin token");
     await next();
   };
 
-  const apiKey: MiddlewareHandler<AppEnv> = async (c, next) => {
-    if (!(await isApiKey(c, deps.now()))) fail(401, "invalid API key");
+  const user: MiddlewareHandler<AppEnv> = async (c, next) => {
+    const found = await userFromToken(c, deps.now());
+    if (!found) fail(401, "invalid user token");
+    c.set("user", found);
+    c.set("userId", found.id);
     await next();
   };
 
-  const adminOrApiKey: MiddlewareHandler<AppEnv> = async (c, next) => {
-    const admin = await isAdmin(c);
-    if (!admin && !(await isApiKey(c, deps.now()))) fail(401, "invalid admin token or API key");
-    c.set("admin", admin);
+  const userOrApiKey: MiddlewareHandler<AppEnv> = async (c, next) => {
+    const found = await userFromToken(c, deps.now());
+    const userId = found?.id ?? (await userIdFromApiKey(c, deps.now()));
+    if (userId === null) fail(401, "invalid user token or API key");
+    c.set("userId", userId);
+    c.set("viaUserToken", found !== null);
+    await next();
+  };
+
+  const userOrOperator: MiddlewareHandler<AppEnv> = async (c, next) => {
+    if (await isAdmin(c)) {
+      c.set("userId", "");
+    } else {
+      const found = await userFromToken(c, deps.now());
+      if (!found) fail(401, "invalid user token or admin token");
+      c.set("userId", found.id);
+    }
     await next();
   };
 
@@ -146,6 +192,7 @@ export function createApp(deps: Deps): Hono<AppEnv> {
       : null;
     if (!found) fail(401, "invalid device token");
     c.set("device", found);
+    c.set("userId", found.user_id);
     await next();
   };
 
@@ -177,50 +224,132 @@ export function createApp(deps: Deps): Hono<AppEnv> {
   app.use("*", bodyLimit({ maxSize: MAX_REQUEST_BYTES, onError: (c) => c.json({ error: "request too large" }, 413) }));
 
   app.get("/healthz", (c) => c.json({ status: "ok" }));
-  adminRoutes(app);
+  pairPageRoutes(app);
 
-  // --- admin ---
+  // --- users (operator) ---
 
-  app.post("/v1/pairings", admin, async (c) => {
+  app.get("/v1/users", operator, async (c) => {
+    const users = await store.listUsers(c.env.DB);
+    return c.json(
+      users.map((u) => ({
+        id: u.id,
+        name: u.name,
+        devices: u.devices,
+        created_at: iso(u.created_at),
+        last_seen_at: iso(u.last_seen_at),
+        ...(u.disabled_at === null ? {} : { disabled_at: iso(u.disabled_at) }),
+      })),
+    );
+  });
+
+  // Issues a fresh token, revoking the old one: recovery for a lost token,
+  // and how the operator first signs in as the migrated owner.
+  app.post("/v1/users/:id/token", operator, async (c) => {
+    const id = c.req.param("id");
+    const token = newSecret(USER_TOKEN_PREFIX);
+    if (!(await store.setUserTokenHash(c.env.DB, id, await sha256Hex(token)))) fail(404, "not found");
+    return c.json({ user_id: id, token });
+  });
+
+  app.post("/v1/users/:id/disable", operator, async (c) => {
+    if (!(await store.setUserDisabled(c.env.DB, c.req.param("id"), deps.now()))) fail(404, "not found");
+    return c.body(null, 204);
+  });
+
+  app.post("/v1/users/:id/enable", operator, async (c) => {
+    if (!(await store.setUserDisabled(c.env.DB, c.req.param("id"), null))) fail(404, "not found");
+    return c.body(null, 204);
+  });
+
+  // --- invites and sign-up ---
+
+  app.post("/v1/invites", userOrOperator, async (c) => {
+    const now = deps.now();
+    const code = newInviteCode();
+    const expiresAt = now + INVITE_TTL_SECONDS;
+    const hash = await inviteHash(code);
+    if (!(await store.createInvite(c.env.DB, hash, c.get("userId"), now, expiresAt, MAX_PENDING_INVITES_PER_USER))) {
+      fail(403, `at most ${MAX_PENDING_INVITES_PER_USER} unused invites at a time`);
+    }
+    return c.json({ code, expires_at: iso(expiresAt) }, 201);
+  });
+
+  app.post("/v1/users", async (c) => {
+    const req = await readJson<{ invite: string; name: string }>(c, ["invite", "name"]);
+    const u = { id: newId("usr_"), name: validName(req.name) };
+    const token = newSecret(USER_TOKEN_PREFIX);
+    const codeHash = await inviteHash(typeof req.invite === "string" ? req.invite : "");
+    if (!(await store.redeemInvite(c.env.DB, codeHash, deps.now(), u, await sha256Hex(token)))) {
+      fail(403, "invite is invalid, expired, or already used");
+    }
+    console.log("user signed up", u.id, u.name);
+    return c.json({ user_id: u.id, name: u.name, token }, 201);
+  });
+
+  app.get("/v1/user", user, (c) => {
+    const u = c.get("user");
+    return c.json({ id: u.id, name: u.name, created_at: iso(u.created_at) });
+  });
+
+  // --- a user's devices and keys ---
+
+  app.post("/v1/pairings", user, async (c) => {
+    const userId = c.get("userId");
+    // An early, clear answer; redeeming enforces the cap atomically.
+    if ((await store.listDevices(c.env.DB, userId)).length >= MAX_DEVICES_PER_USER) {
+      fail(403, `at most ${MAX_DEVICES_PER_USER} paired devices per user`);
+    }
     const code = newPairingCode();
-    const expiresAt = deps.now() + PAIRING_TTL_SECONDS;
-    await store.createPairing(c.env.DB, await sha256Hex(code), expiresAt);
+    const now = deps.now();
+    const expiresAt = now + PAIRING_TTL_SECONDS;
+    const hash = await sha256Hex(code);
+    if (!(await store.createPairing(c.env.DB, hash, userId, now, expiresAt, MAX_PENDING_PAIRINGS_PER_USER))) {
+      fail(403, `at most ${MAX_PENDING_PAIRINGS_PER_USER} unused pairing codes at a time`);
+    }
     const uri = pairingUri(new URL(c.req.url).origin, code);
-    // ?qr=svg also returns the link as a QR code, for the admin page.
+    // ?qr=svg also returns the link as a QR code, for the pairing page.
     const qr = c.req.query("qr") === "svg" ? { qr_svg: qrSvg(uri) } : {};
     return c.json({ code, expires_at: iso(expiresAt), uri, ...qr }, 201);
   });
 
-  app.get("/v1/devices", adminOrApiKey, async (c) => {
-    const devices = await store.listDevices(c.env.DB);
-    // Senders only need enough to address a phone; activity timestamps are
-    // for the operator.
-    const admin = c.get("admin");
+  app.get("/v1/devices", userOrApiKey, async (c) => {
+    const devices = await store.listDevices(c.env.DB, c.get("userId"));
+    // Scripts only need enough to address a phone; activity timestamps are
+    // for the user.
+    const full = c.get("viaUserToken");
     return c.json(
       devices.map((d) => ({
         id: d.id,
         name: d.name,
         reachable: d.fcm_token !== "",
-        ...(admin ? { created_at: iso(d.created_at), last_seen_at: iso(d.last_seen_at) } : {}),
+        ...(full ? { created_at: iso(d.created_at), last_seen_at: iso(d.last_seen_at) } : {}),
       })),
     );
   });
 
-  app.delete("/v1/devices/:id", admin, async (c) => {
-    if (!(await store.deleteDevice(c.env.DB, c.req.param("id")))) fail(404, "not found");
+  app.delete("/v1/devices/:id", user, async (c) => {
+    if (!(await store.deleteDevice(c.env.DB, c.get("userId"), c.req.param("id")))) fail(404, "not found");
     return c.body(null, 204);
   });
 
-  app.post("/v1/keys", admin, async (c) => {
+  app.post("/v1/keys", user, async (c) => {
     const req = await readJson<{ name: string }>(c, ["name"]);
-    const key = { id: newId("key_"), name: validName(req.name), created_at: deps.now(), last_used_at: null };
+    const key = {
+      id: newId("key_"),
+      user_id: c.get("userId"),
+      name: validName(req.name),
+      created_at: deps.now(),
+      last_used_at: null,
+    };
     const secret = newSecret(API_KEY_PREFIX);
-    await store.createApiKey(c.env.DB, key, await sha256Hex(secret));
+    if (!(await store.createApiKey(c.env.DB, key, await sha256Hex(secret), MAX_API_KEYS_PER_USER))) {
+      fail(403, `at most ${MAX_API_KEYS_PER_USER} API keys per user`);
+    }
     return c.json({ id: key.id, name: key.name, key: secret, created_at: iso(key.created_at) }, 201);
   });
 
-  app.get("/v1/keys", admin, async (c) => {
-    const keys = await store.listApiKeys(c.env.DB);
+  app.get("/v1/keys", user, async (c) => {
+    const keys = await store.listApiKeys(c.env.DB, c.get("userId"));
     return c.json(
       keys.map((k) => ({
         id: k.id,
@@ -231,8 +360,8 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     );
   });
 
-  app.delete("/v1/keys/:id", admin, async (c) => {
-    if (!(await store.deleteApiKey(c.env.DB, c.req.param("id")))) fail(404, "not found");
+  app.delete("/v1/keys/:id", user, async (c) => {
+    if (!(await store.deleteApiKey(c.env.DB, c.get("userId"), c.req.param("id")))) fail(404, "not found");
     return c.body(null, 204);
   });
 
@@ -242,7 +371,7 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     const req = await readJson<{ code: string; name: string; fcm_token: string }>(c, ["code", "name", "fcm_token"]);
     const name = validName(req.name);
     if (typeof req.fcm_token !== "string" || req.fcm_token === "") fail(400, "fcm_token is required");
-    const d: Device = {
+    const d: Omit<Device, "user_id"> = {
       id: newId("dev_"),
       name,
       seal_key: toBase64(newSealKey()),
@@ -252,8 +381,8 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     };
     const secret = newSecret(DEVICE_TOKEN_PREFIX);
     const codeHash = await sha256Hex(normalizePairingCode(typeof req.code === "string" ? req.code : ""));
-    if (!(await store.redeemPairing(c.env.DB, codeHash, deps.now(), d, await sha256Hex(secret)))) {
-      fail(403, "pairing code is invalid, expired, or already used");
+    if (!(await store.redeemPairing(c.env.DB, codeHash, deps.now(), d, await sha256Hex(secret), MAX_DEVICES_PER_USER))) {
+      fail(403, `pairing code is invalid, expired, or already used, or its user has ${MAX_DEVICES_PER_USER} devices`);
     }
     console.log("device paired", d.id, d.name);
     return c.json({ device_id: d.id, device_token: secret, seal_key: d.seal_key }, 201);
@@ -267,7 +396,7 @@ export function createApp(deps: Deps): Hono<AppEnv> {
   });
 
   app.delete("/v1/device", device, async (c) => {
-    await store.deleteDevice(c.env.DB, c.get("device").id);
+    await store.deleteDevice(c.env.DB, c.get("userId"), c.get("device").id);
     return c.body(null, 204);
   });
 
@@ -284,7 +413,12 @@ export function createApp(deps: Deps): Hono<AppEnv> {
 
   // --- notifications ---
 
-  app.post("/v1/notifications", apiKey, async (c) => {
+  app.post("/v1/notifications", userOrApiKey, async (c) => {
+    const userId = c.get("userId");
+    // One user's scripts must not use up the FCM quota for everyone.
+    if (!(await c.env.NOTIFY_LIMITER.limit({ key: userId })).success) {
+      fail(429, "too many notifications; try again in a minute");
+    }
     const req = await readJson<{ title: string; body: string; priority: string; device_ids: string[] }>(c, [
       "title",
       "body",
@@ -305,7 +439,7 @@ export function createApp(deps: Deps): Hono<AppEnv> {
       fail(400, "device_ids must be an array of strings");
     }
 
-    const all = await store.listDevices(c.env.DB);
+    const all = await store.listDevices(c.env.DB, userId);
     const targets = ids.length === 0 ? all : all.filter((d) => ids.includes(d.id));
     if (targets.length === 0) fail(404, "no matching paired devices");
 

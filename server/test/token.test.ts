@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { describe, expect, it } from "vitest";
 import { toBase32 } from "../src/encoding";
-import { newPairingCode, newSecret, normalizePairingCode } from "../src/token";
+import { newInviteCode, newPairingCode, newSecret, normalizeInviteCode, normalizePairingCode } from "../src/token";
 
 describe("token", () => {
   it("generates Crockford pairing codes", () => {
@@ -17,6 +17,12 @@ describe("token", () => {
     ["OIL0-0000", "0110-0000"],
   ])("normalizes %j", (input, want) => {
     expect(normalizePairingCode(input)).toBe(want);
+  });
+
+  it("generates longer invite codes", () => {
+    expect(newInviteCode()).toMatch(/^([0-9A-HJKMNP-TV-Z]{4}-){2}[0-9A-HJKMNP-TV-Z]{4}$/);
+    expect(normalizeInviteCode("7kq2 mx9d abcd")).toBe("7KQ2-MX9D-ABCD");
+    expect(normalizeInviteCode("7KQ2-MX9D")).toBe("7KQ2MX9D");
   });
 
   it("encodes RFC 4648 base32", () => {
