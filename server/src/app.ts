@@ -32,6 +32,7 @@ const MAX_TITLE_BYTES = 256;
 const MAX_BODY_BYTES = 2048;
 const MAX_NAME_BYTES = 64;
 const ENVELOPE_VERSION = "1";
+const MIN_ADMIN_TOKEN_LENGTH = 32;
 
 export interface Deps {
   sender: (env: Env) => Sender;
@@ -39,7 +40,7 @@ export interface Deps {
   now: () => number;
 }
 
-type AppEnv = { Bindings: Env; Variables: { device: Device } };
+type AppEnv = { Bindings: Env; Variables: { device: Device; admin: boolean } };
 
 /** The plaintext sealed into each push; the Android app decodes the same shape. */
 export interface Payload {
@@ -63,14 +64,18 @@ function fail(status: 400 | 401 | 403 | 404, message: string): never {
   throw new HTTPException(status, { message });
 }
 
-async function readJson<T>(c: Context): Promise<Partial<T>> {
+/** Parses a JSON object body, rejecting unknown fields so a typo cannot silently change meaning. */
+async function readJson<T extends object>(c: Context, fields: readonly (keyof T & string)[]): Promise<Partial<T>> {
+  let value: unknown;
   try {
-    const value: unknown = await c.req.json();
-    if (typeof value === "object" && value !== null && !Array.isArray(value)) return value;
+    value = await c.req.json();
   } catch {
-    // fall through
+    fail(400, "invalid JSON body");
   }
-  return fail(400, "invalid JSON body");
+  if (typeof value !== "object" || value === null || Array.isArray(value)) fail(400, "invalid JSON body");
+  const unknown = Object.keys(value).find((k) => !(fields as readonly string[]).includes(k));
+  if (unknown !== undefined) fail(400, `invalid JSON body: unknown field "${unknown}"`);
+  return value;
 }
 
 function validName(raw: unknown): string {
@@ -82,11 +87,22 @@ function validName(raw: unknown): string {
 }
 
 function bearer(c: Context): string {
-  const [scheme, credential] = (c.req.header("authorization") ?? "").split(" ", 2);
-  return scheme?.toLowerCase() === "bearer" && credential ? credential.trim() : "";
+  const match = /^bearer\s+(.+)$/i.exec(c.req.header("authorization") ?? "");
+  return match?.[1]?.trim() ?? "";
 }
 
+let reportedBadAdminToken = false;
+
 async function isAdmin(c: Context<AppEnv>): Promise<boolean> {
+  // Fail closed: without this, an unset secret and a missing header would
+  // both hash the empty string and compare equal.
+  if (typeof c.env.ADMIN_TOKEN !== "string" || c.env.ADMIN_TOKEN.length < MIN_ADMIN_TOKEN_LENGTH) {
+    if (!reportedBadAdminToken) {
+      console.error(`ADMIN_TOKEN secret must be set to at least ${MIN_ADMIN_TOKEN_LENGTH} characters`);
+      reportedBadAdminToken = true;
+    }
+    return false;
+  }
   const encoder = new TextEncoder();
   const [got, want] = await Promise.all(
     [bearer(c), c.env.ADMIN_TOKEN].map((s) => crypto.subtle.digest("SHA-256", encoder.encode(s))),
@@ -114,7 +130,9 @@ export function createApp(deps: Deps): Hono<AppEnv> {
   };
 
   const adminOrApiKey: MiddlewareHandler<AppEnv> = async (c, next) => {
-    if (!(await isAdmin(c)) && !(await isApiKey(c, deps.now()))) fail(401, "invalid admin token or API key");
+    const admin = await isAdmin(c);
+    if (!admin && !(await isApiKey(c, deps.now()))) fail(401, "invalid admin token or API key");
+    c.set("admin", admin);
     await next();
   };
 
@@ -165,13 +183,15 @@ export function createApp(deps: Deps): Hono<AppEnv> {
 
   app.get("/v1/devices", adminOrApiKey, async (c) => {
     const devices = await store.listDevices(c.env.DB);
+    // Senders only need enough to address a phone; activity timestamps are
+    // for the operator.
+    const admin = c.get("admin");
     return c.json(
       devices.map((d) => ({
         id: d.id,
         name: d.name,
         reachable: d.fcm_token !== "",
-        created_at: iso(d.created_at),
-        last_seen_at: iso(d.last_seen_at),
+        ...(admin ? { created_at: iso(d.created_at), last_seen_at: iso(d.last_seen_at) } : {}),
       })),
     );
   });
@@ -182,7 +202,7 @@ export function createApp(deps: Deps): Hono<AppEnv> {
   });
 
   app.post("/v1/keys", admin, async (c) => {
-    const req = await readJson<{ name: string }>(c);
+    const req = await readJson<{ name: string }>(c, ["name"]);
     const key = { id: newId("key_"), name: validName(req.name), created_at: deps.now(), last_used_at: null };
     const secret = newSecret(API_KEY_PREFIX);
     await store.createApiKey(c.env.DB, key, await sha256Hex(secret));
@@ -209,7 +229,7 @@ export function createApp(deps: Deps): Hono<AppEnv> {
   // --- device ---
 
   app.post("/v1/devices", async (c) => {
-    const req = await readJson<{ code: string; name: string; fcm_token: string }>(c);
+    const req = await readJson<{ code: string; name: string; fcm_token: string }>(c, ["code", "name", "fcm_token"]);
     const name = validName(req.name);
     if (typeof req.fcm_token !== "string" || req.fcm_token === "") fail(400, "fcm_token is required");
     const d: Device = {
@@ -230,7 +250,7 @@ export function createApp(deps: Deps): Hono<AppEnv> {
   });
 
   app.put("/v1/device", device, async (c) => {
-    const req = await readJson<{ fcm_token: string }>(c);
+    const req = await readJson<{ fcm_token: string }>(c, ["fcm_token"]);
     if (typeof req.fcm_token !== "string" || req.fcm_token === "") fail(400, "fcm_token is required");
     await store.setFcmToken(c.env.DB, c.get("device").id, req.fcm_token);
     return c.body(null, 204);
@@ -255,13 +275,18 @@ export function createApp(deps: Deps): Hono<AppEnv> {
   // --- notifications ---
 
   app.post("/v1/notifications", apiKey, async (c) => {
-    const req = await readJson<{ title: string; body: string; priority: string; device_ids: string[] }>(c);
+    const req = await readJson<{ title: string; body: string; priority: string; device_ids: string[] }>(c, [
+      "title",
+      "body",
+      "priority",
+      "device_ids",
+    ]);
     const title = typeof req.title === "string" ? req.title : "";
     const body = typeof req.body === "string" ? req.body : "";
     if (title.trim() === "") fail(400, "title is required");
     if (utf8Length(title) > MAX_TITLE_BYTES) fail(400, "title is too long");
     if (utf8Length(body) > MAX_BODY_BYTES) fail(400, "body is too long");
-    const priority = req.priority ?? "default";
+    const priority = req.priority === undefined || req.priority === "" ? "default" : req.priority;
     if (priority !== "default" && priority !== "high") fail(400, 'priority must be "default" or "high"');
     const ids = req.device_ids ?? [];
     if (!Array.isArray(ids) || !ids.every((id) => typeof id === "string")) {
@@ -274,6 +299,8 @@ export function createApp(deps: Deps): Hono<AppEnv> {
 
     const p: Payload = { id: newId("msg_"), title, priority, sent_at: deps.now() };
     if (body !== "") p.body = body;
+    // A failed warm-up is not fatal: each send retries and reports per device.
+    await deps.sender(c.env).prepare?.().catch((err: unknown) => console.error("push prepare failed", err));
     const deliveries = await Promise.all(targets.map((d) => deliver(c.env, d, p)));
     return c.json({ id: p.id, deliveries });
   });

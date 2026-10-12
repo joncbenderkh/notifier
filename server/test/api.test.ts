@@ -52,13 +52,14 @@ async function call<T = unknown>(
   bearer: string,
   body: unknown,
   wantStatus: number,
+  bindings: Env = env,
 ): Promise<T> {
   const headers: Record<string, string> = { "content-type": "application/json" };
   if (bearer) headers.authorization = `Bearer ${bearer}`;
   const res = await app.request(
     path,
     { method, headers, body: body === undefined ? undefined : JSON.stringify(body) },
-    env,
+    bindings,
   );
   const text = await res.text();
   expect(res.status, `${method} ${path}: ${text}`).toBe(wantStatus);
@@ -100,6 +101,12 @@ describe("notifications", () => {
     }
   });
 
+  it("treats an empty priority as default", async () => {
+    await pair("phone", "fcm-phone");
+    await call("POST", "/v1/notifications", await apiKey(), { title: "hi", priority: "" }, 200);
+    expect(sender.sent[0]!.high).toBe(false);
+  });
+
   it("targets only the selected devices", async () => {
     await pair("phone", "fcm-phone");
     const tablet = await pair("tablet", "fcm-tablet");
@@ -121,6 +128,9 @@ describe("notifications", () => {
     { title: "hi", priority: "urgent" },
     { title: "x".repeat(257) },
     { title: "hi", device_ids: "dev_x" },
+    { title: "hi", device_id: "dev_x" },
+    { title: "hi", priority: 0 },
+    { title: "hi", priority: false },
   ])("rejects invalid request %j", async (body) => {
     await pair("phone", "fcm");
     await call("POST", "/v1/notifications", await apiKey(), body, 400);
@@ -144,10 +154,28 @@ describe("authentication", () => {
     await call("DELETE", `/v1/devices/${reg.device_id}`, key, undefined, 401);
   });
 
-  it("lets API keys list devices", async () => {
+  it("lets API keys list devices without activity timestamps", async () => {
     const reg = await pair("phone", "fcm-phone");
-    const devices = await call<{ id: string; name: string }[]>("GET", "/v1/devices", await apiKey(), undefined, 200);
-    expect(devices).toMatchObject([{ id: reg.device_id, name: "phone", reachable: true }]);
+    const devices = await call<object[]>("GET", "/v1/devices", await apiKey(), undefined, 200);
+    expect(devices).toEqual([{ id: reg.device_id, name: "phone", reachable: true }]);
+    const full = await call<object[]>("GET", "/v1/devices", ADMIN, undefined, 200);
+    expect(full[0]).toHaveProperty("last_seen_at");
+  });
+
+  it.each([
+    ["unset", undefined],
+    ["empty", ""],
+    ["too short", "short"],
+  ])("fails closed when ADMIN_TOKEN is %s", async (_, token) => {
+    const bindings = { ...env, ADMIN_TOKEN: token } as Env;
+    await call("POST", "/v1/pairings", "", undefined, 401, bindings);
+    await call("POST", "/v1/pairings", token ?? "", undefined, 401, bindings);
+    await call("POST", "/v1/keys", "", { name: "x" }, 401, bindings);
+  });
+
+  it("tolerates extra whitespace after Bearer", async () => {
+    const res = await app.request("/v1/keys", { headers: { authorization: `bearer   ${ADMIN}` } }, env);
+    expect(res.status).toBe(200);
   });
 
   it("rejects a revoked API key", async () => {

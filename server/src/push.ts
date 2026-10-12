@@ -17,6 +17,8 @@ export interface PushMessage {
 export class UnregisteredError extends Error {}
 
 export interface Sender {
+  /** Optional warm-up before a fan-out, so concurrent sends share its work. */
+  prepare?(): Promise<void>;
   send(message: PushMessage): Promise<void>;
 }
 
@@ -70,6 +72,15 @@ export class FcmSender implements Sender {
     const body = await response.text();
     if (response.status === 404 || body.includes('"UNREGISTERED"')) throw new UnregisteredError(body);
     throw new Error(`FCM send failed: HTTP ${response.status}: ${body}`);
+  }
+
+  /**
+   * Mints the OAuth token inside the calling request, so a fan-out's sends
+   * reuse it. Only the resolved token is shared across requests, never a
+   * pending promise: Workers ties I/O to the request that started it.
+   */
+  async prepare(): Promise<void> {
+    await this.#token();
   }
 
   async #token(): Promise<string> {

@@ -69,6 +69,22 @@ describe("FcmSender", () => {
     });
   });
 
+  it("mints one OAuth token for a prepared fan-out", async () => {
+    const { json } = await serviceAccount();
+    let tokenRequests = 0;
+    const fetcher = ((input: RequestInfo) => {
+      if (new Request(input).url.endsWith("/token")) {
+        tokenRequests++;
+        return Promise.resolve(Response.json({ access_token: "a", expires_in: 3600 }));
+      }
+      return Promise.resolve(Response.json({}));
+    }) as typeof fetch;
+    const sender = new FcmSender(json, fetcher);
+    await sender.prepare();
+    await Promise.all([sender.send(message), sender.send(message), sender.send(message)]);
+    expect(tokenRequests).toBe(1);
+  });
+
   it("maps UNREGISTERED to UnregisteredError", async () => {
     const { json } = await serviceAccount();
     const fetcher = ((input: RequestInfo) => {
