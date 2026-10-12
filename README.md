@@ -117,15 +117,27 @@ notify version
   -high       high priority (heads-up, may wake the phone)
   -url URL    server (default $NOTIFIER_URL)
   -key KEY    API key (default $NOTIFIER_API_KEY)
-  -timeout    request timeout (default 30s)
+  -timeout    request timeout (default 30s), counted from when the request
+              starts, not while waiting for stdin
 ```
 
-A `BODY` of `-` reads standard input: `make test 2>&1 | tail -5 | notify "Tests" -`.
-Exit status is 0 when every phone accepted the message, 3 when any delivery
-failed or a phone was unreachable, 1 on other errors, and 2 on usage errors.
+Flags must come before TITLE; everything from TITLE on is message text, so a
+body taken from a variable can never act as a flag. Put `--` before a title
+that starts with `-`. A `BODY` of `-` reads standard input, so a long job can
+report when it finishes: `make test 2>&1 | tail -5 | notify "Tests" -`.
+Bodies over the server's 2048-byte limit keep their last 2048 bytes (where a
+log's error usually is), prefixed with `…`; invalid UTF-8 is replaced, and
+only the last 8 KiB of a piped stream is ever held in memory. The server URL must be `https`,
+except for `localhost`.
 
-Install with `go install github.com/joncbenderkh/notifier/notify@latest`, or
-download a prebuilt binary from the
+Exit status is 0 when every phone accepted the message; 3 when any delivery
+failed, a phone was unreachable, or no paired phone matched; 1 on other
+errors; and 2 on usage errors.
+
+Install a tagged release with
+`go install github.com/joncbenderkh/notifier/notify@latest` (the module lives
+in a subdirectory, so its versions are the `notify/vX.Y.Z` tags), or download
+a prebuilt binary from the
 [releases](https://github.com/joncbenderkh/notifier/releases).
 
 ## API

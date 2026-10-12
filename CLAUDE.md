@@ -71,7 +71,10 @@ See `README.md` for the user-facing setup and API table.
 
 ## Layout
 
-- `server/src/app.ts` — `createApp(deps)`: routes and auth middleware. The
+- `server/src/app.ts` — `createApp(deps)`: routes and auth middleware.
+  Admin auth fails closed unless `ADMIN_TOKEN` is ≥32 characters; request
+  bodies reject unknown fields; API keys see only `id`/`name`/`reachable`
+  from `GET /v1/devices`. The
   sender and clock are injected so `test/api.test.ts` drives the whole flow
   against D1 with a fake sender.
 - `server/src/{store,seal,token,push,encoding}.ts` — D1 queries, envelope
@@ -121,9 +124,10 @@ SemVer 2.0.0, starting at 0.1.0. One version for the whole repo:
 `versionName` in `android/app/build.gradle.kts`, `version` in
 `server/package.json`, and `version` in `notify/main.go` must match; the tag
 `vX.Y.Z` mirrors them (release builds also inject it into `notify` via
-`-ldflags -X`). The Worker deploys continuously from `main`, independent of
-tags.
-`versionCode` increments by one each release.
+`-ldflags -X`). Because `notify/` is a nested Go module, also push
+`notify/vX.Y.Z` on the same commit, or `go install …/notify@latest` resolves
+to an untagged pseudo-version. The Worker deploys continuously from `main`,
+independent of tags. `versionCode` increments by one each release.
 
 ## Working on notifier
 
