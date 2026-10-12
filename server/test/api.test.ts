@@ -265,3 +265,37 @@ describe("device self-management", () => {
     await call("POST", "/v1/device/test", reg.device_token, undefined, 401);
   });
 });
+
+describe("QR pairing", () => {
+  it("returns a pairing link for this origin, and a QR on request", async () => {
+    const plain = await call<{ code: string; uri: string; qr_svg?: string }>("POST", "/v1/pairings", ADMIN, undefined, 201);
+    expect(plain.uri).toBe(`notifier://pair?server=http%3A%2F%2Flocalhost&code=${plain.code}`);
+    expect(plain.qr_svg).toBeUndefined();
+
+    const withQr = await call<{ qr_svg: string }>("POST", "/v1/pairings?qr=svg", ADMIN, undefined, 201);
+    expect(withQr.qr_svg).toMatch(/^<svg [^>]*viewBox/);
+  });
+
+  it("serves the admin page with a strict policy and no secrets", async () => {
+    const page = await app.request("/admin/pair", {}, env);
+    expect(page.status).toBe(200);
+    const csp = page.headers.get("content-security-policy") ?? "";
+    expect(csp).toContain("default-src 'none'");
+    expect(csp).toContain("script-src 'self'");
+    expect(csp).not.toContain("unsafe-inline");
+    expect(page.headers.get("cache-control")).toBe("no-store");
+    expect(page.headers.get("referrer-policy")).toBe("no-referrer");
+    const html = await page.text();
+    expect(html).not.toContain(ADMIN);
+    expect(html).not.toMatch(/<script>|<style>|\son\w+=/);
+
+    for (const [path, type] of [
+      ["/admin/pair.js", "text/javascript"],
+      ["/admin/pair.css", "text/css"],
+    ]) {
+      const res = await app.request(path!, {}, env);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain(type);
+    }
+  });
+});
