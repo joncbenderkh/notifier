@@ -6,7 +6,7 @@ import java.net.URISyntaxException
 import java.net.URLDecoder
 
 /**
- * A pairing link, `notifier://pair?server=<url>&code=<code>`, as shown in QR
+ * A pairing link, `notifier://pair?server=<origin>&code=<code>`, as shown in QR
  * form by the server's admin page and `notify pair`. Mirrors
  * `server/src/pairing.ts`.
  */
@@ -31,9 +31,15 @@ data class PairingLink(val serverUrl: String, val code: String) {
             } catch (_: URISyntaxException) {
                 return null
             }
-            val schemeOk = serverUri.scheme == "https" || (allowHttp && serverUri.scheme == "http")
-            if (!schemeOk || serverUri.host.isNullOrEmpty()) return null
-            return PairingLink(server, code)
+            val scheme = serverUri.scheme?.lowercase()
+            val schemeOk = scheme == "https" || (allowHttp && scheme == "http")
+            // Only a bare origin: "https://trusted@evil.example" would show a
+            // trusted name in the form while pairing with evil.example.
+            val bareOrigin = serverUri.rawUserInfo == null && serverUri.rawPath.isNullOrEmpty() &&
+                serverUri.rawQuery == null && serverUri.rawFragment == null
+            if (!schemeOk || !bareOrigin || serverUri.host.isNullOrEmpty() || serverUri.port > 65535) return null
+            val port = if (serverUri.port == -1) "" else ":${serverUri.port}"
+            return PairingLink("$scheme://${serverUri.host.lowercase()}$port", code)
         }
     }
 }

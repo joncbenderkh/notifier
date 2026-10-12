@@ -24,6 +24,14 @@ class PairingLinkTest {
     }
 
     @Test
+    fun normalizesTheOrigin() {
+        assertEquals(
+            PairingLink("https://x.dev:8443", "A"),
+            PairingLink.parse("notifier://pair?server=HTTPS%3A%2F%2FX.dev%3A8443%2F&code=A", allowHttp = false),
+        )
+    }
+
+    @Test
     fun rejectsOtherLinks() {
         for (raw in listOf(
             "https://notifier.joncbender.workers.dev",
@@ -33,6 +41,13 @@ class PairingLinkTest {
             "notifier://pair?server=ftp%3A%2F%2Fx.dev&code=A",
             "notifier://pair?server=javascript%3Aalert(1)&code=A",
             "not a uri at all %%",
+            // Anything but a bare origin could disguise the real host.
+            "notifier://pair?server=https%3A%2F%2Fnotifier.joncbender.workers.dev%40evil.example&code=A",
+            "notifier://pair?server=https%3A%2F%2Fx.dev%2Fpath&code=A",
+            "notifier://pair?server=https%3A%2F%2Fx.dev%3Fq%3D1&code=A",
+            "notifier://pair?server=https%3A%2F%2Fx.dev%23frag&code=A",
+            "notifier://pair?server=https%3A%2F%2F%40x.dev&code=A",
+            "notifier://pair?server=https%3A%2F%2Fx.dev%3A99999&code=A",
         )) {
             assertNull(raw, PairingLink.parse(raw, allowHttp = true))
         }
