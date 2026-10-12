@@ -14,6 +14,7 @@ google-services.json
 
 # notify CLI
 /notify/notify
+/notify/notify.exe
 
 # Server (Cloudflare Worker)
 node_modules/
