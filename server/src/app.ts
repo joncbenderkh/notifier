@@ -5,7 +5,8 @@
 //   and invites, nothing else;
 // - a user's token (nu_): pairing, keys, devices, invites, and sending, all
 //   within that user's own devices;
-// - a user's API keys (nk_): sending and listing devices, for scripts;
+// - a user's API keys (nk_): sending and listing devices, for scripts,
+//   optionally limited to some of the user's channels;
 // - a device's token (nd_): a paired phone managing its own registration.
 
 import { Hono } from "hono";
@@ -14,12 +15,12 @@ import { bodyLimit } from "hono/body-limit";
 import { HTTPException } from "hono/http-exception";
 import { pairPageRoutes } from "./pairPage";
 import { fromBase64, toBase64 } from "./encoding";
-import { pairingUri, qrSvg } from "./pairing";
+import { joinUri, pairingUri, qrSvg } from "./pairing";
 import { UnregisteredError } from "./push";
 import type { Sender } from "./push";
 import { newSealKey, seal } from "./seal";
 import * as store from "./store";
-import type { Device, User } from "./store";
+import type { Channel, Device, User } from "./store";
 import {
   API_KEY_PREFIX,
   DEVICE_TOKEN_PREFIX,
@@ -40,6 +41,11 @@ export const MAX_DEVICES_PER_USER = 20;
 export const MAX_API_KEYS_PER_USER = 20;
 export const MAX_INVITES_PER_USER = 10;
 export const MAX_PENDING_PAIRINGS_PER_USER = 5;
+export const MAX_CHANNELS_PER_USER = 20;
+export const MAX_MEMBERSHIPS_PER_USER = 50;
+export const MAX_PENDING_INVITES_PER_CHANNEL = 10;
+const MAX_CHANNELS_PER_REQUEST = 20;
+const CHANNEL_NAME = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 const MAX_REQUEST_BYTES = 16 * 1024;
 const MAX_TITLE_BYTES = 256;
 const MAX_BODY_BYTES = 2048;
@@ -62,6 +68,8 @@ type AppEnv = {
     device: Device;
     /** True for a user token, false for an API key. */
     viaUserToken: boolean;
+    /** Channel IDs an API key is limited to; empty means unlimited. */
+    keyScope: string[];
   };
 };
 
@@ -72,6 +80,9 @@ export interface Payload {
   body?: string;
   priority: "default" | "high";
   sent_at: number;
+  /** The channel it was published to, as this device's owner names it. */
+  channel?: string;
+  channel_id?: string;
 }
 
 export interface Delivery {
@@ -83,7 +94,7 @@ export interface Delivery {
 const utf8Length = (s: string) => new TextEncoder().encode(s).length;
 const iso = (seconds: number) => new Date(seconds * 1000).toISOString().replace(".000Z", "Z");
 
-function fail(status: 400 | 401 | 403 | 404 | 429, message: string): never {
+function fail(status: 400 | 401 | 403 | 404 | 409 | 429, message: string): never {
   throw new HTTPException(status, { message });
 }
 
@@ -140,11 +151,31 @@ async function userFromToken(c: Context<AppEnv>, now: number): Promise<User | nu
   return store.userByTokenHash(c.env.DB, await sha256Hex(secret), now);
 }
 
-async function userIdFromApiKey(c: Context<AppEnv>, now: number): Promise<string | null> {
+async function apiKeyFromToken(c: Context<AppEnv>, now: number): Promise<store.ApiKey | null> {
   const secret = bearer(c);
   if (!secret.startsWith(API_KEY_PREFIX)) return null;
-  return (await store.apiKeyByHash(c.env.DB, await sha256Hex(secret), now))?.user_id ?? null;
+  return store.apiKeyByHash(c.env.DB, await sha256Hex(secret), now);
 }
+
+/** How a member sees a channel: bare when they own it, "owner/name" otherwise. */
+const channelLabel = (ch: Channel, viewer: string) => (ch.owner_id === viewer ? ch.name : `${ch.owner_name}/${ch.name}`);
+
+function stringList(raw: unknown, field: string): string[] {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw) || !raw.every((v) => typeof v === "string")) fail(400, `${field} must be an array of strings`);
+  return raw;
+}
+
+function channelNames(raw: unknown): string[] {
+  const names = [...new Set(stringList(raw, "channels"))];
+  if (names.length > MAX_CHANNELS_PER_REQUEST) fail(400, `at most ${MAX_CHANNELS_PER_REQUEST} channels per request`);
+  const bad = names.find((n) => !CHANNEL_NAME.test(n));
+  if (bad !== undefined) fail(400, `invalid channel name "${bad}"`);
+  return names;
+}
+
+/** Invites, channel invites, and pairing codes share an alphabet; prefixes keep them apart. */
+const channelInviteHash = (code: string) => sha256Hex(`channel-invite:${normalizeInviteCode(code)}`);
 
 /** Invites share the code alphabet with pairing codes; the prefix keeps the two apart. */
 const inviteHash = (code: string) => sha256Hex(`invite:${normalizeInviteCode(code)}`);
@@ -167,10 +198,11 @@ export function createApp(deps: Deps): Hono<AppEnv> {
 
   const userOrApiKey: MiddlewareHandler<AppEnv> = async (c, next) => {
     const found = await userFromToken(c, deps.now());
-    const userId = found?.id ?? (await userIdFromApiKey(c, deps.now()));
-    if (userId === null) fail(401, "invalid user token or API key");
-    c.set("userId", userId);
+    const key = found ? null : await apiKeyFromToken(c, deps.now());
+    if (!found && !key) fail(401, "invalid user token or API key");
+    c.set("userId", found?.id ?? key!.user_id);
     c.set("viaUserToken", found !== null);
+    c.set("keyScope", key ? await store.apiKeyScope(c.env.DB, key.id) : []);
     await next();
   };
 
@@ -201,6 +233,31 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     if (!(await env.NOTIFY_LIMITER.limit({ key: userId })).success) {
       fail(429, "too many notifications; try again in a minute");
     }
+  }
+
+  /** Resolves channel names among the user's own channels; any unknown name is a 404. */
+  async function ownedChannels(db: D1Database, userId: string, names: readonly string[]): Promise<Channel[]> {
+    return Promise.all(
+      names.map(async (name) => (await store.ownedChannelNamed(db, userId, name)) ?? fail(404, `you have no channel named "${name}"`)),
+    );
+  }
+
+  /** Checks that [userId] belongs to every channel in [ids]; others are a 404. */
+  async function memberOfAll(db: D1Database, userId: string, raw: unknown): Promise<string[]> {
+    const ids = [...new Set(stringList(raw, "channel_ids"))];
+    const mine = new Set((await store.memberships(db, userId)).map((ch) => ch.id));
+    const missing = ids.find((id) => !mine.has(id));
+    if (missing !== undefined) fail(404, `not a member of channel ${missing}`);
+    return ids;
+  }
+
+  async function deviceChannels(db: D1Database, d: Device) {
+    const subscribed = new Set(await store.deviceSubscriptions(db, d.id));
+    return (await store.memberships(db, d.user_id)).map((ch) => ({
+      id: ch.id,
+      name: channelLabel(ch, d.user_id),
+      subscribed: subscribed.has(ch.id),
+    }));
   }
 
   async function deliver(env: Env, d: Device, p: Payload): Promise<Delivery> {
@@ -341,7 +398,8 @@ export function createApp(deps: Deps): Hono<AppEnv> {
   });
 
   app.post("/v1/keys", user, async (c) => {
-    const req = await readJson<{ name: string }>(c, ["name"]);
+    const req = await readJson<{ name: string; channels: string[] }>(c, ["name", "channels"]);
+    const scope = await ownedChannels(c.env.DB, c.get("userId"), channelNames(req.channels));
     const key = {
       id: newId("key_"),
       user_id: c.get("userId"),
@@ -350,20 +408,26 @@ export function createApp(deps: Deps): Hono<AppEnv> {
       last_used_at: null,
     };
     const secret = newSecret(API_KEY_PREFIX);
-    if (!(await store.createApiKey(c.env.DB, key, await sha256Hex(secret), MAX_API_KEYS_PER_USER))) {
+    const scopeIds = scope.map((ch) => ch.id);
+    if (!(await store.createApiKey(c.env.DB, key, await sha256Hex(secret), MAX_API_KEYS_PER_USER, scopeIds))) {
       fail(403, `at most ${MAX_API_KEYS_PER_USER} API keys per user`);
     }
-    return c.json({ id: key.id, name: key.name, key: secret, created_at: iso(key.created_at) }, 201);
+    const channels = scope.map((ch) => ch.name);
+    return c.json({ id: key.id, name: key.name, key: secret, created_at: iso(key.created_at), channels }, 201);
   });
 
   app.get("/v1/keys", user, async (c) => {
-    const keys = await store.listApiKeys(c.env.DB, c.get("userId"));
+    const userId = c.get("userId");
+    const keys = await store.listApiKeys(c.env.DB, userId);
+    const names = new Map((await store.memberships(c.env.DB, userId)).map((ch) => [ch.id, ch.name]));
+    const scopes = await Promise.all(keys.map((k) => store.apiKeyScope(c.env.DB, k.id)));
     return c.json(
-      keys.map((k) => ({
+      keys.map((k, i) => ({
         id: k.id,
         name: k.name,
         created_at: iso(k.created_at),
         ...(k.last_used_at === null ? {} : { last_used_at: iso(k.last_used_at) }),
+        channels: scopes[i]!.map((id) => names.get(id) ?? id),
       })),
     );
   });
@@ -373,7 +437,124 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     return c.body(null, 204);
   });
 
+  // --- channels ---
+
+  app.post("/v1/channels", user, async (c) => {
+    const req = await readJson<{ name: string }>(c, ["name"]);
+    const [name] = channelNames([req.name]);
+    if (name === undefined) fail(400, "name is required");
+    const userId = c.get("userId");
+    const ch = { id: newId("ch_"), owner_id: userId, name, created_at: deps.now() };
+    if (!(await store.createChannel(c.env.DB, ch, MAX_CHANNELS_PER_USER))) {
+      if (await store.ownedChannelNamed(c.env.DB, userId, name)) fail(409, `you already have a channel named "${name}"`);
+      fail(403, `at most ${MAX_CHANNELS_PER_USER} channels per user`);
+    }
+    return c.json({ id: ch.id, name, created_at: iso(ch.created_at) }, 201);
+  });
+
+  app.get("/v1/channels", user, async (c) => {
+    const userId = c.get("userId");
+    const channels = await store.memberships(c.env.DB, userId);
+    return c.json(
+      channels.map((ch) => ({
+        id: ch.id,
+        name: channelLabel(ch, userId),
+        owned: ch.owner_id === userId,
+        members: ch.members,
+      })),
+    );
+  });
+
+  app.delete("/v1/channels/:id", user, async (c) => {
+    if (!(await store.deleteChannel(c.env.DB, c.get("userId"), c.req.param("id")))) {
+      fail(404, "not found (the default channel cannot be deleted)");
+    }
+    return c.body(null, 204);
+  });
+
+  app.post("/v1/channels/:id/invites", user, async (c) => {
+    const ch = await store.ownedChannel(c.env.DB, c.get("userId"), c.req.param("id"));
+    if (!ch) fail(404, "not found");
+    // A send without channels goes to default, so sharing it would leak those.
+    if (ch.id === store.defaultChannelId(ch.owner_id)) fail(400, "the default channel cannot be shared");
+    const now = deps.now();
+    const code = newInviteCode();
+    const expiresAt = now + INVITE_TTL_SECONDS;
+    const hash = await channelInviteHash(code);
+    if (!(await store.createChannelInvite(c.env.DB, hash, ch.id, now, expiresAt, MAX_PENDING_INVITES_PER_CHANNEL))) {
+      fail(403, `at most ${MAX_PENDING_INVITES_PER_CHANNEL} unused invites per channel`);
+    }
+    const uri = joinUri(new URL(c.req.url).origin, code);
+    const qr = c.req.query("qr") === "svg" ? { qr_svg: qrSvg(uri) } : {};
+    return c.json({ code, channel: ch.name, expires_at: iso(expiresAt), uri, ...qr }, 201);
+  });
+
+  /** Joins a channel for [userId]; the response names it as that user sees it. */
+  async function join(db: D1Database, userId: string, raw: unknown) {
+    const result = await store.joinChannel(
+      db,
+      await channelInviteHash(typeof raw === "string" ? raw : ""),
+      userId,
+      deps.now(),
+      MAX_MEMBERSHIPS_PER_USER,
+    );
+    if (result === "invalid") fail(403, "channel invite is invalid, expired, or already used");
+    if (result === "full") fail(403, `at most ${MAX_MEMBERSHIPS_PER_USER} channels per user`);
+    return result.channel;
+  }
+
+  app.post("/v1/memberships", user, async (c) => {
+    const req = await readJson<{ invite: string }>(c, ["invite"]);
+    const userId = c.get("userId");
+    const ch = await join(c.env.DB, userId, req.invite);
+    return c.json({ id: ch.id, name: channelLabel(ch, userId) }, 201);
+  });
+
+  app.get("/v1/channels/:id/members", user, async (c) => {
+    const ch = await store.ownedChannel(c.env.DB, c.get("userId"), c.req.param("id"));
+    if (!ch) fail(404, "not found");
+    const list = await store.members(c.env.DB, ch.id);
+    return c.json(list.map((m) => ({ id: m.id, name: m.name, joined_at: iso(m.joined_at) })));
+  });
+
+  // The owner removes a member, or a member leaves.
+  app.delete("/v1/channels/:id/members/:userId", user, async (c) => {
+    const me = c.get("userId");
+    const channelId = c.req.param("id");
+    const target = c.req.param("userId");
+    const owner = (await store.ownedChannel(c.env.DB, me, channelId)) !== null;
+    if ((!owner && target !== me) || !(await store.removeMember(c.env.DB, channelId, target))) fail(404, "not found");
+    return c.body(null, 204);
+  });
+
+  app.put("/v1/devices/:id/channels", user, async (c) => {
+    const req = await readJson<{ channel_ids: string[] }>(c, ["channel_ids"]);
+    const userId = c.get("userId");
+    const d = (await store.listDevices(c.env.DB, userId)).find((x) => x.id === c.req.param("id"));
+    if (!d) fail(404, "not found");
+    await store.setSubscriptions(c.env.DB, d.id, await memberOfAll(c.env.DB, userId, req.channel_ids));
+    return c.json(await deviceChannels(c.env.DB, d));
+  });
+
   // --- device ---
+
+  app.get("/v1/device/channels", device, async (c) => c.json(await deviceChannels(c.env.DB, c.get("device"))));
+
+  app.put("/v1/device/channels", device, async (c) => {
+    const req = await readJson<{ channel_ids: string[] }>(c, ["channel_ids"]);
+    const d = c.get("device");
+    await store.setSubscriptions(c.env.DB, d.id, await memberOfAll(c.env.DB, d.user_id, req.channel_ids));
+    return c.json(await deviceChannels(c.env.DB, d));
+  });
+
+  // A phone joins a channel for its owner and subscribes itself.
+  app.post("/v1/device/memberships", device, async (c) => {
+    const req = await readJson<{ invite: string }>(c, ["invite"]);
+    const d = c.get("device");
+    const ch = await join(c.env.DB, d.user_id, req.invite);
+    await store.subscribe(c.env.DB, d.id, ch.id);
+    return c.json({ id: ch.id, name: channelLabel(ch, d.user_id) }, 201);
+  });
 
   app.post("/v1/devices", async (c) => {
     const req = await readJson<{ code: string; name: string; fcm_token: string }>(c, ["code", "name", "fcm_token"]);
@@ -425,12 +606,13 @@ export function createApp(deps: Deps): Hono<AppEnv> {
   app.post("/v1/notifications", userOrApiKey, async (c) => {
     const userId = c.get("userId");
     await rateLimit(c.env, userId);
-    const req = await readJson<{ title: string; body: string; priority: string; device_ids: string[] }>(c, [
-      "title",
-      "body",
-      "priority",
-      "device_ids",
-    ]);
+    const req = await readJson<{
+      title: string;
+      body: string;
+      priority: string;
+      device_ids: string[];
+      channels: string[];
+    }>(c, ["title", "body", "priority", "device_ids", "channels"]);
     const title = typeof req.title === "string" ? req.title : "";
     const body = typeof req.body === "string" ? req.body : "";
     if (title.trim() === "") fail(400, "title is required");
@@ -440,19 +622,35 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     const priority =
       req.priority === undefined || req.priority === null || req.priority === "" ? "default" : req.priority;
     if (priority !== "default" && priority !== "high") fail(400, 'priority must be "default" or "high"');
-    const ids = req.device_ids ?? [];
-    if (!Array.isArray(ids) || !ids.every((id) => typeof id === "string")) {
-      fail(400, "device_ids must be an array of strings");
+    const ids = stringList(req.device_ids, "device_ids");
+    let names = channelNames(req.channels);
+    const scope = c.get("keyScope");
+    if (scope.length > 0 && ids.length > 0) fail(403, "this API key may only publish to its channels");
+    if (names.length === 0 && ids.length === 0) names = ["default"];
+    const channels = await ownedChannels(c.env.DB, userId, names);
+    const outside = channels.find((ch) => scope.length > 0 && !scope.includes(ch.id));
+    if (outside) fail(403, `this API key may not publish to "${outside.name}"`);
+
+    // Each device gets the message once, labelled with the first requested
+    // channel it subscribes to; devices named directly carry no channel.
+    const targets = new Map<string, { device: Device; channel?: Channel }>();
+    for (const ch of channels) {
+      for (const d of await store.subscribers(c.env.DB, ch.id)) {
+        if (!targets.has(d.id)) targets.set(d.id, { device: d, channel: ch });
+      }
     }
+    if (ids.length > 0) {
+      const own = await store.listDevices(c.env.DB, userId);
+      const unknown = ids.find((id) => !own.some((d) => d.id === id));
+      if (unknown !== undefined) fail(404, `no paired device ${unknown}`);
+      for (const d of own) {
+        if (ids.includes(d.id) && !targets.has(d.id)) targets.set(d.id, { device: d });
+      }
+    }
+    if (targets.size === 0) fail(404, "no matching paired devices");
 
-    const all = await store.listDevices(c.env.DB, userId);
-    const unknown = ids.find((id) => !all.some((d) => d.id === id));
-    if (unknown !== undefined) fail(404, `no paired device ${unknown}`);
-    const targets = ids.length === 0 ? all : all.filter((d) => ids.includes(d.id));
-    if (targets.length === 0) fail(404, "no paired devices");
-
-    const p: Payload = { id: newId("msg_"), title, priority, sent_at: deps.now() };
-    if (body !== "") p.body = body;
+    const base: Payload = { id: newId("msg_"), title, priority, sent_at: deps.now() };
+    if (body !== "") base.body = body;
     // A failed warm-up (including a missing or invalid FCM_SERVICE_ACCOUNT)
     // is not fatal: each send retries and reports per device.
     try {
@@ -460,8 +658,12 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     } catch (err) {
       console.error("push prepare failed", err);
     }
-    const deliveries = await Promise.all(targets.map((d) => deliver(c.env, d, p)));
-    return c.json({ id: p.id, deliveries });
+    const deliveries = await Promise.all(
+      [...targets.values()].map(({ device: d, channel: ch }) =>
+        deliver(c.env, d, ch ? { ...base, channel: channelLabel(ch, d.user_id), channel_id: ch.id } : base),
+      ),
+    );
+    return c.json({ id: base.id, deliveries });
   });
 
   app.notFound((c) => c.json({ error: "not found" }, 404));
