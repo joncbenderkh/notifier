@@ -17,8 +17,7 @@
     {
       "binding": "DB",
       "database_name": "notifier",
-      // Placeholder until `npx wrangler d1 create notifier` is run.
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "6655fe1d-cd78-4fa1-a0b3-4b17b8cb5863",
       "migrations_dir": "migrations"
     }
   ]
