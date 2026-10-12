@@ -139,7 +139,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, transport htt
 			// Read before the timeout starts: the producer may be a long job.
 			b, more, err := readTail(stdin, stdinTailBytes)
 			if err != nil {
-				return fail(stderr, err)
+				return fail(stderr, err, "API key")
 			}
 			body, dropped = strings.TrimRight(string(b), "\r\n"), more
 		}
@@ -152,13 +152,13 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, transport htt
 	if len(to) > 0 {
 		devices, err := client.Devices(ctx)
 		if err != nil {
-			return fail(stderr, err)
+			return fail(stderr, err, "API key")
 		}
 		if n.DeviceIDs, err = ResolveDevices(devices, to); errors.Is(err, ErrNoSuchDevice) {
 			fmt.Fprintln(stderr, "notify:", err)
 			return exitUndelivered
 		} else if err != nil {
-			return fail(stderr, err)
+			return fail(stderr, err, "API key")
 		}
 	}
 
@@ -170,7 +170,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, transport htt
 		return exitUndelivered
 	}
 	if err != nil {
-		return fail(stderr, err)
+		return fail(stderr, err, "API key")
 	}
 	code := 0
 	reported := make(map[string]bool, len(result.Deliveries))
@@ -299,7 +299,7 @@ func fitBody(s string, dropped bool) string {
 func listDevices(ctx context.Context, client *Client, stdout, stderr io.Writer) int {
 	devices, err := client.Devices(ctx)
 	if err != nil {
-		return fail(stderr, err)
+		return fail(stderr, err, "API key")
 	}
 	w := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(w, "ID\tNAME\tREACHABLE")
@@ -310,10 +310,11 @@ func listDevices(ctx context.Context, client *Client, stdout, stderr io.Writer) 
 	return 0
 }
 
-func fail(stderr io.Writer, err error) int {
+// fail reports err; credential names what a 401 rejected.
+func fail(stderr io.Writer, err error, credential string) int {
 	var apiErr *APIError
 	if errors.As(err, &apiErr) && apiErr.Status == http.StatusUnauthorized {
-		fmt.Fprintln(stderr, "notify: the server rejected the API key")
+		fmt.Fprintln(stderr, "notify: the server rejected the", credential)
 		return exitError
 	}
 	fmt.Fprintln(stderr, "notify:", err)

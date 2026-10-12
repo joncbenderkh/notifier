@@ -388,6 +388,36 @@ func TestPairNeedsAdminToken(t *testing.T) {
 	}
 }
 
+func TestPairNamesTheAdminTokenOn401(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]string{"error": "invalid admin token"})
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("NOTIFIER_ADMIN_TOKEN", "wrong")
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-url", srv.URL, "pair"}, strings.NewReader(""), &stdout, &stderr, nil)
+	if code != exitError || !strings.Contains(stderr.String(), "admin token") || strings.Contains(stderr.String(), "API key") {
+		t.Fatalf("exit %d, stderr %q", code, stderr.String())
+	}
+}
+
+func TestPairPrintsCodeWithoutLink(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]any{"code": "7KQ2-MX9D", "expires_at": time.Now().Add(10 * time.Minute)})
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("NOTIFIER_ADMIN_TOKEN", "admin-token-admin-token-admin-token")
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-url", srv.URL, "pair"}, strings.NewReader(""), &stdout, &stderr, nil)
+	if code != 0 || !strings.Contains(stdout.String(), "7KQ2-MX9D") || strings.Contains(stdout.String(), "▀") {
+		t.Fatalf("exit %d, stdout %q, stderr %q", code, stdout.String(), stderr.String())
+	}
+}
+
 func TestRenderQRCoversWholeCode(t *testing.T) {
 	out, err := renderQR("notifier://pair?server=https%3A%2F%2Fexample.com&code=7KQ2-MX9D")
 	if err != nil {

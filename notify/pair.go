@@ -15,15 +15,19 @@ import (
 func pair(ctx context.Context, client *Client, stdout, stderr io.Writer) int {
 	p, err := client.Pair(ctx)
 	if err != nil {
-		return fail(stderr, err)
+		return fail(stderr, err, "admin token (NOTIFIER_ADMIN_TOKEN)")
 	}
-	qr, err := renderQR(p.URI)
-	if err != nil {
-		return fail(stderr, err)
+	// The code already exists on the server, so always print it, even when
+	// there is no QR to go with it.
+	how := "Scan with the Notifier app, or enter by hand:"
+	if qr, err := renderQR(p.URI); err == nil {
+		fmt.Fprint(stdout, qr, "\n")
+	} else {
+		fmt.Fprintln(stderr, "notify: no QR code:", err)
+		how = "Enter in the Notifier app:"
 	}
-	fmt.Fprint(stdout, qr)
-	fmt.Fprintf(stdout, "\nScan with the Notifier app, or enter by hand:\n  server  %s\n  code    %s  (expires %s, single use)\n",
-		client.BaseURL, p.Code, p.ExpiresAt.Local().Format(time.Kitchen))
+	fmt.Fprintf(stdout, "%s\n  server  %s\n  code    %s  (expires %s, single use)\n",
+		how, client.BaseURL, p.Code, p.ExpiresAt.Local().Format(time.Kitchen))
 	return 0
 }
 
