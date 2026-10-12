@@ -40,8 +40,9 @@ const (
 	exitUsage       = 2
 	exitUndelivered = 3
 
-	// maxBodyBytes mirrors the server's limit on the notification body.
-	maxBodyBytes = 2048
+	// maxTitleBytes and maxBodyBytes mirror the server's limits.
+	maxTitleBytes = 256
+	maxBodyBytes  = 2048
 	// stdinTailBytes bounds memory when a large stream is piped in; only its
 	// end can ever be sent.
 	stdinTailBytes = 8 << 10
@@ -62,10 +63,11 @@ func (m *multiFlag) Set(v string) error {
 }
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr, nil))
 }
 
-func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+// run executes the command; transport is nil outside tests.
+func run(args []string, stdin io.Reader, stdout, stderr io.Writer, transport http.RoundTripper) int {
 	fs := flag.NewFlagSet("notify", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var to multiFlag
@@ -84,7 +86,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 	rest := fs.Args()
-	if len(rest) == 1 && rest[0] == "version" {
+	// After "--", "devices" and "version" are a title like any other.
+	subcommands := !endedByDoubleDash(fs, args, rest)
+	if subcommands && len(rest) == 1 && rest[0] == "version" {
 		fmt.Fprintln(stdout, version)
 		return 0
 	}
@@ -96,9 +100,13 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "notify:", err)
 		return exitUsage
 	}
-	client := &Client{BaseURL: *baseURL, APIKey: *apiKey, HTTP: http.DefaultClient}
+	client := &Client{
+		BaseURL: *baseURL,
+		APIKey:  *apiKey,
+		HTTP:    &http.Client{Transport: transport, CheckRedirect: refuseRedirect},
+	}
 
-	if len(rest) == 1 && rest[0] == "devices" {
+	if subcommands && len(rest) == 1 && rest[0] == "devices" {
 		ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 		defer cancel()
 		return listDevices(ctx, client, stdout, stderr)
@@ -108,7 +116,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 
-	n := Notification{Title: rest[0]}
+	n := Notification{Title: fitTitle(rest[0])}
 	if *high {
 		n.Priority = "high"
 	}
@@ -133,7 +141,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		if err != nil {
 			return fail(stderr, err)
 		}
-		if n.DeviceIDs, err = ResolveDevices(devices, to); err != nil {
+		if n.DeviceIDs, err = ResolveDevices(devices, to); errors.Is(err, ErrNoSuchDevice) {
+			fmt.Fprintln(stderr, "notify:", err)
+			return exitUndelivered
+		} else if err != nil {
 			return fail(stderr, err)
 		}
 	}
@@ -149,7 +160,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return fail(stderr, err)
 	}
 	code := 0
+	reported := make(map[string]bool, len(result.Deliveries))
 	for _, d := range result.Deliveries {
+		reported[d.DeviceID] = true
 		line := fmt.Sprintf("%s: %s", d.DeviceID, d.Status)
 		if d.Error != "" {
 			line += " (" + d.Error + ")"
@@ -161,7 +174,43 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stdout, line)
 		}
 	}
+	// A phone unpaired between name resolution and sending is dropped by the
+	// server without a delivery entry.
+	for _, id := range n.DeviceIDs {
+		if !reported[id] {
+			code = exitUndelivered
+			fmt.Fprintf(stderr, "%s: no longer paired\n", id)
+		}
+	}
 	return code
+}
+
+// endedByDoubleDash reports whether flag parsing stopped at a "--"
+// terminator, as opposed to "--" being the value of a flag such as -to.
+func endedByDoubleDash(fs *flag.FlagSet, args, rest []string) bool {
+	consumed := len(args) - len(rest)
+	if consumed == 0 || args[consumed-1] != "--" {
+		return false
+	}
+	if consumed < 2 {
+		return true
+	}
+	prev := strings.TrimLeft(args[consumed-2], "-")
+	if strings.Contains(prev, "=") || !strings.HasPrefix(args[consumed-2], "-") {
+		return true
+	}
+	f := fs.Lookup(prev)
+	if f == nil {
+		return true
+	}
+	boolFlag, ok := f.Value.(interface{ IsBoolFlag() bool })
+	return ok && boolFlag.IsBoolFlag()
+}
+
+// refuseRedirect stops the client from following redirects: Go would resend
+// the Authorization header to a same-host http:// target, leaking the key.
+func refuseRedirect(req *http.Request, _ []*http.Request) error {
+	return fmt.Errorf("server redirected to %s; set NOTIFIER_URL to the final https URL", req.URL)
 }
 
 // checkURL refuses to send the API key in cleartext anywhere but loopback.
@@ -202,6 +251,20 @@ func readTail(r io.Reader, max int) (tail []byte, more bool, err error) {
 			return nil, more, err
 		}
 	}
+}
+
+// fitTitle makes s valid UTF-8 and shortens it to the server's limit,
+// keeping the start and marking the cut.
+func fitTitle(s string) string {
+	s = strings.ToValidUTF8(s, "\uFFFD")
+	if len(s) <= maxTitleBytes {
+		return s
+	}
+	end := maxTitleBytes - len(truncated)
+	for end > 0 && !utf8.RuneStart(s[end]) {
+		end--
+	}
+	return s[:end] + truncated
 }
 
 // fitBody makes s valid UTF-8 (JSON encoding would otherwise expand each

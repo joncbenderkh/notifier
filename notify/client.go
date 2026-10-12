@@ -62,6 +62,9 @@ func (c *Client) Notify(ctx context.Context, n Notification) (NotifyResult, erro
 	return result, c.do(ctx, http.MethodPost, "/v1/notifications", n, &result)
 }
 
+// ErrNoSuchDevice means a selector matched no paired phone.
+var ErrNoSuchDevice = errors.New("no paired phone matches")
+
 // ResolveDevices maps each selector (a device ID, or a name compared
 // case-insensitively) to exactly one device ID.
 func ResolveDevices(devices []Device, selectors []string) ([]string, error) {
@@ -79,7 +82,7 @@ func ResolveDevices(devices []Device, selectors []string) ([]string, error) {
 		}
 		switch len(matches) {
 		case 0:
-			return nil, fmt.Errorf("no paired device named or with ID %q (see `notify devices`)", sel)
+			return nil, fmt.Errorf("%w %q (see `notify devices`)", ErrNoSuchDevice, sel)
 		case 1:
 			ids = append(ids, matches[0].ID)
 		default:
