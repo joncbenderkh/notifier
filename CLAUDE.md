@@ -81,6 +81,23 @@ See `README.md` for the user-facing setup and API table.
   token (which revokes the old one), so `ADMIN_TOKEN` is not barred from
   sending, only from doing so unnoticed. OAuth sign-up is planned
   separately (issue #10).
+- **Channels (issue #6):** messages are published to channels; devices
+  subscribe. A channel has one owner, who alone publishes (with their token
+  or an API key scoped through `api_key_channels`; an unscoped key may
+  publish to any of the owner's channels and address devices directly).
+  Other users join by single-use channel invite (hashed as
+  `channel-invite:` + code) and choose which of their devices subscribe.
+  Delivery joins `channel_members`, so a removed member's stale subscription
+  delivers nothing. Each user has `ch_default_<user id>`, which cannot be
+  shared or deleted, and every device subscribes to it when paired; a send
+  without `channels` or `device_ids` goes there. Triggers in
+  `0003_channels.sql` create both, so rows the previous Worker writes
+  during a deploy are covered too (D1 counts trigger rows in
+  `meta.changes`, so check those inserts with `> 0`). Deleting a channel
+  keeps its `api_key_channels` rows, so a key scoped only to deleted
+  channels stays scoped to nothing rather than becoming unscoped. The sealed payload carries the optional
+  `channel` (as the receiver names it: `homelab` or `alice/homelab`) and
+  `channel_id`.
 - **Credentials:** operator token (`ADMIN_TOKEN` Worker secret: user
   management and invites only), user tokens (`nu_`), API keys (`nk_`, a
   user's), device tokens (`nd_`), pairing codes (Crockford base32
