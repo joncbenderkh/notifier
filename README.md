@@ -113,9 +113,11 @@ notify devices
 notify version
 
   -to PHONE   device name (case-insensitive) or ID; repeatable or
-              comma-separated. Default: every paired phone.
+              comma-separated (a name containing a comma needs its ID).
+              Default: every paired phone.
   -high       high priority (heads-up, may wake the phone)
-  -url URL    server (default $NOTIFIER_URL)
+  -url URL    server (default $NOTIFIER_URL); must be https except for
+              localhost or a loopback IP, and redirects are refused
   -key KEY    API key (default $NOTIFIER_API_KEY)
   -timeout    request timeout (default 30s), counted from when the request
               starts, not while waiting for stdin
@@ -123,16 +125,19 @@ notify version
 
 Flags must come before TITLE; everything from TITLE on is message text, so a
 body taken from a variable can never act as a flag. Put `--` before a title
-that starts with `-`. A `BODY` of `-` reads standard input, so a long job can
-report when it finishes: `make test 2>&1 | tail -5 | notify "Tests" -`.
-Bodies over the server's 2048-byte limit keep their last 2048 bytes (where a
-log's error usually is), prefixed with `…`; invalid UTF-8 is replaced, and
-only the last 8 KiB of a piped stream is ever held in memory. The server URL must be `https`,
-except for `localhost`.
+that starts with `-` or is exactly `devices` or `version`.
 
-Exit status is 0 when every phone accepted the message; 3 when any delivery
-failed, a phone was unreachable, or no paired phone matched; 1 on other
-errors; and 2 on usage errors.
+A `BODY` of `-` reads standard input, so a long job can report when it
+finishes: `make test 2>&1 | tail -5 | notify "Tests" -`. Only the last 8 KiB
+of a piped stream is held in memory. Invalid UTF-8 is replaced, and text over
+the server's limits is shortened and marked with `…`: a title (256 bytes)
+keeps its start, a body (2048 bytes) keeps its end, where a log's error
+usually is.
+
+Exit status is 0 when every targeted phone accepted the message; 3 when
+nothing reached some phone (a delivery failed, a phone was unreachable or
+unpaired before sending, or no paired phone matched, with or without `-to`);
+1 on other errors; and 2 on usage errors.
 
 Install a tagged release with
 `go install github.com/joncbenderkh/notifier/notify@latest` (the module lives
