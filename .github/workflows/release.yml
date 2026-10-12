@@ -9,33 +9,35 @@ permissions:
   contents: write
 
 jobs:
-  server:
-    name: Build server binaries
+  notify:
+    name: Build notify CLI binaries
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: server
+        working-directory: notify
     steps:
       - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v7
         with:
-          go-version-file: server/go.mod
-          cache-dependency-path: server/go.sum
+          go-version-file: notify/go.mod
+          cache-dependency-path: notify/go.mod
 
-      - name: Build linux binaries
+      - name: Build binaries
         run: |
           version="${GITHUB_REF_NAME#v}"
-          for arch in amd64 arm64; do
-            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath \
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+            os="${target%/*}"; arch="${target#*/}"; ext=""
+            [ "$os" = windows ] && ext=".exe"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath \
               -ldflags "-s -w -X main.version=$version" \
-              -o "dist/notifier-server-linux-$arch" ./cmd/notifier
+              -o "dist/notify-$os-$arch$ext" .
           done
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          files: server/dist/*
+          files: notify/dist/*
           generate_release_notes: true
 
   android-unsigned:
