@@ -287,6 +287,8 @@ export interface Membership extends Channel {
   members: number;
 }
 
+// The Android app recognizes a default channel by this prefix (ChannelRoute.kt);
+// newId("ch_") cannot produce it, since its base32 has no "_".
 export const defaultChannelId = (userId: string) => `ch_default_${userId}`;
 
 const CHANNEL_COLUMNS = "c.id, c.owner_id, o.name AS owner_name, c.name, c.created_at";

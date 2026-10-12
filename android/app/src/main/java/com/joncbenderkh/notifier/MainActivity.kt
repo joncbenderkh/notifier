@@ -19,7 +19,7 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         // Only on a fresh launch: after a configuration change the link has
         // already been handled.
-        if (savedInstanceState == null) handlePairingLink(intent)
+        if (savedInstanceState == null) handleLink(intent)
         setContent {
             NotifierTheme {
                 NotifierScreen(viewModel)
@@ -29,10 +29,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        handlePairingLink(intent)
+        handleLink(intent)
     }
 
-    private fun handlePairingLink(intent: Intent) {
-        if (intent.action == Intent.ACTION_VIEW) intent.dataString?.let(viewModel::openPairingLink)
+    private fun handleLink(intent: Intent) {
+        if (intent.action == Intent.ACTION_VIEW) intent.dataString?.let(viewModel::openLink)
     }
 }

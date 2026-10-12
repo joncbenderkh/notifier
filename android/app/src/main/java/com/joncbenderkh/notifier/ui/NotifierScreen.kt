@@ -9,12 +9,14 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -25,7 +27,9 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -34,6 +38,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardCapitalization
@@ -46,8 +51,10 @@ import com.google.mlkit.common.MlKitException
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
 import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
+import com.joncbenderkh.notifier.data.DeviceChannel
+import com.joncbenderkh.notifier.data.NotifierLink
 import com.joncbenderkh.notifier.data.Pairing
-import com.joncbenderkh.notifier.data.PairingLink
+import com.joncbenderkh.notifier.push.ChannelRoute
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -83,14 +90,69 @@ fun NotifierScreen(viewModel: MainViewModel = viewModel()) {
                     enabled = !state.busy,
                     prefill = state.prefill,
                     onPrefillConsumed = viewModel::consumePrefill,
-                    onScanned = viewModel::openPairingLink,
+                    onScanned = viewModel::openLink,
                     onScanFailed = viewModel::showMessage,
                     onPair = viewModel::pair,
                 )
             } else {
                 PairedPanel(pairing, enabled = !state.busy, onTest = viewModel::sendTest, onUnpair = viewModel::unpair)
+                ChannelsCard(
+                    channels = state.channels,
+                    enabled = !state.busy,
+                    onToggle = viewModel::setSubscribed,
+                    onRefresh = viewModel::refreshChannels,
+                )
+                JoinCard(
+                    enabled = !state.busy,
+                    onJoin = viewModel::join,
+                    onScanned = viewModel::openLink,
+                    onScanFailed = viewModel::showMessage,
+                )
             }
         }
+    }
+
+    state.pendingJoin?.let { link ->
+        AlertDialog(
+            onDismissRequest = viewModel::cancelJoin,
+            title = { Text("Join a channel?") },
+            text = {
+                Text(
+                    "Invite ${link.code} adds you to a channel on ${link.serverUrl} and subscribes this " +
+                        "phone, which will then show whatever its owner sends. Only join channels from " +
+                        "people you trust."
+                )
+            },
+            confirmButton = { TextButton(onClick = viewModel::confirmJoin) { Text("Join") } },
+            dismissButton = { TextButton(onClick = viewModel::cancelJoin) { Text("Cancel") } },
+        )
+    }
+}
+
+/** Returns a function that opens Google's QR scanner and reports the result. */
+@Composable
+private fun rememberQrScanner(onScanned: (String) -> Unit, onScanFailed: (String) -> Unit): () -> Unit {
+    val context = LocalContext.current
+    val scanner = remember(context) {
+        GmsBarcodeScanning.getClient(
+            context,
+            GmsBarcodeScannerOptions.Builder().setBarcodeFormats(Barcode.FORMAT_QR_CODE).build(),
+        )
+    }
+    return {
+        scanner.startScan()
+            .addOnSuccessListener { barcode -> barcode.rawValue?.let(onScanned) }
+            .addOnFailureListener { e ->
+                Log.w("QrScanner", "QR scan failed", e)
+                onScanFailed(
+                    if (e is MlKitException && e.errorCode == MlKitException.CODE_SCANNER_UNAVAILABLE) {
+                        "The QR scanner is still being installed by Google Play services. " +
+                            "Try again shortly, or enter the code by hand."
+                    } else {
+                        "Could not scan: ${e.message}"
+                    }
+                )
+            }
     }
 }
 
@@ -122,7 +184,7 @@ private fun NotificationPermissionCard() {
 private fun PairingForm(
     defaultName: String,
     enabled: Boolean,
-    prefill: PairingLink?,
+    prefill: NotifierLink.Pair?,
     onPrefillConsumed: () -> Unit,
     onScanned: (String) -> Unit,
     onScanFailed: (String) -> Unit,
@@ -140,13 +202,7 @@ private fun PairingForm(
         }
     }
 
-    val context = LocalContext.current
-    val scanner = remember(context) {
-        GmsBarcodeScanning.getClient(
-            context,
-            GmsBarcodeScannerOptions.Builder().setBarcodeFormats(Barcode.FORMAT_QR_CODE).build(),
-        )
-    }
+    val scan = rememberQrScanner(onScanned, onScanFailed)
 
     Text("Pair with a server", style = MaterialTheme.typography.titleLarge)
     Text(
@@ -154,21 +210,7 @@ private fun PairingForm(
             "(or enter the code by hand) within ten minutes."
     )
     Button(
-        onClick = {
-            scanner.startScan()
-                .addOnSuccessListener { barcode -> barcode.rawValue?.let(onScanned) }
-                .addOnFailureListener { e ->
-                    Log.w("PairingForm", "QR scan failed", e)
-                    onScanFailed(
-                        if (e is MlKitException && e.errorCode == MlKitException.CODE_SCANNER_UNAVAILABLE) {
-                            "The QR scanner is still being installed by Google Play services. " +
-                                "Try again shortly, or enter the code by hand."
-                        } else {
-                            "Could not scan: ${e.message}"
-                        }
-                    )
-                }
-        },
+        onClick = scan,
         enabled = enabled,
         modifier = Modifier.fillMaxWidth(),
     ) {
@@ -222,5 +264,80 @@ private fun PairedPanel(pairing: Pairing, enabled: Boolean, onTest: () -> Unit, 
     }
     OutlinedButton(onClick = onUnpair, enabled = enabled, modifier = Modifier.fillMaxWidth()) {
         Text("Unpair")
+    }
+}
+
+@Composable
+private fun ChannelsCard(
+    channels: List<DeviceChannel>?,
+    enabled: Boolean,
+    onToggle: (String, Boolean) -> Unit,
+    onRefresh: () -> Unit,
+) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Channels", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
+                TextButton(onClick = onRefresh, enabled = enabled) { Text("Refresh") }
+            }
+            if (channels == null) {
+                Text("Not loaded yet.")
+                return@Column
+            }
+            for (channel in channels) {
+                // A send without a channel goes to default, so it stays on.
+                val isDefault = ChannelRoute.isDefaultChannel(channel.id)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text(channel.name)
+                        if (isDefault) Text("Always on", style = MaterialTheme.typography.bodySmall)
+                    }
+                    Switch(
+                        checked = channel.subscribed || isDefault,
+                        onCheckedChange = { onToggle(channel.id, it) },
+                        enabled = enabled && !isDefault,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun JoinCard(
+    enabled: Boolean,
+    onJoin: (String) -> Unit,
+    onScanned: (String) -> Unit,
+    onScanFailed: (String) -> Unit,
+) {
+    var code by rememberSaveable { mutableStateOf("") }
+    val scan = rememberQrScanner(onScanned, onScanFailed)
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Join a channel", style = MaterialTheme.typography.titleLarge)
+            Text("Scan or enter an invite from the channel's owner (`notify channel invite`).")
+            OutlinedButton(onClick = scan, enabled = enabled, modifier = Modifier.fillMaxWidth()) {
+                Text("Scan invite QR code")
+            }
+            OutlinedTextField(
+                value = code,
+                onValueChange = { code = it },
+                label = { Text("Invite code") },
+                placeholder = { Text("XXXX-XXXX-XXXX") },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Characters),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Button(
+                onClick = {
+                    onJoin(code)
+                    code = ""
+                },
+                enabled = enabled && code.isNotBlank(),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("Join")
+            }
+        }
     }
 }
