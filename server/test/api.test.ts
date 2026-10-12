@@ -535,7 +535,7 @@ describe("channels", () => {
     const members = await call<{ id: string; name: string }[]>("GET", `/v1/channels/${homelab}/members`, USER, undefined, 200);
     expect(members.map((m) => m.name)).toEqual(["alice", "bob"]);
     await call("GET", `/v1/channels/${homelab}/members`, bob, undefined, 404);
-    const bobId = members[1]!.id;
+    const bobId = members.find((m) => m.name === "bob")!.id;
     await call("DELETE", `/v1/channels/${homelab}/members/${bobId}`, USER, undefined, 204);
     await call("POST", "/v1/notifications", USER, { title: "again", channels: ["homelab"] }, 404);
   });

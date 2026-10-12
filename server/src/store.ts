@@ -442,7 +442,7 @@ export async function members(
   const { results } = await db
     .prepare(
       `SELECT u.id, u.name, m.joined_at FROM channel_members m JOIN users u ON u.id = m.user_id
-       WHERE m.channel_id = ? ORDER BY m.joined_at`,
+       WHERE m.channel_id = ? ORDER BY m.joined_at, u.name`,
     )
     .bind(channelId)
     .all<{ id: string; name: string; joined_at: number }>();
