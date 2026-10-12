@@ -11,12 +11,14 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
-// Client calls the sender-facing half of the notifier API with an API key.
+// Client calls the notifier API with a bearer token: an API key for
+// sending, or the admin token for pairing.
 type Client struct {
 	BaseURL string
-	APIKey  string
+	Token   string
 	HTTP    *http.Client
 }
 
@@ -55,6 +57,18 @@ func (e *APIError) Error() string { return fmt.Sprintf("server returned %d: %s",
 func (c *Client) Devices(ctx context.Context) ([]Device, error) {
 	var devices []Device
 	return devices, c.do(ctx, http.MethodGet, "/v1/devices", nil, &devices)
+}
+
+type Pairing struct {
+	Code      string    `json:"code"`
+	ExpiresAt time.Time `json:"expires_at"`
+	URI       string    `json:"uri"`
+}
+
+// Pair creates a single-use pairing code; it needs the admin token.
+func (c *Client) Pair(ctx context.Context) (Pairing, error) {
+	var p Pairing
+	return p, c.do(ctx, http.MethodPost, "/v1/pairings", nil, &p)
 }
 
 func (c *Client) Notify(ctx context.Context, n Notification) (NotifyResult, error) {
@@ -105,7 +119,7 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any) error
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+c.APIKey)
+	req.Header.Set("Authorization", "Bearer "+c.Token)
 	if in != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}

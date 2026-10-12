@@ -5,6 +5,7 @@
 //
 //	notify [-to PHONE]... [-high] TITLE [BODY | -]
 //	notify devices
+//	notify pair
 //	notify version
 //
 // PHONE is a device name (case-insensitive) or ID; without -to the
@@ -13,7 +14,8 @@
 // message text, so a body from a variable can never act as a flag (such as
 // -url). Use "--" before a title that starts with "-". The server and
 // credential come from NOTIFIER_URL and NOTIFIER_API_KEY, or from -url and
-// -key.
+// -key. `notify pair` instead uses the admin token from NOTIFIER_ADMIN_TOKEN
+// and prints a QR code for the phone app to scan.
 package main
 
 import (
@@ -77,7 +79,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, transport htt
 	apiKey := fs.String("key", os.Getenv("NOTIFIER_API_KEY"), "API `key` (default $NOTIFIER_API_KEY)")
 	timeout := fs.Duration("timeout", 30*time.Second, "request timeout, counted from when the request starts")
 	fs.Usage = func() {
-		fmt.Fprint(stderr, "Usage:\n  notify [flags] TITLE [BODY | -]\n  notify devices\n  notify version\n\n"+
+		fmt.Fprint(stderr, "Usage:\n  notify [flags] TITLE [BODY | -]\n  notify devices\n  notify pair\n  notify version\n\n"+
 			"Flags must come before TITLE.\n\nFlags:\n")
 		fs.PrintDefaults()
 	}
@@ -86,14 +88,19 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, transport htt
 		return exitUsage
 	}
 	rest := fs.Args()
-	// After "--", "devices" and "version" are a title like any other.
+	// After "--", "devices", "pair" and "version" are a title like any other.
 	subcommands := !endedByDoubleDash(fs, args, rest)
 	if subcommands && len(rest) == 1 && rest[0] == "version" {
 		fmt.Fprintln(stdout, version)
 		return 0
 	}
-	if *baseURL == "" || *apiKey == "" {
-		fmt.Fprintln(stderr, "notify: set NOTIFIER_URL and NOTIFIER_API_KEY (or pass -url and -key)")
+	pairing := subcommands && len(rest) == 1 && rest[0] == "pair"
+	token, tokenSource := *apiKey, "NOTIFIER_API_KEY (or pass -key)"
+	if pairing {
+		token, tokenSource = os.Getenv("NOTIFIER_ADMIN_TOKEN"), "NOTIFIER_ADMIN_TOKEN"
+	}
+	if *baseURL == "" || token == "" {
+		fmt.Fprintf(stderr, "notify: set NOTIFIER_URL (or pass -url) and %s\n", tokenSource)
 		return exitUsage
 	}
 	if err := checkURL(*baseURL); err != nil {
@@ -102,8 +109,14 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, transport htt
 	}
 	client := &Client{
 		BaseURL: *baseURL,
-		APIKey:  *apiKey,
+		Token:   token,
 		HTTP:    &http.Client{Transport: transport, CheckRedirect: refuseRedirect},
+	}
+
+	if pairing {
+		ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+		defer cancel()
+		return pair(ctx, client, stdout, stderr)
 	}
 
 	if subcommands && len(rest) == 1 && rest[0] == "devices" {
@@ -126,7 +139,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, transport htt
 			// Read before the timeout starts: the producer may be a long job.
 			b, more, err := readTail(stdin, stdinTailBytes)
 			if err != nil {
-				return fail(stderr, err)
+				return fail(stderr, err, "API key")
 			}
 			body, dropped = strings.TrimRight(string(b), "\r\n"), more
 		}
@@ -139,13 +152,13 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, transport htt
 	if len(to) > 0 {
 		devices, err := client.Devices(ctx)
 		if err != nil {
-			return fail(stderr, err)
+			return fail(stderr, err, "API key")
 		}
 		if n.DeviceIDs, err = ResolveDevices(devices, to); errors.Is(err, ErrNoSuchDevice) {
 			fmt.Fprintln(stderr, "notify:", err)
 			return exitUndelivered
 		} else if err != nil {
-			return fail(stderr, err)
+			return fail(stderr, err, "API key")
 		}
 	}
 
@@ -157,7 +170,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, transport htt
 		return exitUndelivered
 	}
 	if err != nil {
-		return fail(stderr, err)
+		return fail(stderr, err, "API key")
 	}
 	code := 0
 	reported := make(map[string]bool, len(result.Deliveries))
@@ -286,7 +299,7 @@ func fitBody(s string, dropped bool) string {
 func listDevices(ctx context.Context, client *Client, stdout, stderr io.Writer) int {
 	devices, err := client.Devices(ctx)
 	if err != nil {
-		return fail(stderr, err)
+		return fail(stderr, err, "API key")
 	}
 	w := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(w, "ID\tNAME\tREACHABLE")
@@ -297,10 +310,11 @@ func listDevices(ctx context.Context, client *Client, stdout, stderr io.Writer) 
 	return 0
 }
 
-func fail(stderr io.Writer, err error) int {
+// fail reports err; credential names what a 401 rejected.
+func fail(stderr io.Writer, err error, credential string) int {
 	var apiErr *APIError
 	if errors.As(err, &apiErr) && apiErr.Status == http.StatusUnauthorized {
-		fmt.Fprintln(stderr, "notify: the server rejected the API key")
+		fmt.Fprintln(stderr, "notify: the server rejected the", credential)
 		return exitError
 	}
 	fmt.Fprintln(stderr, "notify:", err)

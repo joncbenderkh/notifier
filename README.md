@@ -86,12 +86,25 @@ messages instead of delivering them.
 
 ### 3. Pair the phone
 
+Create a single-use pairing code (valid 10 minutes) and show it as a QR code,
+either way:
+
+- **Browser:** open `https://notifier.joncbender.workers.dev/admin/pair`,
+  paste the admin token, and click *Create pairing code*. The token stays in
+  the page's memory and is sent only to that server.
+- **Terminal:** `NOTIFIER_ADMIN_TOKEN=... notify pair` prints the QR code.
+
+In the app, tap **Scan QR code** (or scan with the phone's camera app, which
+opens the `notifier://pair?...` link in Notifier). Scanning only fills in the
+form: check the server URL, then tap **Pair** and **Send test notification**.
+The code can also be typed by hand.
+
+The raw API works too:
+
 ```sh
 curl -X POST https://notifier.joncbender.workers.dev/v1/pairings -H "Authorization: Bearer $ADMIN_TOKEN"
-# {"code":"7KQ2-MX9D","expires_at":"..."}
+# {"code":"7KQ2-MX9D","expires_at":"...","uri":"notifier://pair?server=...&code=7KQ2-MX9D"}
 ```
-
-Enter the server URL and code in the app, then tap **Send test notification**.
 
 ### 4. Create an API key and send
 
@@ -110,6 +123,7 @@ notify -to pixel "Hello"
 ```
 notify [flags] TITLE [BODY | -]
 notify devices
+notify pair        # needs NOTIFIER_ADMIN_TOKEN; prints a pairing QR code
 notify version
 
   -to PHONE   device name (case-insensitive) or ID; repeatable or
@@ -125,7 +139,7 @@ notify version
 
 Flags must come before TITLE; everything from TITLE on is message text, so a
 body taken from a variable can never act as a flag. Put `--` before a title
-that starts with `-` or is exactly `devices` or `version`.
+that starts with `-` or is exactly `devices`, `pair`, or `version`.
 
 A `BODY` of `-` reads standard input, so a long job can report when it
 finishes: `make test 2>&1 | tail -5 | notify "Tests" -`. Only the last 8 KiB
@@ -151,7 +165,8 @@ a prebuilt binary from the
 |------------------------------|------------------|--------------|
 | `POST /v1/notifications`     | API key          | `{"title", "body"?, "priority"?: "default"\|"high", "device_ids"?: [...]}` — omitting `device_ids` sends to every paired device. Returns per-device delivery status. |
 | `GET /v1/devices`            | Admin or API key | |
-| `POST /v1/pairings`          | Admin            | Returns a single-use code valid for 10 minutes |
+| `POST /v1/pairings`          | Admin            | Returns a single-use code valid for 10 minutes and its `notifier://pair` link (`uri`); `?qr=svg` adds `qr_svg` |
+| `GET /admin/pair`            | —                | Static page that calls `POST /v1/pairings` with a pasted admin token and shows the QR code |
 | `DELETE /v1/devices/{id}`    | Admin            | |
 | `POST /v1/keys`              | Admin            | `{"name"}` |
 | `GET /v1/keys`               | Admin            | |

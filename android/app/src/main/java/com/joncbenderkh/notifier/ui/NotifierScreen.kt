@@ -4,6 +4,7 @@ package com.joncbenderkh.notifier.ui
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
+import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -41,7 +42,12 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.google.mlkit.common.MlKitException
+import com.google.mlkit.vision.barcode.common.Barcode
+import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
+import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
 import com.joncbenderkh.notifier.data.Pairing
+import com.joncbenderkh.notifier.data.PairingLink
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -72,7 +78,15 @@ fun NotifierScreen(viewModel: MainViewModel = viewModel()) {
             NotificationPermissionCard()
             val pairing = state.pairing
             if (pairing == null) {
-                PairingForm(viewModel.defaultDeviceName, enabled = !state.busy, onPair = viewModel::pair)
+                PairingForm(
+                    defaultName = viewModel.defaultDeviceName,
+                    enabled = !state.busy,
+                    prefill = state.prefill,
+                    onPrefillConsumed = viewModel::consumePrefill,
+                    onScanned = viewModel::openPairingLink,
+                    onScanFailed = viewModel::showMessage,
+                    onPair = viewModel::pair,
+                )
             } else {
                 PairedPanel(pairing, enabled = !state.busy, onTest = viewModel::sendTest, onUnpair = viewModel::unpair)
             }
@@ -105,16 +119,61 @@ private fun NotificationPermissionCard() {
 }
 
 @Composable
-private fun PairingForm(defaultName: String, enabled: Boolean, onPair: (String, String, String) -> Unit) {
+private fun PairingForm(
+    defaultName: String,
+    enabled: Boolean,
+    prefill: PairingLink?,
+    onPrefillConsumed: () -> Unit,
+    onScanned: (String) -> Unit,
+    onScanFailed: (String) -> Unit,
+    onPair: (String, String, String) -> Unit,
+) {
     var serverUrl by rememberSaveable { mutableStateOf("https://") }
     var code by rememberSaveable { mutableStateOf("") }
     var name by rememberSaveable { mutableStateOf(defaultName) }
 
+    LaunchedEffect(prefill) {
+        if (prefill != null) {
+            serverUrl = prefill.serverUrl
+            code = prefill.code
+            onPrefillConsumed()
+        }
+    }
+
+    val context = LocalContext.current
+    val scanner = remember(context) {
+        GmsBarcodeScanning.getClient(
+            context,
+            GmsBarcodeScannerOptions.Builder().setBarcodeFormats(Barcode.FORMAT_QR_CODE).build(),
+        )
+    }
+
     Text("Pair with a server", style = MaterialTheme.typography.titleLarge)
     Text(
-        "Create a pairing code on the server (POST /v1/pairings with the admin token), " +
-            "then enter it here within ten minutes."
+        "Open the server's /admin/pair page or run `notify pair`, then scan the QR code " +
+            "(or enter the code by hand) within ten minutes."
     )
+    Button(
+        onClick = {
+            scanner.startScan()
+                .addOnSuccessListener { barcode -> barcode.rawValue?.let(onScanned) }
+                .addOnFailureListener { e ->
+                    Log.w("PairingForm", "QR scan failed", e)
+                    onScanFailed(
+                        if (e is MlKitException && e.errorCode == MlKitException.CODE_SCANNER_UNAVAILABLE) {
+                            "The QR scanner is still being installed by Google Play services. " +
+                                "Try again shortly, or enter the code by hand."
+                        } else {
+                            "Could not scan: ${e.message}"
+                        }
+                    )
+                }
+        },
+        enabled = enabled,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Text("Scan QR code")
+    }
     OutlinedTextField(
         value = serverUrl,
         onValueChange = { serverUrl = it },

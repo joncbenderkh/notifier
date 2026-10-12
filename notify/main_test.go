@@ -357,3 +357,75 @@ func TestLongTitleIsFitted(t *testing.T) {
 		t.Fatalf("title of %d bytes", len(title))
 	}
 }
+
+func TestPairPrintsQRAndCode(t *testing.T) {
+	const admin = "admin-token-admin-token-admin-token"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/pairings" || r.Header.Get("Authorization") != "Bearer "+admin {
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]string{"error": "invalid admin token"})
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(Pairing{Code: "7KQ2-MX9D", ExpiresAt: time.Now().Add(10 * time.Minute), URI: "notifier://pair?server=x&code=7KQ2-MX9D"})
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("NOTIFIER_ADMIN_TOKEN", admin)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-url", srv.URL, "pair"}, strings.NewReader(""), &stdout, &stderr, nil)
+	if code != 0 || !strings.Contains(stdout.String(), "7KQ2-MX9D") || !strings.Contains(stdout.String(), "▀") {
+		t.Fatalf("exit %d, stdout %q, stderr %q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestPairNeedsAdminToken(t *testing.T) {
+	t.Setenv("NOTIFIER_ADMIN_TOKEN", "")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-url", "https://example.com", "-key", testKey, "pair"}, strings.NewReader(""), &stdout, &stderr, nil)
+	if code != exitUsage || !strings.Contains(stderr.String(), "NOTIFIER_ADMIN_TOKEN") {
+		t.Fatalf("exit %d, stderr %q", code, stderr.String())
+	}
+}
+
+func TestPairNamesTheAdminTokenOn401(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]string{"error": "invalid admin token"})
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("NOTIFIER_ADMIN_TOKEN", "wrong")
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-url", srv.URL, "pair"}, strings.NewReader(""), &stdout, &stderr, nil)
+	if code != exitError || !strings.Contains(stderr.String(), "admin token") || strings.Contains(stderr.String(), "API key") {
+		t.Fatalf("exit %d, stderr %q", code, stderr.String())
+	}
+}
+
+func TestPairPrintsCodeWithoutLink(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]any{"code": "7KQ2-MX9D", "expires_at": time.Now().Add(10 * time.Minute)})
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("NOTIFIER_ADMIN_TOKEN", "admin-token-admin-token-admin-token")
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-url", srv.URL, "pair"}, strings.NewReader(""), &stdout, &stderr, nil)
+	if code != 0 || !strings.Contains(stdout.String(), "7KQ2-MX9D") || strings.Contains(stdout.String(), "▀") {
+		t.Fatalf("exit %d, stdout %q, stderr %q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestRenderQRCoversWholeCode(t *testing.T) {
+	out, err := renderQR("notifier://pair?server=https%3A%2F%2Fexample.com&code=7KQ2-MX9D")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
+	width := strings.Count(lines[0], "▀")
+	if width < 21+8 || len(lines) != (width+1)/2 {
+		t.Fatalf("%d lines of %d cells", len(lines), width)
+	}
+}

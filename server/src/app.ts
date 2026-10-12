@@ -9,7 +9,9 @@ import { Hono } from "hono";
 import type { Context, MiddlewareHandler } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { HTTPException } from "hono/http-exception";
+import { adminRoutes } from "./admin";
 import { fromBase64, toBase64 } from "./encoding";
+import { pairingUri, qrSvg } from "./pairing";
 import { UnregisteredError } from "./push";
 import type { Sender } from "./push";
 import { newSealKey, seal } from "./seal";
@@ -175,6 +177,7 @@ export function createApp(deps: Deps): Hono<AppEnv> {
   app.use("*", bodyLimit({ maxSize: MAX_REQUEST_BYTES, onError: (c) => c.json({ error: "request too large" }, 413) }));
 
   app.get("/healthz", (c) => c.json({ status: "ok" }));
+  adminRoutes(app);
 
   // --- admin ---
 
@@ -182,7 +185,10 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     const code = newPairingCode();
     const expiresAt = deps.now() + PAIRING_TTL_SECONDS;
     await store.createPairing(c.env.DB, await sha256Hex(code), expiresAt);
-    return c.json({ code, expires_at: iso(expiresAt) }, 201);
+    const uri = pairingUri(new URL(c.req.url).origin, code);
+    // ?qr=svg also returns the link as a QR code, for the admin page.
+    const qr = c.req.query("qr") === "svg" ? { qr_svg: qrSvg(uri) } : {};
+    return c.json({ code, expires_at: iso(expiresAt), uri, ...qr }, 201);
   });
 
   app.get("/v1/devices", adminOrApiKey, async (c) => {

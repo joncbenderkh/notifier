@@ -19,12 +19,28 @@
         android:theme="@style/Theme.Notifier">
         <activity
             android:name=".MainActivity"
-            android:exported="true">
+            android:exported="true"
+            android:launchMode="singleTop">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- Pairing QR codes encode notifier://pair?server=...&code=...;
+                 opening one only pre-fills the form, it never pairs by itself. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:host="pair"
+                    android:scheme="notifier" />
+            </intent-filter>
         </activity>
+
+        <!-- Fetch the code scanner module at install time rather than on first scan. -->
+        <meta-data
+            android:name="com.google.mlkit.vision.DEPENDENCIES"
+            android:value="barcode_ui" />
 
         <service
             android:name=".push.PushService"
