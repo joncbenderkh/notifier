@@ -11,7 +11,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"time"
 )
 
 // Client calls the sender-facing half of the notifier API with an API key.
@@ -22,10 +21,9 @@ type Client struct {
 }
 
 type Device struct {
-	ID         string    `json:"id"`
-	Name       string    `json:"name"`
-	Reachable  bool      `json:"reachable"`
-	LastSeenAt time.Time `json:"last_seen_at"`
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Reachable bool   `json:"reachable"`
 }
 
 type Notification struct {

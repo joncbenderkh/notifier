@@ -5,10 +5,13 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+	"unicode/utf8"
 )
 
 const testKey = "nk_test"
@@ -37,6 +40,11 @@ func newFakeServer(t *testing.T) *fakeServer {
 		case "POST /v1/notifications":
 			var n Notification
 			json.NewDecoder(r.Body).Decode(&n)
+			if len(n.Body) > maxBodyBytes {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]string{"error": "body is too long"})
+				return
+			}
 			f.got = append(f.got, n)
 			ids := n.DeviceIDs
 			if len(ids) == 0 {
@@ -157,4 +165,132 @@ func equal(a, b Notification) bool {
 	ja, _ := json.Marshal(a)
 	jb, _ := json.Marshal(b)
 	return bytes.Equal(ja, jb)
+}
+
+func TestTimeoutStartsAfterStdinIsRead(t *testing.T) {
+	f := newFakeServer(t)
+	slow := io.MultiReader(strings.NewReader("partial "), &delayedReader{delay: 300 * time.Millisecond, data: "done\n"})
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-url", f.URL, "-key", testKey, "-timeout", "200ms", "Build", "-"}, slow, &stdout, &stderr)
+	if code != 0 || f.got[0].Body != "partial done" {
+		t.Fatalf("exit %d, stderr %q, sent %+v", code, stderr.String(), f.got)
+	}
+}
+
+func TestLongBodyKeepsTheTail(t *testing.T) {
+	f := newFakeServer(t)
+	log := strings.Repeat("é", 3000) + "FAILED: last line"
+	if code, _, stderr := f.run(log, "Build", "-"); code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	body := f.got[0].Body
+	if len(body) > maxBodyBytes || !utf8.ValidString(body) || !strings.HasPrefix(body, "…") || !strings.HasSuffix(body, "FAILED: last line") {
+		t.Fatalf("body of %d bytes: %q...", len(body), body[:20])
+	}
+}
+
+func TestMessageTextIsNeverParsedAsFlags(t *testing.T) {
+	f := newFakeServer(t)
+	evil := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Error("request reached a server named in the message body")
+	}))
+	t.Cleanup(evil.Close)
+	if code, _, stderr := f.run("", "Build", "-url="+evil.URL); code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	f.run("", "Temp", "-5 degrees")
+	f.run("", "--", "-high", "-key=x")
+	want := []Notification{
+		{Title: "Build", Body: "-url=" + evil.URL},
+		{Title: "Temp", Body: "-5 degrees"},
+		{Title: "-high", Body: "-key=x"},
+	}
+	for i, w := range want {
+		if i >= len(f.got) || !equal(f.got[i], w) {
+			t.Fatalf("sent %+v, want %+v", f.got, want)
+		}
+	}
+}
+
+func TestInvalidUTF8StaysWithinLimit(t *testing.T) {
+	f := newFakeServer(t)
+	latin1 := strings.Repeat("caf\xe9 ", 2000)
+	if code, _, stderr := f.run(latin1, "Log", "-"); code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	encoded, _ := json.Marshal(f.got[0].Body)
+	if len(encoded) > maxBodyBytes+2 || !utf8.ValidString(f.got[0].Body) {
+		t.Fatalf("encoded body is %d bytes", len(encoded))
+	}
+}
+
+func TestHugeStdinIsBoundedAndMarked(t *testing.T) {
+	f := newFakeServer(t)
+	huge := io.MultiReader(io.LimitReader(xReader{}, 50<<20), strings.NewReader("tail line"))
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-url", f.URL, "-key", testKey, "Big", "-"}, huge, &stdout, &stderr)
+	body := f.got[0].Body
+	if code != 0 || !strings.HasPrefix(body, "…") || !strings.HasSuffix(body, "tail line") || len(body) > maxBodyBytes {
+		t.Fatalf("exit %d, body of %d bytes", code, len(body))
+	}
+}
+
+type xReader struct{}
+
+func (xReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'x'
+	}
+	return len(p), nil
+}
+
+func TestTrimsCRLF(t *testing.T) {
+	f := newFakeServer(t)
+	f.run("a\r\n", "T", "-")
+	if f.got[0].Body != "a" {
+		t.Fatalf("body %q", f.got[0].Body)
+	}
+}
+
+func TestRefusesPlainHTTPExceptLoopback(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-url", "http://notifier.example.com", "-key", testKey, "Hi"}, strings.NewReader(""), &stdout, &stderr)
+	if code != exitUsage || !strings.Contains(stderr.String(), "https") {
+		t.Fatalf("exit %d, stderr %q", code, stderr.String())
+	}
+	for _, u := range []string{"http://localhost:8787", "http://127.0.0.1:8787", "http://[::1]:8787"} {
+		if err := checkURL(u); err != nil {
+			t.Errorf("%s: %v", u, err)
+		}
+	}
+}
+
+func TestNotFoundExitCodes(t *testing.T) {
+	for message, want := range map[string]int{noDevicesMessage: exitUndelivered, "not found": exitError} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": message})
+		}))
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"-url", srv.URL, "-key", testKey, "Hi"}, strings.NewReader(""), &stdout, &stderr)
+		srv.Close()
+		if code != want {
+			t.Errorf("%q: exit %d, want %d", message, code, want)
+		}
+	}
+}
+
+type delayedReader struct {
+	delay time.Duration
+	data  string
+	done  bool
+}
+
+func (r *delayedReader) Read(p []byte) (int, error) {
+	if r.done {
+		return 0, io.EOF
+	}
+	time.Sleep(r.delay)
+	r.done = true
+	return copy(p, r.data), nil
 }
