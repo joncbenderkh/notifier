@@ -1,0 +1,25 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "notifier",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "observability": {
+    "enabled": true
+  },
+  "vars": {
+    // "fcm" delivers through Firebase; "log" only logs (local development).
+    "PUSH_TRANSPORT": "fcm"
+  },
+  // Secrets, set with `npx wrangler secret put <NAME>` (or `.dev.vars` locally):
+  //   ADMIN_TOKEN          at least 32 characters
+  //   FCM_SERVICE_ACCOUNT  the Firebase service-account JSON, verbatim
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "notifier",
+      // Placeholder until `npx wrangler d1 create notifier` is run.
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ]
+}

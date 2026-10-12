@@ -12,11 +12,15 @@ captures/
 *.keystore
 google-services.json
 
-# Server
-/server/notifier
-*.db
-*.db-shm
-*.db-wal
+# notify CLI
+/notify/notify
+
+# Server (Cloudflare Worker)
+node_modules/
+.wrangler/
+dist/
+.dev.vars
+worker-configuration.d.ts
 service-account*.json
 *-firebase-adminsdk-*.json
 
