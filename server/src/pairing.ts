@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// The pairing link a phone scans: notifier://pair?server=<origin>&code=<code>.
-// The Android app parses the same shape (PairingLink.kt).
+// The links a phone scans: notifier://pair?server=<origin>&code=<code> to
+// pair, and notifier://join?... to join a channel. The Android app parses
+// pair links (PairingLink.kt); join links are not handled there yet.
 
 import { renderSVG } from "uqr";
 
-export function pairingUri(server: string, code: string): string {
-  return `notifier://pair?server=${encodeURIComponent(server)}&code=${encodeURIComponent(code)}`;
+function notifierUri(action: "pair" | "join", server: string, code: string): string {
+  return `notifier://${action}?server=${encodeURIComponent(server)}&code=${encodeURIComponent(code)}`;
 }
+
+export const pairingUri = (server: string, code: string) => notifierUri("pair", server, code);
+export const joinUri = (server: string, code: string) => notifierUri("join", server, code);
 
 export function qrSvg(data: string): string {
   return renderSVG(data, { ecc: "M", border: 4 });
