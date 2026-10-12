@@ -18,5 +18,6 @@ google-services.json
 *.db-shm
 *.db-wal
 service-account*.json
+*-firebase-adminsdk-*.json
 
 .DS_Store
