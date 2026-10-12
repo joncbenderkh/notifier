@@ -70,7 +70,7 @@ func newFakeServer(t *testing.T) *fakeServer {
 func (f *fakeServer) run(stdin string, args ...string) (int, string, string) {
 	var stdout, stderr bytes.Buffer
 	args = append([]string{"-url", f.URL, "-key", testKey}, args...)
-	code := run(args, strings.NewReader(stdin), &stdout, &stderr)
+	code := run(args, strings.NewReader(stdin), &stdout, &stderr, nil)
 	return code, stdout.String(), stderr.String()
 }
 
@@ -120,7 +120,7 @@ func TestReadsBodyFromStdin(t *testing.T) {
 func TestUnknownPhoneFailsWithoutSending(t *testing.T) {
 	f := newFakeServer(t)
 	code, _, stderr := f.run("", "-to", "watch", "Hi")
-	if code != exitError || !strings.Contains(stderr, `"watch"`) || len(f.got) != 0 {
+	if code != exitUndelivered || !strings.Contains(stderr, `"watch"`) || len(f.got) != 0 {
 		t.Fatalf("exit %d, stderr %q, sent %d", code, stderr, len(f.got))
 	}
 }
@@ -137,7 +137,7 @@ func TestUndeliveredExitCode(t *testing.T) {
 func TestRejectedKey(t *testing.T) {
 	f := newFakeServer(t)
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"-url", f.URL, "-key", "nk_wrong", "Hi"}, strings.NewReader(""), &stdout, &stderr)
+	code := run([]string{"-url", f.URL, "-key", "nk_wrong", "Hi"}, strings.NewReader(""), &stdout, &stderr, nil)
 	if code != exitError || !strings.Contains(stderr.String(), "rejected the API key") {
 		t.Fatalf("exit %d, stderr %q", code, stderr.String())
 	}
@@ -171,7 +171,7 @@ func TestTimeoutStartsAfterStdinIsRead(t *testing.T) {
 	f := newFakeServer(t)
 	slow := io.MultiReader(strings.NewReader("partial "), &delayedReader{delay: 300 * time.Millisecond, data: "done\n"})
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"-url", f.URL, "-key", testKey, "-timeout", "200ms", "Build", "-"}, slow, &stdout, &stderr)
+	code := run([]string{"-url", f.URL, "-key", testKey, "-timeout", "200ms", "Build", "-"}, slow, &stdout, &stderr, nil)
 	if code != 0 || f.got[0].Body != "partial done" {
 		t.Fatalf("exit %d, stderr %q, sent %+v", code, stderr.String(), f.got)
 	}
@@ -228,7 +228,7 @@ func TestHugeStdinIsBoundedAndMarked(t *testing.T) {
 	f := newFakeServer(t)
 	huge := io.MultiReader(io.LimitReader(xReader{}, 50<<20), strings.NewReader("tail line"))
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"-url", f.URL, "-key", testKey, "Big", "-"}, huge, &stdout, &stderr)
+	code := run([]string{"-url", f.URL, "-key", testKey, "Big", "-"}, huge, &stdout, &stderr, nil)
 	body := f.got[0].Body
 	if code != 0 || !strings.HasPrefix(body, "…") || !strings.HasSuffix(body, "tail line") || len(body) > maxBodyBytes {
 		t.Fatalf("exit %d, body of %d bytes", code, len(body))
@@ -254,7 +254,7 @@ func TestTrimsCRLF(t *testing.T) {
 
 func TestRefusesPlainHTTPExceptLoopback(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"-url", "http://notifier.example.com", "-key", testKey, "Hi"}, strings.NewReader(""), &stdout, &stderr)
+	code := run([]string{"-url", "http://notifier.example.com", "-key", testKey, "Hi"}, strings.NewReader(""), &stdout, &stderr, nil)
 	if code != exitUsage || !strings.Contains(stderr.String(), "https") {
 		t.Fatalf("exit %d, stderr %q", code, stderr.String())
 	}
@@ -272,7 +272,7 @@ func TestNotFoundExitCodes(t *testing.T) {
 			json.NewEncoder(w).Encode(map[string]string{"error": message})
 		}))
 		var stdout, stderr bytes.Buffer
-		code := run([]string{"-url", srv.URL, "-key", testKey, "Hi"}, strings.NewReader(""), &stdout, &stderr)
+		code := run([]string{"-url", srv.URL, "-key", testKey, "Hi"}, strings.NewReader(""), &stdout, &stderr, nil)
 		srv.Close()
 		if code != want {
 			t.Errorf("%q: exit %d, want %d", message, code, want)
@@ -293,4 +293,67 @@ func (r *delayedReader) Read(p []byte) (int, error) {
 	time.Sleep(r.delay)
 	r.done = true
 	return copy(p, r.data), nil
+}
+
+func TestRefusesRedirects(t *testing.T) {
+	var leaked bool
+	plain := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		leaked = r.Header.Get("Authorization") != ""
+	}))
+	t.Cleanup(plain.Close)
+	redirecting := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, plain.URL+r.URL.Path, http.StatusMovedPermanently)
+	}))
+	t.Cleanup(redirecting.Close)
+
+	var stdout, stderr bytes.Buffer
+	args := []string{"-url", redirecting.URL, "-key", testKey, "Hi"}
+	code := run(args, strings.NewReader(""), &stdout, &stderr, redirecting.Client().Transport)
+	if code != exitError || leaked || !strings.Contains(stderr.String(), "redirected") {
+		t.Fatalf("exit %d, leaked %v, stderr %q", code, leaked, stderr.String())
+	}
+}
+
+func TestPhoneUnpairedBeforeSendIsUndelivered(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			json.NewEncoder(w).Encode([]Device{{ID: "dev_a", Name: "A"}, {ID: "dev_b", Name: "B"}})
+			return
+		}
+		json.NewEncoder(w).Encode(NotifyResult{ID: "msg_1", Deliveries: []Delivery{{DeviceID: "dev_a", Status: "sent"}}})
+	}))
+	t.Cleanup(srv.Close)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-url", srv.URL, "-key", testKey, "-to", "a,b", "Hi"}, strings.NewReader(""), &stdout, &stderr, nil)
+	if code != exitUndelivered || !strings.Contains(stderr.String(), "dev_b: no longer paired") {
+		t.Fatalf("exit %d, stderr %q", code, stderr.String())
+	}
+}
+
+func TestSubcommandNamesAreTitlesAfterDoubleDash(t *testing.T) {
+	f := newFakeServer(t)
+	f.run("", "--", "devices")
+	f.run("", "-high", "--", "version")
+	if len(f.got) != 2 || f.got[0].Title != "devices" || f.got[1].Title != "version" {
+		t.Fatalf("sent %+v", f.got)
+	}
+}
+
+func TestDoubleDashAsFlagValueKeepsSubcommands(t *testing.T) {
+	f := newFakeServer(t)
+	code, stdout, _ := f.run("", "-to", "--", "devices")
+	if code != 0 || !strings.Contains(stdout, "dev_phone") || len(f.got) != 0 {
+		t.Fatalf("exit %d, stdout %q, sent %+v", code, stdout, f.got)
+	}
+}
+
+func TestLongTitleIsFitted(t *testing.T) {
+	f := newFakeServer(t)
+	if code, _, stderr := f.run("", strings.Repeat("é", 200)+"\xff"); code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	title := f.got[0].Title
+	if len(title) > maxTitleBytes || !utf8.ValidString(title) || !strings.HasSuffix(title, "…") {
+		t.Fatalf("title of %d bytes", len(title))
+	}
 }

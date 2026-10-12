@@ -16,17 +16,38 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: deploy
-  cancel-in-progress: false
-
 jobs:
-  deploy:
+  # Runs every dependency's code (tsc, eslint, vitest, miniflare) with no
+  # secrets in the job.
+  check:
     runs-on: ubuntu-latest
-    # The Cloudflare credentials are passed only to the steps that call
-    # wrangler, and `npm ci` skips install scripts, so no dependency's
-    # install hook runs in this job (or can tamper with wrangler before the
-    # credentialed steps).
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+
+  # A fresh runner and checkout, so nothing the check job ran can have
+  # touched node_modules. Install scripts are skipped and only wrangler runs
+  # here, with the Cloudflare credentials passed to its steps alone.
+  deploy:
+    needs: check
+    if: github.ref == 'refs/heads/main'
+    # Job-level, so a manual check-only run on another branch never joins the
+    # group and cannot cancel a pending main deploy.
+    concurrency:
+      group: deploy
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: server
@@ -45,13 +66,7 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: server/package-lock.json
       - run: npm ci --ignore-scripts
-      - run: npx wrangler types
-      - run: npm run typecheck
-      - run: npm run lint
-      - run: npm test
       - name: Apply D1 migrations
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
