@@ -299,15 +299,26 @@ export async function createChannel(
   db: D1Database,
   channel: Pick<Channel, "id" | "owner_id" | "name" | "created_at">,
   max: number,
+  maxMemberships: number,
 ): Promise<boolean> {
   const [inserted] = await db.batch([
     db
       .prepare(
         `INSERT OR IGNORE INTO channels (id, owner_id, name, created_at)
          SELECT ?, ?, ?, ?
-         WHERE (SELECT count(*) FROM channels WHERE owner_id = ?) < ?`,
+         WHERE (SELECT count(*) FROM channels WHERE owner_id = ? AND name != 'default') < ?
+           AND (SELECT count(*) FROM channel_members WHERE user_id = ?) < ?`,
       )
-      .bind(channel.id, channel.owner_id, channel.name, channel.created_at, channel.owner_id, max),
+      .bind(
+        channel.id,
+        channel.owner_id,
+        channel.name,
+        channel.created_at,
+        channel.owner_id,
+        max,
+        channel.owner_id,
+        maxMemberships,
+      ),
     db
       .prepare("INSERT INTO channel_members (channel_id, user_id, joined_at) SELECT id, owner_id, created_at FROM channels WHERE id = ?")
       .bind(channel.id),
@@ -378,13 +389,14 @@ export async function createChannelInvite(
   return result.meta.changes === 1;
 }
 
-export type JoinResult = { channel: Channel; joined: boolean } | "invalid" | "full";
+export type JoinResult = { channel: Channel; joined: boolean } | "invalid" | "full" | "channel full";
 
 /**
  * Redeems a channel invite for [userId], atomically: the membership and the
  * invite's deletion are one batch, so an invite admits one user. A user who
  * is already a member keeps the invite unspent. "full" means the user
- * already belongs to [maxMemberships] channels.
+ * already belongs to [maxMemberships] channels, "channel full" that the
+ * channel already has [maxMembers] members.
  */
 export async function joinChannel(
   db: D1Database,
@@ -392,6 +404,7 @@ export async function joinChannel(
   userId: string,
   now: number,
   maxMemberships: number,
+  maxMembers: number,
 ): Promise<JoinResult> {
   const channel = await db
     .prepare(
@@ -415,9 +428,10 @@ export async function joinChannel(
         `INSERT OR IGNORE INTO channel_members (channel_id, user_id, joined_at)
          SELECT ?, ?, ?
          WHERE EXISTS (SELECT 1 FROM channel_invites WHERE code_hash = ? AND expires_at > ?)
-           AND (SELECT count(*) FROM channel_members WHERE user_id = ?) < ?`,
+           AND (SELECT count(*) FROM channel_members WHERE user_id = ?) < ?
+           AND (SELECT count(*) FROM channel_members WHERE channel_id = ?) < ?`,
       )
-      .bind(channel.id, userId, now, codeHash, now, userId, maxMemberships),
+      .bind(channel.id, userId, now, codeHash, now, userId, maxMemberships, channel.id, maxMembers),
     db
       .prepare(
         `DELETE FROM channel_invites WHERE code_hash = ?
@@ -432,7 +446,9 @@ export async function joinChannel(
     .first();
   if (raced) return { channel, joined: false };
   const stillValid = await db.prepare("SELECT 1 FROM channel_invites WHERE code_hash = ?").bind(codeHash).first();
-  return stillValid ? "full" : "invalid";
+  if (!stillValid) return "invalid";
+  const joined = await db.prepare("SELECT count(*) AS n FROM channel_members WHERE user_id = ?").bind(userId).first<number>("n");
+  return (joined ?? 0) >= maxMemberships ? "full" : "channel full";
 }
 
 export async function members(

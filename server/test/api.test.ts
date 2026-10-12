@@ -5,8 +5,12 @@ import {
   createApp,
   INVITE_TTL_SECONDS,
   MAX_API_KEYS_PER_USER,
+  MAX_CHANNELS_PER_REQUEST,
+  MAX_CHANNELS_PER_USER,
   MAX_DEVICES_PER_USER,
   MAX_INVITES_PER_USER,
+  MAX_MEMBERS_PER_CHANNEL,
+  MAX_PENDING_INVITES_PER_CHANNEL,
   MAX_PENDING_PAIRINGS_PER_USER,
   PAIRING_TTL_SECONDS,
 } from "../src/app";
@@ -524,7 +528,15 @@ describe("channels", () => {
     expect(joined).toEqual({ id: homelab, name: "alice/homelab" });
     await call("POST", "/v1/memberships", bob, { invite: code }, 403);
 
-    await call("POST", "/v1/notifications", USER, { title: "disk full", channels: ["homelab"] }, 200);
+    // The sender learns how other members' devices fared, not their IDs.
+    const sent = await call<NotifyResponse & { members?: object }>(
+      "POST",
+      "/v1/notifications",
+      USER,
+      { title: "disk full", channels: ["homelab"] },
+      200,
+    );
+    expect(sent).toMatchObject({ deliveries: [], members: { sent: 1 } });
     expect(sender.sent.map((m) => m.token)).toEqual(["fcm-bob"]);
     expect((await payloadFor(bobPhone, 0)).channel).toBe("alice/homelab");
 
@@ -616,8 +628,41 @@ describe("channels", () => {
     await call("PUT", `/v1/devices/${reg.device_id}/channels`, USER, { channel_ids: [secret] }, 404);
     await call("PUT", `/v1/devices/${reg.device_id}/channels`, bob, { channel_ids: [] }, 404);
 
-    const subs = await call<ChannelView[]>("PUT", `/v1/devices/${reg.device_id}/channels`, USER, { channel_ids: [] }, 200);
-    expect(subs.every((ch) => ch.subscribed === false)).toBe(true);
+    // A send without channels goes to default, so no device may leave it.
+    await call("PUT", `/v1/devices/${reg.device_id}/channels`, USER, { channel_ids: [] }, 400);
+    await call("PUT", "/v1/device/channels", reg.device_token, { channel_ids: [] }, 400);
+    const ci = await channel("ci");
+    const all = await call<ChannelView[]>("GET", "/v1/device/channels", reg.device_token, undefined, 200);
+    const def = all.find((ch) => ch.name === "default");
+    const subs = await call<ChannelView[]>("PUT", "/v1/device/channels", reg.device_token, { channel_ids: [def!.id] }, 200);
+    expect(subs.filter((ch) => ch.subscribed).map((ch) => ch.id)).toEqual([def!.id]);
+    expect(subs.some((ch) => ch.id === ci)).toBe(true);
+  });
+
+  it("caps channels, invites, members, and channels per request", async () => {
+    for (let i = 0; i < MAX_CHANNELS_PER_USER; i++) await channel(`c${i}`);
+    await call("POST", "/v1/channels", USER, { name: "one-more" }, 403);
+    await call("POST", "/v1/channels", USER, {}, 400);
+
+    const names = Array.from({ length: MAX_CHANNELS_PER_REQUEST + 1 }, (_, i) => `c${i}`);
+    await call("POST", "/v1/notifications", USER, { title: "x", channels: names }, 400);
+
+    const c0 = (await call<{ id: string; name: string }[]>("GET", "/v1/channels", USER, undefined, 200)).find(
+      (ch) => ch.name === "c0",
+    )!.id;
+    const invites: string[] = [];
+    for (let i = 0; i < MAX_PENDING_INVITES_PER_CHANNEL; i++) {
+      invites.push((await call<{ code: string }>("POST", `/v1/channels/${c0}/invites`, USER, undefined, 201)).code);
+    }
+    await call("POST", `/v1/channels/${c0}/invites`, USER, undefined, 403);
+
+    // Fill the channel (the owner counts), then one invite too many.
+    for (let i = 1; i < MAX_MEMBERS_PER_CHANNEL; i++) {
+      const code = invites.pop() ?? (await call<{ code: string }>("POST", `/v1/channels/${c0}/invites`, USER, undefined, 201)).code;
+      await call("POST", "/v1/memberships", await signup(`m${i}`), { invite: code }, 201);
+    }
+    const last = await call<{ code: string }>("POST", `/v1/channels/${c0}/invites`, USER, undefined, 201);
+    await call("POST", "/v1/memberships", await signup("late"), { invite: last.code }, 403);
   });
 
   it("validates channel names and protects the default channel", async () => {

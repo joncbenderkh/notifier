@@ -43,8 +43,10 @@ export const MAX_INVITES_PER_USER = 10;
 export const MAX_PENDING_PAIRINGS_PER_USER = 5;
 export const MAX_CHANNELS_PER_USER = 20;
 export const MAX_MEMBERSHIPS_PER_USER = 50;
+/** Members, owner included; bounds one send's fan-out (FCM calls per request). */
+export const MAX_MEMBERS_PER_CHANNEL = 20;
 export const MAX_PENDING_INVITES_PER_CHANNEL = 10;
-const MAX_CHANNELS_PER_REQUEST = 20;
+export const MAX_CHANNELS_PER_REQUEST = 20;
 const CHANNEL_NAME = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 const MAX_REQUEST_BYTES = 16 * 1024;
 const MAX_TITLE_BYTES = 256;
@@ -251,6 +253,13 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     return ids;
   }
 
+  /** The channel IDs a device asks to subscribe to; a send without channels relies on default staying in. */
+  async function subscriptionIds(db: D1Database, userId: string, raw: unknown): Promise<string[]> {
+    const ids = await memberOfAll(db, userId, raw);
+    if (!ids.includes(store.defaultChannelId(userId))) fail(400, "devices always subscribe to the default channel");
+    return ids;
+  }
+
   async function deviceChannels(db: D1Database, d: Device) {
     const subscribed = new Set(await store.deviceSubscriptions(db, d.id));
     return (await store.memberships(db, d.user_id)).map((ch) => ({
@@ -441,13 +450,17 @@ export function createApp(deps: Deps): Hono<AppEnv> {
 
   app.post("/v1/channels", user, async (c) => {
     const req = await readJson<{ name: string }>(c, ["name"]);
+    if (typeof req.name !== "string" || req.name === "") fail(400, "name is required");
     const [name] = channelNames([req.name]);
     if (name === undefined) fail(400, "name is required");
     const userId = c.get("userId");
     const ch = { id: newId("ch_"), owner_id: userId, name, created_at: deps.now() };
-    if (!(await store.createChannel(c.env.DB, ch, MAX_CHANNELS_PER_USER))) {
+    if (!(await store.createChannel(c.env.DB, ch, MAX_CHANNELS_PER_USER, MAX_MEMBERSHIPS_PER_USER))) {
       if (await store.ownedChannelNamed(c.env.DB, userId, name)) fail(409, `you already have a channel named "${name}"`);
-      fail(403, `at most ${MAX_CHANNELS_PER_USER} channels per user`);
+      fail(
+        403,
+        `at most ${MAX_CHANNELS_PER_USER} channels besides default, and ${MAX_MEMBERSHIPS_PER_USER} owned or joined, per user`,
+      );
     }
     return c.json({ id: ch.id, name, created_at: iso(ch.created_at) }, 201);
   });
@@ -497,9 +510,11 @@ export function createApp(deps: Deps): Hono<AppEnv> {
       userId,
       deps.now(),
       MAX_MEMBERSHIPS_PER_USER,
+      MAX_MEMBERS_PER_CHANNEL,
     );
     if (result === "invalid") fail(403, "channel invite is invalid, expired, or already used");
     if (result === "full") fail(403, `at most ${MAX_MEMBERSHIPS_PER_USER} channels per user`);
+    if (result === "channel full") fail(403, `at most ${MAX_MEMBERS_PER_CHANNEL} members per channel`);
     return result.channel;
   }
 
@@ -532,7 +547,7 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     const userId = c.get("userId");
     const d = (await store.listDevices(c.env.DB, userId)).find((x) => x.id === c.req.param("id"));
     if (!d) fail(404, "not found");
-    await store.setSubscriptions(c.env.DB, d.id, await memberOfAll(c.env.DB, userId, req.channel_ids));
+    await store.setSubscriptions(c.env.DB, d.id, await subscriptionIds(c.env.DB, userId, req.channel_ids));
     return c.json(await deviceChannels(c.env.DB, d));
   });
 
@@ -543,7 +558,7 @@ export function createApp(deps: Deps): Hono<AppEnv> {
   app.put("/v1/device/channels", device, async (c) => {
     const req = await readJson<{ channel_ids: string[] }>(c, ["channel_ids"]);
     const d = c.get("device");
-    await store.setSubscriptions(c.env.DB, d.id, await memberOfAll(c.env.DB, d.user_id, req.channel_ids));
+    await store.setSubscriptions(c.env.DB, d.id, await subscriptionIds(c.env.DB, d.user_id, req.channel_ids));
     return c.json(await deviceChannels(c.env.DB, d));
   });
 
@@ -658,12 +673,19 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     } catch (err) {
       console.error("push prepare failed", err);
     }
-    const deliveries = await Promise.all(
-      [...targets.values()].map(({ device: d, channel: ch }) =>
-        deliver(c.env, d, ch ? { ...base, channel: channelLabel(ch, d.user_id), channel_id: ch.id } : base),
-      ),
+    const all = await Promise.all(
+      [...targets.values()].map(async ({ device: d, channel: ch }) => ({
+        own: d.user_id === userId,
+        delivery: await deliver(c.env, d, ch ? { ...base, channel: channelLabel(ch, d.user_id), channel_id: ch.id } : base),
+      })),
     );
-    return c.json({ id: base.id, deliveries });
+    // Other members' device IDs are theirs to know; the sender gets counts.
+    const deliveries = all.filter((x) => x.own).map((x) => x.delivery);
+    const members: Partial<Record<Delivery["status"], number>> = {};
+    for (const { own, delivery } of all) {
+      if (!own) members[delivery.status] = (members[delivery.status] ?? 0) + 1;
+    }
+    return c.json({ id: base.id, deliveries, ...(Object.keys(members).length > 0 ? { members } : {}) });
   });
 
   app.notFound((c) => c.json({ error: "not found" }, 404));
