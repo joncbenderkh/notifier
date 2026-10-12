@@ -5,8 +5,12 @@ import {
   createApp,
   INVITE_TTL_SECONDS,
   MAX_API_KEYS_PER_USER,
+  MAX_CHANNELS_PER_REQUEST,
+  MAX_CHANNELS_PER_USER,
   MAX_DEVICES_PER_USER,
   MAX_INVITES_PER_USER,
+  MAX_MEMBERS_PER_CHANNEL,
+  MAX_PENDING_INVITES_PER_CHANNEL,
   MAX_PENDING_PAIRINGS_PER_USER,
   PAIRING_TTL_SECONDS,
 } from "../src/app";
@@ -51,6 +55,9 @@ beforeEach(async () => {
     env.DB.prepare("DELETE FROM pairings"),
     env.DB.prepare("DELETE FROM users"),
     env.DB.prepare("DELETE FROM invites"),
+    ...["channels", "channel_members", "subscriptions", "channel_invites", "api_key_channels"].map((t) =>
+      env.DB.prepare(`DELETE FROM ${t}`),
+    ),
   ]);
   sender = new FakeSender();
   now = 1_790_000_000;
@@ -469,5 +476,204 @@ describe("users", () => {
     const { id } = await call<{ id: string }>("GET", "/v1/user", USER, undefined, 200);
     expect(keys).toEqual([id, id]);
     expect(sender.sent).toEqual([]);
+  });
+});
+
+interface ChannelView {
+  id: string;
+  name: string;
+  subscribed?: boolean;
+}
+
+async function payloadFor(reg: Registration, index: number): Promise<Payload> {
+  const m = sender.sent[index]!;
+  const plaintext = await open(fromBase64(reg.seal_key), reg.device_id, {
+    nonce: fromBase64(m.data.n!),
+    ciphertext: fromBase64(m.data.c!),
+  });
+  return JSON.parse(new TextDecoder().decode(plaintext)) as Payload;
+}
+
+async function channel(name: string, owner = USER): Promise<string> {
+  return (await call<{ id: string }>("POST", "/v1/channels", owner, { name }, 201)).id;
+}
+
+describe("channels", () => {
+  it("subscribes new devices to the user's default channel", async () => {
+    const reg = await pair("phone", "fcm-phone");
+    const channels = await call<ChannelView[]>("GET", "/v1/device/channels", reg.device_token, undefined, 200);
+    expect(channels).toEqual([{ id: expect.stringMatching(/^ch_default_/) as string, name: "default", subscribed: true }]);
+
+    await call("POST", "/v1/notifications", USER, { title: "hi" }, 200);
+    expect((await payloadFor(reg, 0)).channel).toBe("default");
+  });
+
+  it("lets a member subscribe to a shared channel, but only the owner publish", async () => {
+    const bob = await signup("bob");
+    const homelab = await channel("homelab");
+    const bobPhone = await pair("phone", "fcm-bob", bob);
+
+    const { code, uri } = await call<{ code: string; uri: string }>(
+      "POST",
+      `/v1/channels/${homelab}/invites`,
+      USER,
+      undefined,
+      201,
+    );
+    expect(uri).toBe(`notifier://join?server=http%3A%2F%2Flocalhost&code=${code}`);
+    await call("POST", `/v1/channels/${homelab}/invites`, bob, undefined, 404);
+
+    // Joining from the phone subscribes that phone.
+    const joined = await call<ChannelView>("POST", "/v1/device/memberships", bobPhone.device_token, { invite: code }, 201);
+    expect(joined).toEqual({ id: homelab, name: "alice/homelab" });
+    await call("POST", "/v1/memberships", bob, { invite: code }, 403);
+
+    // The sender learns how other members' devices fared, not their IDs.
+    const sent = await call<NotifyResponse & { members?: object }>(
+      "POST",
+      "/v1/notifications",
+      USER,
+      { title: "disk full", channels: ["homelab"] },
+      200,
+    );
+    expect(sent).toMatchObject({ deliveries: [], members: { sent: 1 } });
+    expect(sender.sent.map((m) => m.token)).toEqual(["fcm-bob"]);
+    expect((await payloadFor(bobPhone, 0)).channel).toBe("alice/homelab");
+
+    // Bob receives but cannot publish: his "homelab" would be his own.
+    await call("POST", "/v1/notifications", bob, { title: "x", channels: ["homelab"] }, 404);
+
+    // Removing Bob stops delivery, even though his phone subscribed.
+    const members = await call<{ id: string; name: string }[]>("GET", `/v1/channels/${homelab}/members`, USER, undefined, 200);
+    expect(members.map((m) => m.name)).toEqual(["alice", "bob"]);
+    await call("GET", `/v1/channels/${homelab}/members`, bob, undefined, 404);
+    const bobId = members.find((m) => m.name === "bob")!.id;
+    await call("DELETE", `/v1/channels/${homelab}/members/${bobId}`, USER, undefined, 204);
+    await call("POST", "/v1/notifications", USER, { title: "again", channels: ["homelab"] }, 404);
+  });
+
+  it("lets a member leave, but not remove others", async () => {
+    const bob = await signup("bob");
+    const carol = await signup("carol");
+    const homelab = await channel("homelab");
+    const ids: Record<string, string> = {};
+    for (const [name, token] of [
+      ["bob", bob],
+      ["carol", carol],
+    ] as const) {
+      const { code } = await call<{ code: string }>("POST", `/v1/channels/${homelab}/invites`, USER, undefined, 201);
+      await call("POST", "/v1/memberships", token, { invite: code }, 201);
+      ids[name] = (await call<{ id: string }>("GET", "/v1/user", token, undefined, 200)).id;
+    }
+    await call("DELETE", `/v1/channels/${homelab}/members/${ids.carol}`, bob, undefined, 404);
+    await call("DELETE", `/v1/channels/${homelab}/members/${ids.bob}`, bob, undefined, 204);
+    const aliceId = (await call<{ id: string }>("GET", "/v1/user", USER, undefined, 200)).id;
+    await call("DELETE", `/v1/channels/${homelab}/members/${aliceId}`, USER, undefined, 404);
+  });
+
+  it("delivers once per device across several channels", async () => {
+    const ci = await channel("ci");
+    await channel("alerts");
+    const reg = await pair("phone", "fcm-phone");
+    const all = await call<ChannelView[]>("GET", "/v1/device/channels", reg.device_token, undefined, 200);
+    await call("PUT", "/v1/device/channels", reg.device_token, { channel_ids: all.map((ch) => ch.id) }, 200);
+
+    const resp = await call<NotifyResponse>(
+      "POST",
+      "/v1/notifications",
+      USER,
+      { title: "hi", channels: ["ci", "alerts", "ci"], device_ids: [reg.device_id] },
+      200,
+    );
+    expect(resp.deliveries).toHaveLength(1);
+    expect(await payloadFor(reg, 0)).toMatchObject({ channel: "ci", channel_id: ci });
+  });
+
+  it("limits a scoped API key to its channels", async () => {
+    const ci = await channel("ci");
+    await channel("homelab");
+    const reg = await pair("phone", "fcm-phone");
+    const { key, channels } = await call<{ key: string; channels: string[] }>(
+      "POST",
+      "/v1/keys",
+      USER,
+      { name: "ci", channels: ["ci"] },
+      201,
+    );
+    expect(channels).toEqual(["ci"]);
+    const all = await call<ChannelView[]>("GET", "/v1/device/channels", reg.device_token, undefined, 200);
+    await call("PUT", "/v1/device/channels", reg.device_token, { channel_ids: all.map((ch) => ch.id) }, 200);
+
+    await call("POST", "/v1/notifications", key, { title: "ok", channels: ["ci"] }, 200);
+    await call("POST", "/v1/notifications", key, { title: "no", channels: ["homelab"] }, 403);
+    await call("POST", "/v1/notifications", key, { title: "no" }, 403);
+    await call("POST", "/v1/notifications", key, { title: "no", channels: ["ci"], device_ids: [reg.device_id] }, 403);
+    await call("POST", "/v1/keys", USER, { name: "x", channels: ["nope"] }, 404);
+    expect(await call<{ channels: string[] }[]>("GET", "/v1/keys", USER, undefined, 200)).toMatchObject([
+      { name: "ci", channels: ["ci"] },
+    ]);
+
+    // Deleting its only channel leaves the key scoped to nothing, not unscoped.
+    await call("DELETE", `/v1/channels/${ci}`, USER, undefined, 204);
+    await call("POST", "/v1/notifications", key, { title: "no" }, 403);
+    await call("POST", "/v1/notifications", key, { title: "no", device_ids: [reg.device_id] }, 403);
+    await call("POST", "/v1/notifications", key, { title: "no", channels: ["homelab"] }, 403);
+  });
+
+  it("refuses subscriptions to channels the owner has not joined", async () => {
+    const bob = await signup("bob");
+    const secret = await channel("secret", bob);
+    const reg = await pair("phone", "fcm-phone");
+    await call("PUT", "/v1/device/channels", reg.device_token, { channel_ids: [secret] }, 404);
+    await call("PUT", `/v1/devices/${reg.device_id}/channels`, USER, { channel_ids: [secret] }, 404);
+    await call("PUT", `/v1/devices/${reg.device_id}/channels`, bob, { channel_ids: [] }, 404);
+
+    // A send without channels goes to default, so no device may leave it.
+    await call("PUT", `/v1/devices/${reg.device_id}/channels`, USER, { channel_ids: [] }, 400);
+    await call("PUT", "/v1/device/channels", reg.device_token, { channel_ids: [] }, 400);
+    const ci = await channel("ci");
+    const all = await call<ChannelView[]>("GET", "/v1/device/channels", reg.device_token, undefined, 200);
+    const def = all.find((ch) => ch.name === "default");
+    const subs = await call<ChannelView[]>("PUT", "/v1/device/channels", reg.device_token, { channel_ids: [def!.id] }, 200);
+    expect(subs.filter((ch) => ch.subscribed).map((ch) => ch.id)).toEqual([def!.id]);
+    expect(subs.some((ch) => ch.id === ci)).toBe(true);
+  });
+
+  it("caps channels, invites, members, and channels per request", async () => {
+    for (let i = 0; i < MAX_CHANNELS_PER_USER; i++) await channel(`c${i}`);
+    await call("POST", "/v1/channels", USER, { name: "one-more" }, 403);
+    await call("POST", "/v1/channels", USER, {}, 400);
+
+    const names = Array.from({ length: MAX_CHANNELS_PER_REQUEST + 1 }, (_, i) => `c${i}`);
+    await call("POST", "/v1/notifications", USER, { title: "x", channels: names }, 400);
+
+    const c0 = (await call<{ id: string; name: string }[]>("GET", "/v1/channels", USER, undefined, 200)).find(
+      (ch) => ch.name === "c0",
+    )!.id;
+    const invites: string[] = [];
+    for (let i = 0; i < MAX_PENDING_INVITES_PER_CHANNEL; i++) {
+      invites.push((await call<{ code: string }>("POST", `/v1/channels/${c0}/invites`, USER, undefined, 201)).code);
+    }
+    await call("POST", `/v1/channels/${c0}/invites`, USER, undefined, 403);
+
+    // Fill the channel (the owner counts), then one invite too many.
+    for (let i = 1; i < MAX_MEMBERS_PER_CHANNEL; i++) {
+      const code = invites.pop() ?? (await call<{ code: string }>("POST", `/v1/channels/${c0}/invites`, USER, undefined, 201)).code;
+      await call("POST", "/v1/memberships", await signup(`m${i}`), { invite: code }, 201);
+    }
+    const last = await call<{ code: string }>("POST", `/v1/channels/${c0}/invites`, USER, undefined, 201);
+    await call("POST", "/v1/memberships", await signup("late"), { invite: last.code }, 403);
+  });
+
+  it("validates channel names and protects the default channel", async () => {
+    await call("POST", "/v1/channels", USER, { name: "Has Spaces" }, 400);
+    await channel("ci");
+    await call("POST", "/v1/channels", USER, { name: "ci" }, 409);
+    const list = await call<{ id: string; name: string; owned: boolean }[]>("GET", "/v1/channels", USER, undefined, 200);
+    const def = list.find((ch) => ch.name === "default")!;
+    await call("DELETE", `/v1/channels/${def.id}`, USER, undefined, 404);
+    await call("POST", `/v1/channels/${def.id}/invites`, USER, undefined, 400);
+    await call("POST", "/v1/channels", USER, { name: "default" }, 409);
+    await call("POST", "/v1/notifications", USER, { title: "x", channels: ["../etc"] }, 400);
   });
 });

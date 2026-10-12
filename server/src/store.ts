@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// D1 persistence for users, invites, devices, API keys, and pending pairings.
+// D1 persistence for users, invites, devices, API keys, pending pairings,
+// and channels.
 // Times are Unix seconds. Everything a user owns is looked up by user ID, and
 // the credentials of a disabled user resolve to nothing.
 
@@ -93,7 +94,7 @@ export async function redeemInvite(
       .bind(user.id, user.name, tokenHash, now, now, codeHash, now),
     db.prepare("DELETE FROM invites WHERE code_hash = ? OR expires_at <= ?").bind(codeHash, now),
   ]);
-  return (inserted?.meta.changes ?? 0) === 1;
+  return (inserted?.meta.changes ?? 0) > 0; // also counts rows a trigger writes
 }
 
 export async function userByTokenHash(db: D1Database, tokenHash: string, now: number): Promise<User | null> {
@@ -173,7 +174,7 @@ export async function redeemPairing(
       .bind(device.id, device.name, tokenHash, device.seal_key, device.fcm_token, now, now, codeHash, now, maxDevices),
     db.prepare("DELETE FROM pairings WHERE code_hash = ? OR expires_at <= ?").bind(codeHash, now),
   ]);
-  return (inserted?.meta.changes ?? 0) === 1;
+  return (inserted?.meta.changes ?? 0) > 0; // also counts rows a trigger writes
 }
 
 export async function deviceByTokenHash(db: D1Database, tokenHash: string, now: number): Promise<Device | null> {
@@ -199,23 +200,51 @@ export async function setFcmToken(db: D1Database, deviceId: string, fcmToken: st
 }
 
 export async function deleteDevice(db: D1Database, userId: string, id: string): Promise<boolean> {
-  const result = await db.prepare("DELETE FROM devices WHERE id = ? AND user_id = ?").bind(id, userId).run();
-  return result.meta.changes === 1;
+  const [deleted] = await db.batch([
+    db.prepare("DELETE FROM devices WHERE id = ? AND user_id = ?").bind(id, userId),
+    db.prepare("DELETE FROM subscriptions WHERE device_id = ? AND NOT EXISTS (SELECT 1 FROM devices WHERE id = ?)").bind(id, id),
+  ]);
+  return deleted?.meta.changes === 1;
 }
 
 // --- API keys ---
 
-/** Stores a key unless its user already has [max]; atomic, like createInvite. */
-export async function createApiKey(db: D1Database, key: ApiKey, keyHash: string, max: number): Promise<boolean> {
-  const result = await db
-    .prepare(
-      `INSERT INTO api_keys (id, user_id, name, key_hash, created_at)
-       SELECT ?, ?, ?, ?, ?
-       WHERE (SELECT count(*) FROM api_keys WHERE user_id = ?) < ?`,
-    )
-    .bind(key.id, key.user_id, key.name, keyHash, key.created_at, key.user_id, max)
-    .run();
-  return result.meta.changes === 1;
+/**
+ * Stores a key, limited to [channelIds] when any are given, unless its user
+ * already has [max]; atomic, like createInvite. The key and its scope are
+ * one batch, so a key can never exist without the scope it was given.
+ */
+export async function createApiKey(
+  db: D1Database,
+  key: ApiKey,
+  keyHash: string,
+  max: number,
+  channelIds: readonly string[],
+): Promise<boolean> {
+  const [inserted] = await db.batch([
+    db
+      .prepare(
+        `INSERT INTO api_keys (id, user_id, name, key_hash, created_at)
+         SELECT ?, ?, ?, ?, ?
+         WHERE (SELECT count(*) FROM api_keys WHERE user_id = ?) < ?`,
+      )
+      .bind(key.id, key.user_id, key.name, keyHash, key.created_at, key.user_id, max),
+    ...channelIds.map((channelId) =>
+      db
+        .prepare("INSERT INTO api_key_channels (key_id, channel_id) SELECT id, ? FROM api_keys WHERE id = ?")
+        .bind(channelId, key.id),
+    ),
+  ]);
+  return inserted?.meta.changes === 1;
+}
+
+/** The channel IDs a key is limited to; empty means unscoped. */
+export async function apiKeyScope(db: D1Database, keyId: string): Promise<string[]> {
+  const { results } = await db
+    .prepare("SELECT channel_id FROM api_key_channels WHERE key_id = ? ORDER BY channel_id")
+    .bind(keyId)
+    .all<{ channel_id: string }>();
+  return results.map((r) => r.channel_id);
 }
 
 export async function apiKeyByHash(db: D1Database, keyHash: string, now: number): Promise<ApiKey | null> {
@@ -236,6 +265,269 @@ export async function listApiKeys(db: D1Database, userId: string): Promise<ApiKe
 }
 
 export async function deleteApiKey(db: D1Database, userId: string, id: string): Promise<boolean> {
-  const result = await db.prepare("DELETE FROM api_keys WHERE id = ? AND user_id = ?").bind(id, userId).run();
+  const [deleted] = await db.batch([
+    db.prepare("DELETE FROM api_keys WHERE id = ? AND user_id = ?").bind(id, userId),
+    db.prepare("DELETE FROM api_key_channels WHERE key_id = ? AND NOT EXISTS (SELECT 1 FROM api_keys WHERE id = ?)").bind(id, id),
+  ]);
+  return deleted?.meta.changes === 1;
+}
+
+// --- channels ---
+
+export interface Channel {
+  id: string;
+  owner_id: string;
+  owner_name: string;
+  name: string;
+  created_at: number;
+}
+
+/** A channel as one of its members sees it. */
+export interface Membership extends Channel {
+  members: number;
+}
+
+export const defaultChannelId = (userId: string) => `ch_default_${userId}`;
+
+const CHANNEL_COLUMNS = "c.id, c.owner_id, o.name AS owner_name, c.name, c.created_at";
+
+/**
+ * Creates a channel and makes its owner a member, unless the owner already
+ * owns [max] channels or one with this name. Returns false in either case.
+ */
+export async function createChannel(
+  db: D1Database,
+  channel: Pick<Channel, "id" | "owner_id" | "name" | "created_at">,
+  max: number,
+  maxMemberships: number,
+): Promise<boolean> {
+  const [inserted] = await db.batch([
+    db
+      .prepare(
+        `INSERT OR IGNORE INTO channels (id, owner_id, name, created_at)
+         SELECT ?, ?, ?, ?
+         WHERE (SELECT count(*) FROM channels WHERE owner_id = ? AND name != 'default') < ?
+           AND (SELECT count(*) FROM channel_members WHERE user_id = ?) < ?`,
+      )
+      .bind(
+        channel.id,
+        channel.owner_id,
+        channel.name,
+        channel.created_at,
+        channel.owner_id,
+        max,
+        channel.owner_id,
+        maxMemberships,
+      ),
+    db
+      .prepare("INSERT INTO channel_members (channel_id, user_id, joined_at) SELECT id, owner_id, created_at FROM channels WHERE id = ?")
+      .bind(channel.id),
+  ]);
+  return inserted?.meta.changes === 1;
+}
+
+export async function ownedChannelNamed(db: D1Database, ownerId: string, name: string): Promise<Channel | null> {
+  return db
+    .prepare(`SELECT ${CHANNEL_COLUMNS} FROM channels c JOIN users o ON o.id = c.owner_id WHERE c.owner_id = ? AND c.name = ?`)
+    .bind(ownerId, name)
+    .first<Channel>();
+}
+
+export async function ownedChannel(db: D1Database, ownerId: string, id: string): Promise<Channel | null> {
+  return db
+    .prepare(`SELECT ${CHANNEL_COLUMNS} FROM channels c JOIN users o ON o.id = c.owner_id WHERE c.owner_id = ? AND c.id = ?`)
+    .bind(ownerId, id)
+    .first<Channel>();
+}
+
+/** Channels the user belongs to, owned or joined, in the order they joined. */
+export async function memberships(db: D1Database, userId: string): Promise<Membership[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT ${CHANNEL_COLUMNS}, (SELECT count(*) FROM channel_members WHERE channel_id = c.id) AS members
+       FROM channel_members m
+       JOIN channels c ON c.id = m.channel_id
+       JOIN users o ON o.id = c.owner_id
+       WHERE m.user_id = ?
+       ORDER BY m.joined_at, c.name`,
+    )
+    .bind(userId)
+    .all<Membership>();
+  return results;
+}
+
+/** Deletes a channel the user owns, other than their default, with everything that refers to it. */
+export async function deleteChannel(db: D1Database, ownerId: string, id: string): Promise<boolean> {
+  const [deleted] = await db.batch([
+    db.prepare("DELETE FROM channels WHERE id = ? AND owner_id = ? AND name != 'default'").bind(id, ownerId),
+    // api_key_channels rows stay: a key scoped only to deleted channels must
+    // stay scoped (to nothing), not become unscoped.
+    ...["channel_members", "subscriptions", "channel_invites"].map((table) =>
+      db.prepare(`DELETE FROM ${table} WHERE channel_id = ? AND NOT EXISTS (SELECT 1 FROM channels WHERE id = ?)`).bind(id, id),
+    ),
+  ]);
+  return deleted?.meta.changes === 1;
+}
+
+/** Stores a channel invite unless the channel already has [maxPending] unused ones. */
+export async function createChannelInvite(
+  db: D1Database,
+  codeHash: string,
+  channelId: string,
+  now: number,
+  expiresAt: number,
+  maxPending: number,
+): Promise<boolean> {
+  const result = await db
+    .prepare(
+      `INSERT INTO channel_invites (code_hash, channel_id, expires_at)
+       SELECT ?, ?, ?
+       WHERE (SELECT count(*) FROM channel_invites WHERE channel_id = ? AND expires_at > ?) < ?`,
+    )
+    .bind(codeHash, channelId, expiresAt, channelId, now, maxPending)
+    .run();
   return result.meta.changes === 1;
+}
+
+export type JoinResult = { channel: Channel; joined: boolean } | "invalid" | "full" | "channel full";
+
+/**
+ * Redeems a channel invite for [userId], atomically: the membership and the
+ * invite's deletion are one batch, so an invite admits one user. A user who
+ * is already a member keeps the invite unspent. "full" means the user
+ * already belongs to [maxMemberships] channels, "channel full" that the
+ * channel already has [maxMembers] members.
+ */
+export async function joinChannel(
+  db: D1Database,
+  codeHash: string,
+  userId: string,
+  now: number,
+  maxMemberships: number,
+  maxMembers: number,
+): Promise<JoinResult> {
+  const channel = await db
+    .prepare(
+      `SELECT ${CHANNEL_COLUMNS} FROM channel_invites i
+       JOIN channels c ON c.id = i.channel_id
+       JOIN users o ON o.id = c.owner_id AND o.disabled_at IS NULL
+       WHERE i.code_hash = ? AND i.expires_at > ?`,
+    )
+    .bind(codeHash, now)
+    .first<Channel>();
+  if (!channel) return "invalid";
+  const member = await db
+    .prepare("SELECT 1 FROM channel_members WHERE channel_id = ? AND user_id = ?")
+    .bind(channel.id, userId)
+    .first();
+  if (member) return { channel, joined: false };
+
+  const [inserted] = await db.batch([
+    db
+      .prepare(
+        `INSERT OR IGNORE INTO channel_members (channel_id, user_id, joined_at)
+         SELECT ?, ?, ?
+         WHERE EXISTS (SELECT 1 FROM channel_invites WHERE code_hash = ? AND expires_at > ?)
+           AND (SELECT count(*) FROM channel_members WHERE user_id = ?) < ?
+           AND (SELECT count(*) FROM channel_members WHERE channel_id = ?) < ?`,
+      )
+      .bind(channel.id, userId, now, codeHash, now, userId, maxMemberships, channel.id, maxMembers),
+    db
+      .prepare(
+        `DELETE FROM channel_invites WHERE code_hash = ?
+         AND EXISTS (SELECT 1 FROM channel_members WHERE channel_id = ? AND user_id = ? AND joined_at = ?)`,
+      )
+      .bind(codeHash, channel.id, userId, now),
+  ]);
+  if (inserted?.meta.changes === 1) return { channel, joined: true };
+  const raced = await db
+    .prepare("SELECT 1 FROM channel_members WHERE channel_id = ? AND user_id = ?")
+    .bind(channel.id, userId)
+    .first();
+  if (raced) return { channel, joined: false };
+  const stillValid = await db.prepare("SELECT 1 FROM channel_invites WHERE code_hash = ?").bind(codeHash).first();
+  if (!stillValid) return "invalid";
+  const joined = await db.prepare("SELECT count(*) AS n FROM channel_members WHERE user_id = ?").bind(userId).first<number>("n");
+  return (joined ?? 0) >= maxMemberships ? "full" : "channel full";
+}
+
+export async function members(
+  db: D1Database,
+  channelId: string,
+): Promise<{ id: string; name: string; joined_at: number }[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT u.id, u.name, m.joined_at FROM channel_members m JOIN users u ON u.id = m.user_id
+       WHERE m.channel_id = ? ORDER BY m.joined_at, u.name`,
+    )
+    .bind(channelId)
+    .all<{ id: string; name: string; joined_at: number }>();
+  return results;
+}
+
+/**
+ * Removes a member who is not the owner, and unsubscribes that member's
+ * devices from the channel.
+ */
+export async function removeMember(db: D1Database, channelId: string, userId: string): Promise<boolean> {
+  const [deleted] = await db.batch([
+    db
+      .prepare(
+        `DELETE FROM channel_members WHERE channel_id = ? AND user_id = ?
+         AND user_id != (SELECT owner_id FROM channels WHERE id = ?)`,
+      )
+      .bind(channelId, userId, channelId),
+    db
+      .prepare(
+        `DELETE FROM subscriptions WHERE channel_id = ?
+         AND device_id IN (SELECT id FROM devices WHERE user_id = ?)
+         AND NOT EXISTS (SELECT 1 FROM channel_members WHERE channel_id = ? AND user_id = ?)`,
+      )
+      .bind(channelId, userId, channelId, userId),
+  ]);
+  return deleted?.meta.changes === 1;
+}
+
+export async function deviceSubscriptions(db: D1Database, deviceId: string): Promise<string[]> {
+  const { results } = await db
+    .prepare("SELECT channel_id FROM subscriptions WHERE device_id = ?")
+    .bind(deviceId)
+    .all<{ channel_id: string }>();
+  return results.map((r) => r.channel_id);
+}
+
+/** Replaces a device's subscriptions. The caller checks that its owner belongs to every channel. */
+export async function setSubscriptions(db: D1Database, deviceId: string, channelIds: readonly string[]): Promise<void> {
+  await db.batch([
+    db.prepare("DELETE FROM subscriptions WHERE device_id = ?").bind(deviceId),
+    ...channelIds.map((channelId) =>
+      db.prepare("INSERT OR IGNORE INTO subscriptions (device_id, channel_id) VALUES (?, ?)").bind(deviceId, channelId),
+    ),
+  ]);
+}
+
+export async function subscribe(db: D1Database, deviceId: string, channelId: string): Promise<void> {
+  await db
+    .prepare("INSERT OR IGNORE INTO subscriptions (device_id, channel_id) VALUES (?, ?)")
+    .bind(deviceId, channelId)
+    .run();
+}
+
+/**
+ * The devices subscribed to [channelId] whose owners are still enabled
+ * members of it: a removed member's stale subscription delivers nothing.
+ */
+export async function subscribers(db: D1Database, channelId: string): Promise<Device[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT ${DEVICE_COLUMNS} FROM subscriptions s
+       JOIN devices d ON d.id = s.device_id
+       JOIN channel_members m ON m.channel_id = s.channel_id AND m.user_id = d.user_id
+       ${activeOwner("d")}
+       WHERE s.channel_id = ?
+       ORDER BY d.created_at`,
+    )
+    .bind(channelId)
+    .all<Device>();
+  return results;
 }

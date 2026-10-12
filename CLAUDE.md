@@ -73,7 +73,8 @@ See `README.md` for the user-facing setup and API table.
   binding `NOTIFY_LIMITER`, approximate by design). Migration 0002 moved
   pre-user data to `usr_owner` (also the column default, for writes by the
   old Worker during deploy), reachable only after the operator reissues its
-  token. **No rollback past migration 0002:** the earlier Worker ignores
+  token. **No rollback past migration 0002** (nor, after it, past PR #13,
+  whose `> 0` checks the 0003 triggers need): the earlier Worker ignores
   `user_id` and `disabled_at`, so it would send to every user's phones and
   accept every user's API keys, disabled or not. Never run it against a
   database with more than one user. Disabling a user does not disable the
@@ -81,6 +82,30 @@ See `README.md` for the user-facing setup and API table.
   token (which revokes the old one), so `ADMIN_TOKEN` is not barred from
   sending, only from doing so unnoticed. OAuth sign-up is planned
   separately (issue #10).
+- **Channels (issue #6):** messages are published to channels; devices
+  subscribe. A channel has one owner, who alone publishes (with their token
+  or an API key scoped through `api_key_channels`; an unscoped key may
+  publish to any of the owner's channels and address devices directly).
+  Other users join by single-use channel invite (hashed as
+  `channel-invite:` + code) and choose which of their devices subscribe.
+  Delivery joins `channel_members`, so a removed member's stale subscription
+  delivers nothing. Each user has `ch_default_<user id>`, which cannot be
+  shared or deleted, and every device subscribes to it when paired and
+  cannot leave it; a send without `channels` or `device_ids` goes there.
+  Triggers in `0003_channels.sql` create both, so rows the previous Worker
+  writes during a deploy are covered too. D1 counts trigger rows in
+  `meta.changes`, so those inserts are checked with `> 0`; that check
+  shipped separately (PR #13) before 0003, because deploys migrate before
+  publishing code. Deleting a channel keeps its `api_key_channels` rows,
+  so a key scoped only to deleted channels stays scoped to nothing rather
+  than becoming unscoped. Caps: 20 channels besides `default`, 50 owned or
+  joined channels per user, 20 members per channel (bounding one send's
+  FCM fan-out), 10 pending invites per channel, 20 channels per send. A
+  send reports per-device status only for the sender's own devices, and
+  counts for other members'. The sealed payload carries the optional
+  `channel` (as the receiver names it: `homelab` or `alice/homelab`) and
+  `channel_id`. User names are not unique, so the label is for display
+  only; clients must key on `channel_id`.
 - **Credentials:** operator token (`ADMIN_TOKEN` Worker secret: user
   management and invites only), user tokens (`nu_`), API keys (`nk_`, a
   user's), device tokens (`nd_`), pairing codes (Crockford base32
