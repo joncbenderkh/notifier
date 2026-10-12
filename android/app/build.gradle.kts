@@ -69,6 +69,7 @@ dependencies {
     implementation(libs.coroutines.play.services)
     implementation(libs.serialization.json)
     implementation(libs.okhttp)
+    implementation(libs.code.scanner)
 
     testImplementation(libs.junit)
     debugImplementation(libs.ui.tooling)

@@ -9,6 +9,7 @@ import com.google.firebase.messaging.FirebaseMessaging
 import com.joncbenderkh.notifier.BuildConfig
 import com.joncbenderkh.notifier.NotifierApp
 import com.joncbenderkh.notifier.data.Pairing
+import com.joncbenderkh.notifier.data.PairingLink
 import com.joncbenderkh.notifier.data.PairingStore
 import com.joncbenderkh.notifier.data.ServerClient
 import com.joncbenderkh.notifier.data.ServerException
@@ -26,6 +27,8 @@ data class UiState(
     val pairing: Pairing? = null,
     val busy: Boolean = false,
     val message: String? = null,
+    /** A scanned or opened pairing link waiting to fill the form. */
+    val prefill: PairingLink? = null,
 )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -61,6 +64,30 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             store.save(pairing)
             _state.update { it.copy(pairing = pairing) }
         }
+    }
+
+    /**
+     * Fills the pairing form from a scanned QR code or a `notifier://pair`
+     * link. It never pairs by itself: the user reviews the server URL and
+     * taps Pair, so a hostile QR code cannot silently redirect the phone.
+     */
+    fun openPairingLink(raw: String) {
+        val link = PairingLink.parse(raw, allowHttp = BuildConfig.DEBUG)
+        _state.update {
+            when {
+                link == null -> it.copy(message = "That is not a Notifier pairing code.")
+                it.pairing != null -> it.copy(message = "Already paired. Unpair first to pair with another server.")
+                else -> it.copy(prefill = link, message = "Check the server URL, then tap Pair.")
+            }
+        }
+    }
+
+    fun consumePrefill() {
+        _state.update { it.copy(prefill = null) }
+    }
+
+    fun showMessage(message: String) {
+        _state.update { it.copy(message = message) }
     }
 
     fun sendTest() {
