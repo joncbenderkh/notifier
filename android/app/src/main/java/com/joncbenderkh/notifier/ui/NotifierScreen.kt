@@ -150,7 +150,7 @@ private fun PairingForm(
 
     Text("Pair with a server", style = MaterialTheme.typography.titleLarge)
     Text(
-        "Open the server's /admin/pair page or run `notify pair`, then scan the QR code " +
+        "Open the server's /pair page or run `notify pair`, then scan the QR code " +
             "(or enter the code by hand) within ten minutes."
     )
     Button(
