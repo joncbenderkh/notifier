@@ -35,8 +35,19 @@ See `README.md` for the user-facing setup and API table.
   service-account JSON verbatim), declared in `src/env.d.ts` because
   `wrangler types` cannot see secrets. Locally they live in the gitignored
   `server/.dev.vars`.
-- **CLI stack:** Go stdlib only (`flag`, `net/http`). `-to` accepts names or
-  IDs; names resolve through `GET /v1/devices`, which API keys may call.
+- **CLI stack:** Go stdlib (`flag`, `net/http`) plus `skip2/go-qrcode` for
+  `notify pair`, which draws the QR with half blocks in explicit black/white
+  ANSI colours so it scans on dark terminals too. `-to` accepts names or IDs;
+  names resolve through `GET /v1/devices`, which API keys may call.
+- **QR pairing:** the link is `notifier://pair?server=<origin>&code=<code>`,
+  built by `server/src/pairing.ts` and parsed by Android's `PairingLink.kt`
+  (keep them in step). The Worker's `/admin/pair` page (`src/admin.ts`) is
+  static and secret-free under a strict CSP (no inline script or style);
+  the operator pastes the admin token, which never leaves page memory. The
+  app scans with Google's code scanner (`play-services-code-scanner`; no
+  camera permission) and also handles the link as a deep link. Either way
+  it only pre-fills the form — never pair without the user tapping Pair, or
+  a hostile QR code could silently point the phone at another server.
 - **Android stack:** Kotlin + Jetpack Compose, AGP 9 with built-in Kotlin
   (no `org.jetbrains.kotlin.android` plugin), Gradle Kotlin DSL with a version
   catalog. `minSdk = 26`, `compileSdk = 37.2`, `targetSdk = 37`. OkHttp +
