@@ -155,8 +155,8 @@ notify -to pixel "Hello"
 
 Messages are published to channels, and devices subscribe to the channels
 they want. Every user has a `default` channel, and new devices subscribe to
-it, so a message sent without a channel reaches all of a user's devices
-(and only theirs: `default` cannot be shared).
+it and cannot leave it, so a message sent without a channel reaches all of
+a user's devices (and only theirs: `default` cannot be shared).
 
 ```sh
 T="Authorization: Bearer $NOTIFIER_TOKEN"; S=https://notifier.joncbender.workers.dev
@@ -166,10 +166,10 @@ curl -X POST $S/v1/notifications -H "$T" -d '{"title": "disk full", "channels": 
 ```
 
 - **Sharing:** the channel's owner invites other users. Each invite admits
-  one user (`notifier://join?...`, valid 7 days). Members choose which of
-  their devices subscribe, and only the owner publishes. The owner can remove
-  members (`GET /v1/channels/{id}/members` lists them), and members can
-  leave.
+  one user (`notifier://join?...`, valid 7 days); a channel has at most 20
+  members, owner included. Members choose which of their devices
+  subscribe, and only the owner publishes. The owner can remove members
+  (`GET /v1/channels/{id}/members` lists them), and members can leave.
 - **Scoped keys:** an API key created with `{"name": "ci", "channels":
   ["ci"]}` can publish only to those channels, and cannot address devices
   directly.
@@ -227,7 +227,7 @@ another user's device or key IDs answer 404.
 
 | Method & path                     | Auth                 | Body / notes |
 |-----------------------------------|----------------------|--------------|
-| `POST /v1/notifications`          | User or API key      | `{"title", "body"?, "priority"?: "default"\|"high", "channels"?: [names], "device_ids"?: [...]}` — reaches devices subscribed to the named channels (the caller's own) plus the listed devices, each once; with neither, the `default` channel. Returns per-device delivery status. At most 60 a minute per user (429 after). |
+| `POST /v1/notifications`          | User or API key      | `{"title", "body"?, "priority"?: "default"\|"high", "channels"?: [names], "device_ids"?: [...]}` — reaches devices subscribed to the named channels (the caller's own) plus the listed devices, each once; with neither, the `default` channel. Returns per-device delivery status for the sender's own devices, and `members` (counts by status) for other members'. At most 60 a minute per user (429 after). |
 | `GET /v1/devices`                 | User or API key      | Activity timestamps only with a user token |
 | `POST /v1/pairings`               | User                 | Returns a single-use code valid for 10 minutes and its `notifier://pair` link (`uri`); `?qr=svg` adds `qr_svg`. At most 20 devices and 5 unused codes per user. |
 | `GET /pair`                       | —                    | Static page that calls `POST /v1/pairings` with a pasted user token and shows the QR code (`/admin/pair` redirects here) |
@@ -236,14 +236,14 @@ another user's device or key IDs answer 404.
 | `GET /v1/keys`                    | User                 | |
 | `DELETE /v1/keys/{id}`            | User                 | |
 | `GET /v1/user`                    | User                 | Who am I |
-| `POST /v1/channels`               | User                 | `{"name"}` (`[a-z0-9][a-z0-9_-]*`, ≤32); at most 20 per user |
+| `POST /v1/channels`               | User                 | `{"name"}` (`[a-z0-9][a-z0-9_-]*`, ≤32); at most 20 besides `default`, and 50 owned or joined, per user |
 | `GET /v1/channels`                | User                 | Channels owned or joined |
 | `DELETE /v1/channels/{id}`        | User (owner)         | Not `default` |
 | `POST /v1/channels/{id}/invites`  | User (owner)         | Not `default`; single-use, 7 days; returns `uri` (`notifier://join?...`), `?qr=svg` adds `qr_svg` |
 | `POST /v1/memberships`            | User                 | `{"invite"}`: join a channel |
 | `GET /v1/channels/{id}/members`   | User (owner)         | Members, with `id`, `name`, `joined_at` |
 | `DELETE /v1/channels/{id}/members/{user_id}` | User (owner, or the member leaving) | Also unsubscribes that member's devices |
-| `PUT /v1/devices/{id}/channels`   | User                 | `{"channel_ids"}`: set a device's subscriptions |
+| `PUT /v1/devices/{id}/channels`   | User                 | `{"channel_ids"}`: set a device's subscriptions (must include `default`) |
 | `POST /v1/invites`                | User or operator     | Single-use code valid for 7 days |
 | `POST /v1/users`                  | Invite               | `{"invite", "name"}`; returns the new user's token, once |
 | `GET /v1/users`                   | Operator             | |
@@ -254,7 +254,7 @@ another user's device or key IDs answer 404.
 | `POST /v1/device/test`            | Device               | Used by the app |
 | `DELETE /v1/device`               | Device               | Used by the app (unpair) |
 | `GET /v1/device/channels`         | Device               | Channels its owner can subscribe to, with `subscribed` |
-| `PUT /v1/device/channels`         | Device               | `{"channel_ids"}` |
+| `PUT /v1/device/channels`         | Device               | `{"channel_ids"}` (must include `default`) |
 | `POST /v1/device/memberships`     | Device               | `{"invite"}`: its owner joins, and the device subscribes |
 | `GET /healthz`                    | —                    | |
 
