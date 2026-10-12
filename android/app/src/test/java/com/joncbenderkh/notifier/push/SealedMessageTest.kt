@@ -5,7 +5,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 import java.util.Base64
 
-/** Pins the wire format against the vector in server/internal/seal/seal_test.go. */
+/** Pins the wire format against the vector in server/test/seal.test.ts. */
 class SealedMessageTest {
     private val key = Base64.getDecoder().decode("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=")
     private val vector = mapOf(

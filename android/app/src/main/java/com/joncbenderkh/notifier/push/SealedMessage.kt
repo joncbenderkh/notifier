@@ -9,7 +9,7 @@ import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
-/** The plaintext the server seals into every push; mirrors `api.Payload`. */
+/** The plaintext the server seals into every push; mirrors `Payload` in server/src/app.ts. */
 @Serializable
 data class Payload(
     val id: String,

@@ -1,0 +1,35 @@
+{
+  "name": "notifier-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Authenticated, end-to-end encrypted push notifications to Android via an HTTP API.",
+  "license": "GPL-3.0-or-later",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "postinstall": "wrangler types",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "build": "wrangler deploy --dry-run --outdir dist",
+    "typegen": "wrangler types",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "db:migrate:local": "wrangler d1 migrations apply notifier --local",
+    "db:migrate:remote": "wrangler d1 migrations apply notifier --remote"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.4.0",
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.12.0",
+    "typescript": "~6.0.3",
+    "typescript-eslint": "^8.71.1",
+    "vitest": "^5.0.3",
+    "wrangler": "^4.149.0"
+  },
+  "dependencies": {
+    "hono": "^4.13.13"
+  }
+}
