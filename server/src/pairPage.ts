@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// A static admin page for creating a pairing code and showing it as a QR
-// code. The page itself is public and holds no secrets; the operator pastes
-// the admin token, which stays in page memory only and is sent solely to
-// this origin's POST /v1/pairings.
+// A static page for creating a pairing code and showing it as a QR code. The
+// page itself is public and holds no secrets; the user pastes their token,
+// which the page keeps in memory only and sends solely to this origin's
+// POST /v1/pairings.
 
 import type { Hono } from "hono";
 import { secureHeaders } from "hono/secure-headers";
@@ -15,15 +15,15 @@ const PAGE = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
 <title>Pair a phone · notifier</title>
-<link rel="stylesheet" href="/admin/pair.css">
-<script src="/admin/pair.js" defer></script>
+<link rel="stylesheet" href="/pair.css">
+<script src="/pair.js" defer></script>
 </head>
 <body>
 <main>
   <h1>Pair a phone</h1>
   <form id="form" autocomplete="off">
-    <label for="token">Admin token</label>
-    <input id="token" type="password" required minlength="32" spellcheck="false">
+    <label for="token">Your token</label>
+    <input id="token" type="password" required pattern="\\s*nu_[a-z2-7]+\\s*" placeholder="nu_…" spellcheck="false">
     <button id="create" type="submit">Create pairing code</button>
   </form>
   <p id="status" role="status"></p>
@@ -112,26 +112,28 @@ dd { margin: 0; font-family: ui-monospace, monospace; overflow-wrap: anywhere; }
 
 const NO_STORE = { "cache-control": "no-store" };
 
-export function adminRoutes<E extends object>(app: Hono<E>): void {
-  app.use(
-    "/admin/*",
-    secureHeaders({
-      contentSecurityPolicy: {
-        defaultSrc: ["'none'"],
-        scriptSrc: ["'self'"],
-        styleSrc: ["'self'"],
-        imgSrc: ["data:"],
-        connectSrc: ["'self'"],
-        formAction: ["'none'"],
-        baseUri: ["'none'"],
-        frameAncestors: ["'none'"],
-      },
-      referrerPolicy: "no-referrer",
-      xFrameOptions: "DENY",
-      strictTransportSecurity: "max-age=31536000; includeSubDomains",
-    }),
+const pageHeaders = secureHeaders({
+  contentSecurityPolicy: {
+    defaultSrc: ["'none'"],
+    scriptSrc: ["'self'"],
+    styleSrc: ["'self'"],
+    imgSrc: ["data:"],
+    connectSrc: ["'self'"],
+    formAction: ["'none'"],
+    baseUri: ["'none'"],
+    frameAncestors: ["'none'"],
+  },
+  referrerPolicy: "no-referrer",
+  xFrameOptions: "DENY",
+  strictTransportSecurity: "max-age=31536000; includeSubDomains",
+});
+
+export function pairPageRoutes<E extends object>(app: Hono<E>): void {
+  app.get("/pair", pageHeaders, (c) => c.html(PAGE, 200, NO_STORE));
+  app.get("/pair.js", pageHeaders, (c) =>
+    c.body(SCRIPT, 200, { ...NO_STORE, "content-type": "text/javascript; charset=utf-8" }),
   );
-  app.get("/admin/pair", (c) => c.html(PAGE, 200, NO_STORE));
-  app.get("/admin/pair.js", (c) => c.body(SCRIPT, 200, { ...NO_STORE, "content-type": "text/javascript; charset=utf-8" }));
-  app.get("/admin/pair.css", (c) => c.body(STYLE, 200, { ...NO_STORE, "content-type": "text/css; charset=utf-8" }));
+  app.get("/pair.css", pageHeaders, (c) => c.body(STYLE, 200, { ...NO_STORE, "content-type": "text/css; charset=utf-8" }));
+  // The page's address before users existed.
+  app.get("/admin/pair", (c) => c.redirect("/pair", 301));
 }

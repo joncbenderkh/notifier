@@ -25,10 +25,11 @@ curl -X POST https://notifier.joncbender.workers.dev/v1/notifications \
 
 | Credential   | Held by                         | Allows                                         |
 |--------------|---------------------------------|------------------------------------------------|
-| Admin token  | Server operator (Worker secret) | Create pairing codes and API keys; list/remove devices and keys |
-| API key      | Each sending script/service     | Send notifications; list paired devices (IDs and names) |
+| Admin token  | Server operator (Worker secret) | Manage users (list, reissue token, disable); mint invites |
+| User token   | Each user, from sign-up         | Pair devices, manage their API keys and devices, invite, send |
+| API key      | A user's sending script/service | Send notifications; list paired devices (IDs and names) |
 | Device token | The paired phone                | Update its own FCM token, send itself a test, unpair |
-| Pairing code | Operator → phone, once          | Register one device, within 10 minutes         |
+| Pairing code | User → phone, once              | Register one device, within 10 minutes         |
 
 API keys and device tokens are 256-bit random secrets stored server-side only
 as SHA-256 digests, and each can be revoked independently.
@@ -71,7 +72,7 @@ npm install
 npx wrangler login
 npx wrangler d1 create notifier        # paste the database_id into wrangler.jsonc
 npx wrangler d1 migrations apply notifier --remote
-openssl rand -hex 32 | tee /dev/stderr | npx wrangler secret put ADMIN_TOKEN
+openssl rand -hex 32 | tee /dev/stderr | npx wrangler secret put ADMIN_TOKEN   # the operator's token
 npx wrangler secret put FCM_SERVICE_ACCOUNT < /path/to/notifier-firebase-adminsdk.json
 npx wrangler deploy
 ```
@@ -84,15 +85,47 @@ Local development: copy `server/.dev.vars.example` to `server/.dev.vars`,
 then `npm run db:migrate:local && npm run dev`. `PUSH_TRANSPORT=log` logs
 messages instead of delivering them.
 
-### 3. Pair the phone
+### 3. Create a user
+
+A deployment serves several users; each owns their own phones and API keys.
+`ADMIN_TOKEN` is the operator's credential: it manages users and mints
+invites, and nothing else. People join with a single-use invite (valid seven
+days), and the server generates their token:
+
+```sh
+curl -X POST https://notifier.joncbender.workers.dev/v1/invites -H "Authorization: Bearer $ADMIN_TOKEN"
+# {"code":"0Z5H-QCEA-3JX4","expires_at":"..."}
+
+curl -X POST https://notifier.joncbender.workers.dev/v1/users -d '{"invite": "0Z5H-QCEA-3JX4", "name": "alice"}'
+# {"user_id":"usr_...","name":"alice","token":"nu_..."}   <- shown only once
+```
+
+Users can invite others too (`POST /v1/invites` with their own token; at most
+ten each, used or not). `GET /v1/users` shows who invited whom; disabling a
+user does not disable the users they invited. A lost token cannot be
+recovered, only replaced: the operator calls `POST /v1/users/{id}/token`,
+which revokes the old one. That also means the operator can take over any
+account, though not without its owner's token stopping working.
+
+Upgrading a deployment from before users existed moves its phones and API
+keys to a user `usr_owner`. Nobody can sign in as it until the operator issues
+its token:
+
+```sh
+curl -X POST https://notifier.joncbender.workers.dev/v1/users/usr_owner/token -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+Paired phones and existing API keys keep working throughout.
+
+### 4. Pair the phone
 
 Create a single-use pairing code (valid 10 minutes) and show it as a QR code,
 either way:
 
-- **Browser:** open `https://notifier.joncbender.workers.dev/admin/pair`,
-  paste the admin token, and click *Create pairing code*. The token stays in
-  the page's memory and is sent only to that server.
-- **Terminal:** `NOTIFIER_ADMIN_TOKEN=... notify pair` prints the QR code.
+- **Browser:** open `https://notifier.joncbender.workers.dev/pair`, paste your
+  user token, and click *Create pairing code*. The token stays in the page's
+  memory and is sent only to that server.
+- **Terminal:** `NOTIFIER_ADMIN_TOKEN=nu_... notify pair` prints the QR code.
 
 In the app, tap **Scan QR code** (or scan with the phone's camera app, which
 opens the `notifier://pair?...` link in Notifier). Scanning only fills in the
@@ -102,15 +135,15 @@ The code can also be typed by hand.
 The raw API works too:
 
 ```sh
-curl -X POST https://notifier.joncbender.workers.dev/v1/pairings -H "Authorization: Bearer $ADMIN_TOKEN"
+curl -X POST https://notifier.joncbender.workers.dev/v1/pairings -H "Authorization: Bearer $NOTIFIER_TOKEN"
 # {"code":"7KQ2-MX9D","expires_at":"...","uri":"notifier://pair?server=...&code=7KQ2-MX9D"}
 ```
 
-### 4. Create an API key and send
+### 5. Create an API key and send
 
 ```sh
 curl -X POST https://notifier.joncbender.workers.dev/v1/keys \
-  -H "Authorization: Bearer $ADMIN_TOKEN" -d '{"name": "laptop"}'
+  -H "Authorization: Bearer $NOTIFIER_TOKEN" -d '{"name": "laptop"}'
 # {"id":"key_...","key":"nk_...", ...}   <- the key is shown only once
 
 export NOTIFIER_URL=https://notifier.joncbender.workers.dev NOTIFIER_API_KEY=nk_...
@@ -123,7 +156,7 @@ notify -to pixel "Hello"
 ```
 notify [flags] TITLE [BODY | -]
 notify devices
-notify pair        # needs NOTIFIER_ADMIN_TOKEN; prints a pairing QR code
+notify pair        # needs a user token in NOTIFIER_ADMIN_TOKEN; prints a pairing QR code
 notify version
 
   -to PHONE   device name (case-insensitive) or ID; repeatable or
@@ -161,21 +194,32 @@ a prebuilt binary from the
 
 ## API
 
-| Method & path                | Auth             | Body / notes |
-|------------------------------|------------------|--------------|
-| `POST /v1/notifications`     | API key          | `{"title", "body"?, "priority"?: "default"\|"high", "device_ids"?: [...]}` — omitting `device_ids` sends to every paired device. Returns per-device delivery status. |
-| `GET /v1/devices`            | Admin or API key | |
-| `POST /v1/pairings`          | Admin            | Returns a single-use code valid for 10 minutes and its `notifier://pair` link (`uri`); `?qr=svg` adds `qr_svg` |
-| `GET /admin/pair`            | —                | Static page that calls `POST /v1/pairings` with a pasted admin token and shows the QR code |
-| `DELETE /v1/devices/{id}`    | Admin            | |
-| `POST /v1/keys`              | Admin            | `{"name"}` |
-| `GET /v1/keys`               | Admin            | |
-| `DELETE /v1/keys/{id}`       | Admin            | |
-| `POST /v1/devices`           | Pairing code     | Used by the app: `{"code", "name", "fcm_token"}` |
-| `PUT /v1/device`             | Device           | Used by the app: `{"fcm_token"}` |
-| `POST /v1/device/test`       | Device           | Used by the app |
-| `DELETE /v1/device`          | Device           | Used by the app (unpair) |
-| `GET /healthz`               | —                | |
+Credentials: **operator** (`ADMIN_TOKEN`), **user** (`nu_`, from sign-up),
+**API key** (`nk_`, a user's, for scripts), **device** (`nd_`, a paired
+phone's). Everything a user or API key touches is scoped to that user;
+another user's device or key IDs answer 404.
+
+| Method & path                     | Auth                 | Body / notes |
+|-----------------------------------|----------------------|--------------|
+| `POST /v1/notifications`          | User or API key      | `{"title", "body"?, "priority"?: "default"\|"high", "device_ids"?: [...]}` — omitting `device_ids` sends to every one of the user's devices. Returns per-device delivery status. At most 60 a minute per user (429 after). |
+| `GET /v1/devices`                 | User or API key      | Activity timestamps only with a user token |
+| `POST /v1/pairings`               | User                 | Returns a single-use code valid for 10 minutes and its `notifier://pair` link (`uri`); `?qr=svg` adds `qr_svg`. At most 20 devices and 5 unused codes per user. |
+| `GET /pair`                       | —                    | Static page that calls `POST /v1/pairings` with a pasted user token and shows the QR code (`/admin/pair` redirects here) |
+| `DELETE /v1/devices/{id}`         | User                 | |
+| `POST /v1/keys`                   | User                 | `{"name"}`; at most 20 per user |
+| `GET /v1/keys`                    | User                 | |
+| `DELETE /v1/keys/{id}`            | User                 | |
+| `GET /v1/user`                    | User                 | Who am I |
+| `POST /v1/invites`                | User or operator     | Single-use code valid for 7 days |
+| `POST /v1/users`                  | Invite               | `{"invite", "name"}`; returns the new user's token, once |
+| `GET /v1/users`                   | Operator             | |
+| `POST /v1/users/{id}/token`       | Operator             | Issues a new token, revoking the old one |
+| `POST /v1/users/{id}/disable`     | Operator             | Rejects the user's token, API keys, and devices; `/enable` undoes it |
+| `POST /v1/devices`                | Pairing code         | Used by the app: `{"code", "name", "fcm_token"}` |
+| `PUT /v1/device`                  | Device               | Used by the app: `{"fcm_token"}` |
+| `POST /v1/device/test`            | Device               | Used by the app |
+| `DELETE /v1/device`               | Device               | Used by the app (unpair) |
+| `GET /healthz`                    | —                    | |
 
 Limits: title 256 bytes, body 2048 bytes.
 

@@ -11,8 +11,18 @@
     "PUSH_TRANSPORT": "fcm"
   },
   // Secrets, set with `npx wrangler secret put <NAME>` (or `.dev.vars` locally):
-  //   ADMIN_TOKEN          at least 32 characters
+  //   ADMIN_TOKEN          the operator's token (user management), at least
+  //                        32 characters: `openssl rand -hex 32`
   //   FCM_SERVICE_ACCOUNT  the Firebase service-account JSON, verbatim
+  // Per-user cap on POST /v1/notifications. Counted per Cloudflare location,
+  // so it is a guard against runaway scripts, not an exact quota.
+  "ratelimits": [
+    {
+      "name": "NOTIFY_LIMITER",
+      "namespace_id": "1001",
+      "simple": { "limit": 60, "period": 60 }
+    }
+  ],
   "d1_databases": [
     {
       "binding": "DB",

@@ -41,9 +41,9 @@ See `README.md` for the user-facing setup and API table.
   names resolve through `GET /v1/devices`, which API keys may call.
 - **QR pairing:** the link is `notifier://pair?server=<origin>&code=<code>`,
   built by `server/src/pairing.ts` and parsed by Android's `PairingLink.kt`
-  (keep them in step). The Worker's `/admin/pair` page (`src/admin.ts`) is
+  (keep them in step). The Worker's `/pair` page (`src/pairPage.ts`) is
   static and secret-free under a strict CSP (no inline script or style);
-  the operator pastes the admin token, which never leaves page memory. The
+  the user pastes their token, which never leaves page memory. The
   app scans with Google's code scanner (`play-services-code-scanner`; no
   camera permission) and also handles the link as a deep link. Either way
   it only pre-fills the form — never pair without the user tapping Pair, or
@@ -61,9 +61,31 @@ See `README.md` for the user-facing setup and API table.
   initializes `FirebaseApp` manually. There is deliberately no
   `google-services.json` and no google-services Gradle plugin, so the app
   builds (but cannot pair) without Firebase config — CI relies on this.
-- **Credentials:** admin token (Worker secret), API keys (`nk_` prefix), device
-  tokens (`nd_` prefix), pairing codes (Crockford base32 `XXXX-XXXX`, 10 min,
-  single use). Secrets are stored only as unsalted SHA-256 digests — fine
+- **Users:** a deployment serves several users (issue #9). Sign-up is by
+  single-use invite (`XXXX-XXXX-XXXX`, 7 days), minted by the operator or a
+  user; the server generates the user's token. Devices, API keys, and
+  pairings carry `user_id`, and every store query is scoped by it; another
+  user's IDs answer 404, never 403. Credentials of a disabled user resolve to
+  nothing (the lookups join `users`). Per-user caps, enforced inside the INSERT so
+  concurrent requests cannot overshoot: 20 devices, 20 API keys, 10 invites
+  (pending plus redeemed, recorded in `users.invited_by`, so redeeming one's
+  own invites cannot mint unlimited accounts), 5 pending pairing codes, and 60 notifications a minute (Workers Rate Limiting
+  binding `NOTIFY_LIMITER`, approximate by design). Migration 0002 moved
+  pre-user data to `usr_owner` (also the column default, for writes by the
+  old Worker during deploy), reachable only after the operator reissues its
+  token. **No rollback past migration 0002:** the earlier Worker ignores
+  `user_id` and `disabled_at`, so it would send to every user's phones and
+  accept every user's API keys, disabled or not. Never run it against a
+  database with more than one user. Disabling a user does not disable the
+  users they invited. The operator can act as any user by reissuing their
+  token (which revokes the old one), so `ADMIN_TOKEN` is not barred from
+  sending, only from doing so unnoticed. OAuth sign-up is planned
+  separately (issue #10).
+- **Credentials:** operator token (`ADMIN_TOKEN` Worker secret: user
+  management and invites only), user tokens (`nu_`), API keys (`nk_`, a
+  user's), device tokens (`nd_`), pairing codes (Crockford base32
+  `XXXX-XXXX`, 10 min, single use). Invite codes are hashed with an
+  `invite:` prefix so they can never redeem as pairing codes. Secrets are stored only as unsalted SHA-256 digests — fine
   because they are 256-bit random; don't reuse that scheme for anything
   low-entropy.
 - **Wire format (envelope v1):** FCM data `{"v":"1","n":<b64 nonce>,"c":<b64
@@ -82,14 +104,17 @@ See `README.md` for the user-facing setup and API table.
 
 ## Layout
 
-- `server/src/app.ts` — `createApp(deps)`: routes and auth middleware.
-  Admin auth fails closed unless `ADMIN_TOKEN` is ≥32 characters; request
-  bodies reject unknown fields; API keys see only `id`/`name`/`reachable`
-  from `GET /v1/devices`. The
+- `server/src/app.ts` — `createApp(deps)`: routes and auth middleware
+  (`operator`, `user`, `userOrApiKey`, `userOrOperator`, `device`, each
+  setting `userId`). Operator auth fails closed unless `ADMIN_TOKEN` is ≥32
+  characters; request bodies reject unknown fields; API keys see only
+  `id`/`name`/`reachable` from `GET /v1/devices`. The
   sender and clock are injected so `test/api.test.ts` drives the whole flow
   against D1 with a fake sender.
 - `server/src/{store,seal,token,push,encoding}.ts` — D1 queries, envelope
   encryption, secret generation/hashing, FCM + log senders, byte encodings.
+- `server/src/{pairing,pairPage}.ts` — the `notifier://pair` link and QR, and
+  the static `/pair` page.
 - `server/src/index.ts` — the deployed entry point.
 - `notify/` — `main.go` (flags, output, exit codes), `client.go` (API client,
   name → ID resolution); `main_test.go` runs it against an `httptest` server.
