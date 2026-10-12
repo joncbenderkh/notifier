@@ -12,7 +12,8 @@ notifications to the user's own phone via an HTTP API. A monorepo:
   `https://notifier.joncbender.workers.dev`.
 - `android/` — Kotlin + Jetpack Compose app. Pairs with a server, receives FCM
   data messages, decrypts them, and posts notifications.
-- `notify/` — Go CLI that sends notifications with an API key.
+- `notify/` — Go CLI that sends notifications and manages the account
+  (sign-up, pairing, keys, channels).
 
 See `README.md` for the user-facing setup and API table.
 
@@ -39,6 +40,19 @@ See `README.md` for the user-facing setup and API table.
   `notify pair`, which draws the QR with half blocks in explicit black/white
   ANSI colours so it scans on dark terminals too. `-to` accepts names or IDs;
   names resolve through `GET /v1/devices`, which API keys may call.
+  Settings: flags > env (`NOTIFIER_URL`, `NOTIFIER_API_KEY`,
+  `NOTIFIER_TOKEN`; `NOTIFIER_ADMIN_TOKEN` as a legacy alias, honoured only
+  when it starts with `nu_`, since it once held the operator secret) > JSON config
+  at `$XDG_CONFIG_HOME/notifier/config.json` (issue #8; the daemon of #7
+  shares it). Unknown fields are rejected, and a file with credentials must
+  be 0600; writes are atomic and 0600. Flags default to empty and resolve
+  after parsing, so `-h` never prints a secret. Sending uses the API key or
+  user token from the highest level that sets one; other commands need the
+  user token. Subcommand flags come before their arguments. Subcommand
+  words are reserved only in a command's shape (no-argument commands alone,
+  the rest with arguments), so scripts sending arbitrary titles keep
+  working. Sign-up rewrites the config with only the new account's
+  settings.
 - **QR pairing:** the link is `notifier://pair?server=<origin>&code=<code>`,
   built by `server/src/pairing.ts` and parsed by Android's `PairingLink.kt`
   (keep them in step). The Worker's `/pair` page (`src/pairPage.ts`) is
@@ -141,8 +155,11 @@ See `README.md` for the user-facing setup and API table.
 - `server/src/{pairing,pairPage}.ts` — the `notifier://pair` link and QR, and
   the static `/pair` page.
 - `server/src/index.ts` — the deployed entry point.
-- `notify/` — `main.go` (flags, output, exit codes), `client.go` (API client,
-  name → ID resolution); `main_test.go` runs it against an `httptest` server.
+- `notify/` — `main.go` (flags, settings, sending, exit codes),
+  `commands.go` (subcommands), `config.go` (config file), `client.go` (API
+  client, name → ID resolution), `pair.go` (terminal QR). `main_test.go` and
+  `commands_test.go` run it against `httptest` servers; `TestMain` clears
+  `NOTIFIER_*` and points `NOTIFIER_CONFIG` at a missing file.
 - `android/app/src/main/java/com/joncbenderkh/notifier/`
   - `data/` — `PairingStore`, `ServerClient` (blocking; callers pick the thread).
   - `push/` — `PushService` (FCM), `SealedMessage` (pure JVM, unit-tested),

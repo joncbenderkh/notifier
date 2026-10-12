@@ -10,12 +10,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
 
-// Client calls the notifier API with a bearer token: an API key for
-// sending, or the admin token for pairing.
+// Client calls the notifier API with a bearer token: a user token, or an
+// API key (which may only send and list devices). Sign-up sends none.
 type Client struct {
 	BaseURL string
 	Token   string
@@ -32,6 +33,7 @@ type Notification struct {
 	Title     string   `json:"title"`
 	Body      string   `json:"body,omitempty"`
 	Priority  string   `json:"priority,omitempty"`
+	Channels  []string `json:"channels,omitempty"`
 	DeviceIDs []string `json:"device_ids,omitempty"`
 }
 
@@ -41,9 +43,12 @@ type Delivery struct {
 	Error    string `json:"error,omitempty"`
 }
 
+// NotifyResult lists deliveries to the sender's own devices; Members counts
+// those to other channel members' devices by status.
 type NotifyResult struct {
-	ID         string     `json:"id"`
-	Deliveries []Delivery `json:"deliveries"`
+	ID         string         `json:"id"`
+	Deliveries []Delivery     `json:"deliveries"`
+	Members    map[string]int `json:"members,omitempty"`
 }
 
 // APIError is a non-2xx response, carrying the server's error message.
@@ -65,7 +70,7 @@ type Pairing struct {
 	URI       string    `json:"uri"`
 }
 
-// Pair creates a single-use pairing code; it needs the admin token.
+// Pair creates a single-use pairing code; it needs a user token.
 func (c *Client) Pair(ctx context.Context) (Pairing, error) {
 	var p Pairing
 	return p, c.do(ctx, http.MethodPost, "/v1/pairings", nil, &p)
@@ -74,6 +79,123 @@ func (c *Client) Pair(ctx context.Context) (Pairing, error) {
 func (c *Client) Notify(ctx context.Context, n Notification) (NotifyResult, error) {
 	var result NotifyResult
 	return result, c.do(ctx, http.MethodPost, "/v1/notifications", n, &result)
+}
+
+type Signup struct {
+	UserID string `json:"user_id"`
+	Name   string `json:"name"`
+	Token  string `json:"token"`
+}
+
+// Signup redeems an invite for a new user; the token is shown only once.
+func (c *Client) Signup(ctx context.Context, invite, name string) (Signup, error) {
+	var s Signup
+	return s, c.do(ctx, http.MethodPost, "/v1/users", map[string]string{"invite": invite, "name": name}, &s)
+}
+
+type Invite struct {
+	Code      string    `json:"code"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+func (c *Client) Invite(ctx context.Context) (Invite, error) {
+	var i Invite
+	return i, c.do(ctx, http.MethodPost, "/v1/invites", nil, &i)
+}
+
+type User struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+func (c *Client) Me(ctx context.Context) (User, error) {
+	var u User
+	return u, c.do(ctx, http.MethodGet, "/v1/user", nil, &u)
+}
+
+type APIKey struct {
+	ID         string     `json:"id"`
+	Name       string     `json:"name"`
+	Key        string     `json:"key,omitempty"`
+	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
+	Channels   []string   `json:"channels"`
+}
+
+func (c *Client) Keys(ctx context.Context) ([]APIKey, error) {
+	var keys []APIKey
+	return keys, c.do(ctx, http.MethodGet, "/v1/keys", nil, &keys)
+}
+
+// CreateKey creates an API key, limited to [channels] unless that is empty.
+func (c *Client) CreateKey(ctx context.Context, name string, channels []string) (APIKey, error) {
+	in := struct {
+		Name     string   `json:"name"`
+		Channels []string `json:"channels,omitempty"`
+	}{name, channels}
+	var k APIKey
+	return k, c.do(ctx, http.MethodPost, "/v1/keys", in, &k)
+}
+
+func (c *Client) DeleteKey(ctx context.Context, id string) error {
+	return c.do(ctx, http.MethodDelete, "/v1/keys/"+url.PathEscape(id), nil, nil)
+}
+
+// Channel is a channel the user owns or has joined. Name is as the user
+// sees it: "homelab" when owned, "alice/homelab" when joined.
+type Channel struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Owned   bool   `json:"owned"`
+	Members int    `json:"members"`
+}
+
+func (c *Client) Channels(ctx context.Context) ([]Channel, error) {
+	var channels []Channel
+	return channels, c.do(ctx, http.MethodGet, "/v1/channels", nil, &channels)
+}
+
+func (c *Client) CreateChannel(ctx context.Context, name string) (Channel, error) {
+	var ch Channel
+	return ch, c.do(ctx, http.MethodPost, "/v1/channels", map[string]string{"name": name}, &ch)
+}
+
+func (c *Client) DeleteChannel(ctx context.Context, id string) error {
+	return c.do(ctx, http.MethodDelete, "/v1/channels/"+url.PathEscape(id), nil, nil)
+}
+
+type ChannelInvite struct {
+	Code      string    `json:"code"`
+	Channel   string    `json:"channel"`
+	ExpiresAt time.Time `json:"expires_at"`
+	URI       string    `json:"uri"`
+}
+
+func (c *Client) InviteToChannel(ctx context.Context, id string) (ChannelInvite, error) {
+	var i ChannelInvite
+	return i, c.do(ctx, http.MethodPost, "/v1/channels/"+url.PathEscape(id)+"/invites", nil, &i)
+}
+
+// Join redeems a channel invite for the user.
+func (c *Client) Join(ctx context.Context, code string) (Channel, error) {
+	var ch Channel
+	return ch, c.do(ctx, http.MethodPost, "/v1/memberships", map[string]string{"invite": code}, &ch)
+}
+
+type Member struct {
+	ID       string    `json:"id"`
+	Name     string    `json:"name"`
+	JoinedAt time.Time `json:"joined_at"`
+}
+
+func (c *Client) Members(ctx context.Context, channelID string) ([]Member, error) {
+	var members []Member
+	return members, c.do(ctx, http.MethodGet, "/v1/channels/"+url.PathEscape(channelID)+"/members", nil, &members)
+}
+
+// RemoveMember removes a member (the owner's right), or the user themselves.
+func (c *Client) RemoveMember(ctx context.Context, channelID, userID string) error {
+	path := "/v1/channels/" + url.PathEscape(channelID) + "/members/" + url.PathEscape(userID)
+	return c.do(ctx, http.MethodDelete, path, nil, nil)
 }
 
 // ErrNoSuchDevice means a selector matched no paired phone.
@@ -119,7 +241,9 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any) error
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+c.Token)
+	if c.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.Token)
+	}
 	if in != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -140,6 +264,9 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any) error
 			e.Error = strings.TrimSpace(string(raw))
 		}
 		return &APIError{Status: resp.StatusCode, Message: e.Error}
+	}
+	if out == nil {
+		return nil
 	}
 	if err := json.Unmarshal(raw, out); err != nil {
 		return errors.New("unexpected response from server: " + err.Error())

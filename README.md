@@ -100,6 +100,9 @@ curl -X POST https://notifier.joncbender.workers.dev/v1/users -d '{"invite": "0Z
 # {"user_id":"usr_...","name":"alice","token":"nu_..."}   <- shown only once
 ```
 
+Or, with the CLI, which saves the token to its config file:
+`notify -url https://notifier.joncbender.workers.dev signup 0Z5H-QCEA-3JX4 alice`.
+
 Users can invite others too (`POST /v1/invites` with their own token; at most
 ten each, used or not). `GET /v1/users` shows who invited whom; disabling a
 user does not disable the users they invited. A lost token cannot be
@@ -125,7 +128,8 @@ either way:
 - **Browser:** open `https://notifier.joncbender.workers.dev/pair`, paste your
   user token, and click *Create pairing code*. The token stays in the page's
   memory and is sent only to that server.
-- **Terminal:** `NOTIFIER_ADMIN_TOKEN=nu_... notify pair` prints the QR code.
+- **Terminal:** `notify pair` prints the QR code (it needs your user token;
+  see [the CLI](#notify-cli)).
 
 In the app, tap **Scan QR code** (or scan with the phone's camera app, which
 opens the `notifier://pair?...` link in Notifier). Scanning only fills in the
@@ -180,25 +184,80 @@ curl -X POST $S/v1/notifications -H "$T" -d '{"title": "disk full", "channels": 
 ## `notify` CLI
 
 ```
-notify [flags] TITLE [BODY | -]
-notify devices
-notify pair        # needs a user token in NOTIFIER_ADMIN_TOKEN; prints a pairing QR code
+notify [flags] TITLE [BODY | -]       send
+notify devices                        list your paired phones
+notify pair                           print a pairing QR code
+notify signup [-force] INVITE NAME    create a user; saves the token to the config file
+notify invite                         mint an invite for someone else
+notify config init [-force]           write the config file from -url/-token/-key
+notify keys                           list API keys
+notify key create [-c CHANNEL]... NAME   print a new API key, optionally scoped
+notify key delete NAME|ID
+notify channels                       list channels you own or joined
+notify channel create|delete|invite|members|leave NAME
+notify channel join CODE
+notify channel remove NAME MEMBER
 notify version
 
   -to PHONE   device name (case-insensitive) or ID; repeatable or
-              comma-separated (a name containing a comma needs its ID).
-              Default: every paired phone.
+              comma-separated (a name containing a comma needs its ID)
+  -c CHANNEL  one of your own channels; repeatable or comma-separated.
+              Without -to or -c: the config file's, else the default
+              channel (every paired phone)
   -high       high priority (heads-up, may wake the phone)
-  -url URL    server (default $NOTIFIER_URL); must be https except for
-              localhost or a loopback IP, and redirects are refused
-  -key KEY    API key (default $NOTIFIER_API_KEY)
+  -url URL    server; must be https except for localhost or a loopback IP,
+              and redirects are refused
+  -key KEY    API key, for sending and `devices`
+  -token TOK  user token, for everything (sending included)
   -timeout    request timeout (default 30s), counted from when the request
               starts, not while waiting for stdin
 ```
 
-Flags must come before TITLE; everything from TITLE on is message text, so a
-body taken from a variable can never act as a flag. Put `--` before a title
-that starts with `-` or is exactly `devices`, `pair`, or `version`.
+Settings come from flags, then the environment (`NOTIFIER_URL`,
+`NOTIFIER_API_KEY`, `NOTIFIER_TOKEN`), then the config file
+`~/.config/notifier/config.json` (`$XDG_CONFIG_HOME` is honoured, and
+`$NOTIFIER_CONFIG` names another file). Sending uses an API key if one is
+set at the highest level that sets any credential, else the user token.
+`NOTIFIER_ADMIN_TOKEN`, the name `notify pair` used before users existed,
+is still read as a user token (with a warning), but only when it holds one
+(`nu_...`); an operator token there is ignored, never sent.
+
+```json
+{
+  "url": "https://notifier.joncbender.workers.dev",
+  "token": "nu_...",
+  "api_key": "nk_...",
+  "channels": ["homelab"],
+  "to": ["pixel"],
+  "priority": "high"
+}
+```
+
+Every field is optional and unknown ones are rejected. A file holding a
+token or key must be readable only by you (`chmod 600`); `notify signup` and
+`notify config init` write it that way. `notify signup` replaces the
+previous account's `api_key`, `to` and `channels`, which belong to that
+account. The desktop daemon (#7) will read
+the same file.
+
+A new user's whole setup, with an invite from the operator or another user:
+
+```sh
+notify -url https://notifier.joncbender.workers.dev signup 0Z5H-QCEA-3JX4 alice
+notify pair                                # scan with the phone
+notify channel create homelab
+notify key create -c homelab homelab-cron  # an API key that may only post there
+notify -c homelab "disk full"
+```
+
+Flags must come before TITLE or the subcommand; everything from TITLE on is
+message text, so a body taken from a variable can never act as a flag. A
+subcommand word counts only in a command's shape: `devices`, `pair`,
+`invite`, `keys`, `channels` and `version` alone, and `signup`, `config`,
+`key` and `channel` with arguments; so `notify channel` sends a message,
+while `notify channel "$BODY"` is refused rather than guessed. Put `--`
+before a title that starts with `-` or is meant as a message in one of
+those shapes.
 
 A `BODY` of `-` reads standard input, so a long job can report when it
 finishes: `make test 2>&1 | tail -5 | notify "Tests" -`. Only the last 8 KiB
@@ -207,10 +266,12 @@ the server's limits is shortened and marked with `…`: a title (256 bytes)
 keeps its start, a body (2048 bytes) keeps its end, where a log's error
 usually is.
 
-Exit status is 0 when every targeted phone accepted the message; 3 when
-nothing reached some phone (a delivery failed, a phone was unreachable or
-unpaired before sending, or no paired phone matched, with or without `-to`);
-1 on other errors; and 2 on usage errors.
+Exit status is 0 when every one of your targeted phones accepted the
+message; 3 when nothing reached one of them (a delivery failed, a phone was
+unreachable or unpaired before sending, or no phone matched or subscribed),
+or when the message reached no phone at all; 1 on other errors; and 2 on
+usage errors. Other members' phones on a shared channel are reported as
+counts and do not affect the exit status unless none got the message.
 
 Install a tagged release with
 `go install github.com/joncbenderkh/notifier/notify@latest` (the module lives

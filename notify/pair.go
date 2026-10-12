@@ -3,33 +3,10 @@
 package main
 
 import (
-	"context"
-	"fmt"
-	"io"
 	"strings"
-	"time"
 
 	"github.com/skip2/go-qrcode"
 )
-
-func pair(ctx context.Context, client *Client, stdout, stderr io.Writer) int {
-	p, err := client.Pair(ctx)
-	if err != nil {
-		return fail(stderr, err, "admin token (NOTIFIER_ADMIN_TOKEN)")
-	}
-	// The code already exists on the server, so always print it, even when
-	// there is no QR to go with it.
-	how := "Scan with the Notifier app, or enter by hand:"
-	if qr, err := renderQR(p.URI); err == nil {
-		fmt.Fprint(stdout, qr, "\n")
-	} else {
-		fmt.Fprintln(stderr, "notify: no QR code:", err)
-		how = "Enter in the Notifier app:"
-	}
-	fmt.Fprintf(stdout, "%s\n  server  %s\n  code    %s  (expires %s, single use)\n",
-		how, client.BaseURL, p.Code, p.ExpiresAt.Local().Format(time.Kitchen))
-	return 0
-}
 
 // renderQR draws data as a QR code with half-block characters, two modules
 // per character cell. Colours are explicit black on white, so the code reads

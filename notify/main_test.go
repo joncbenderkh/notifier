@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +17,21 @@ import (
 )
 
 const testKey = "nk_test"
+
+// TestMain keeps the developer's own settings out of the tests.
+func TestMain(m *testing.M) {
+	for _, name := range []string{"NOTIFIER_URL", "NOTIFIER_API_KEY", "NOTIFIER_TOKEN", "NOTIFIER_ADMIN_TOKEN", "XDG_CONFIG_HOME"} {
+		os.Unsetenv(name)
+	}
+	dir, err := os.MkdirTemp("", "notify-test")
+	if err != nil {
+		panic(err)
+	}
+	os.Setenv("NOTIFIER_CONFIG", filepath.Join(dir, "absent.json"))
+	code := m.Run()
+	os.RemoveAll(dir)
+	os.Exit(code)
+}
 
 type fakeServer struct {
 	*httptest.Server
@@ -320,12 +337,13 @@ func TestPhoneUnpairedBeforeSendIsUndelivered(t *testing.T) {
 			json.NewEncoder(w).Encode([]Device{{ID: "dev_a", Name: "A"}, {ID: "dev_b", Name: "B"}})
 			return
 		}
-		json.NewEncoder(w).Encode(NotifyResult{ID: "msg_1", Deliveries: []Delivery{{DeviceID: "dev_a", Status: "sent"}}})
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"error": "no paired device dev_b"})
 	}))
 	t.Cleanup(srv.Close)
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"-url", srv.URL, "-key", testKey, "-to", "a,b", "Hi"}, strings.NewReader(""), &stdout, &stderr, nil)
-	if code != exitUndelivered || !strings.Contains(stderr.String(), "dev_b: no longer paired") {
+	if code != exitUndelivered || !strings.Contains(stderr.String(), "no paired device dev_b") {
 		t.Fatalf("exit %d, stderr %q", code, stderr.String())
 	}
 }
@@ -359,46 +377,48 @@ func TestLongTitleIsFitted(t *testing.T) {
 }
 
 func TestPairPrintsQRAndCode(t *testing.T) {
-	const admin = "admin-token-admin-token-admin-token"
+	const token = "nu_test"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/v1/pairings" || r.Header.Get("Authorization") != "Bearer "+admin {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/pairings" || r.Header.Get("Authorization") != "Bearer "+token {
 			w.WriteHeader(http.StatusUnauthorized)
-			json.NewEncoder(w).Encode(map[string]string{"error": "invalid admin token"})
+			json.NewEncoder(w).Encode(map[string]string{"error": "invalid user token"})
 			return
 		}
 		w.WriteHeader(http.StatusCreated)
 		json.NewEncoder(w).Encode(Pairing{Code: "7KQ2-MX9D", ExpiresAt: time.Now().Add(10 * time.Minute), URI: "notifier://pair?server=x&code=7KQ2-MX9D"})
 	}))
 	t.Cleanup(srv.Close)
-	t.Setenv("NOTIFIER_ADMIN_TOKEN", admin)
 
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"-url", srv.URL, "pair"}, strings.NewReader(""), &stdout, &stderr, nil)
-	if code != 0 || !strings.Contains(stdout.String(), "7KQ2-MX9D") || !strings.Contains(stdout.String(), "▀") {
-		t.Fatalf("exit %d, stdout %q, stderr %q", code, stdout.String(), stderr.String())
+	for _, env := range []string{"NOTIFIER_TOKEN", "NOTIFIER_ADMIN_TOKEN"} { // the latter is the old name
+		t.Run(env, func(t *testing.T) {
+			t.Setenv(env, token)
+			var stdout, stderr bytes.Buffer
+			code := run([]string{"-url", srv.URL, "pair"}, strings.NewReader(""), &stdout, &stderr, nil)
+			if code != 0 || !strings.Contains(stdout.String(), "7KQ2-MX9D") || !strings.Contains(stdout.String(), "▀") {
+				t.Fatalf("exit %d, stdout %q, stderr %q", code, stdout.String(), stderr.String())
+			}
+		})
 	}
 }
 
-func TestPairNeedsAdminToken(t *testing.T) {
-	t.Setenv("NOTIFIER_ADMIN_TOKEN", "")
+func TestPairNeedsUserToken(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"-url", "https://example.com", "-key", testKey, "pair"}, strings.NewReader(""), &stdout, &stderr, nil)
-	if code != exitUsage || !strings.Contains(stderr.String(), "NOTIFIER_ADMIN_TOKEN") {
+	if code != exitUsage || !strings.Contains(stderr.String(), "NOTIFIER_TOKEN") {
 		t.Fatalf("exit %d, stderr %q", code, stderr.String())
 	}
 }
 
-func TestPairNamesTheAdminTokenOn401(t *testing.T) {
+func TestPairNamesTheUserTokenOn401(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(map[string]string{"error": "invalid admin token"})
+		json.NewEncoder(w).Encode(map[string]string{"error": "invalid user token"})
 	}))
 	t.Cleanup(srv.Close)
-	t.Setenv("NOTIFIER_ADMIN_TOKEN", "wrong")
 
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"-url", srv.URL, "pair"}, strings.NewReader(""), &stdout, &stderr, nil)
-	if code != exitError || !strings.Contains(stderr.String(), "admin token") || strings.Contains(stderr.String(), "API key") {
+	code := run([]string{"-url", srv.URL, "-key", testKey, "-token", "nu_wrong", "pair"}, strings.NewReader(""), &stdout, &stderr, nil)
+	if code != exitError || !strings.Contains(stderr.String(), "user token") || strings.Contains(stderr.String(), "API key") {
 		t.Fatalf("exit %d, stderr %q", code, stderr.String())
 	}
 }
@@ -409,7 +429,7 @@ func TestPairPrintsCodeWithoutLink(t *testing.T) {
 		json.NewEncoder(w).Encode(map[string]any{"code": "7KQ2-MX9D", "expires_at": time.Now().Add(10 * time.Minute)})
 	}))
 	t.Cleanup(srv.Close)
-	t.Setenv("NOTIFIER_ADMIN_TOKEN", "admin-token-admin-token-admin-token")
+	t.Setenv("NOTIFIER_TOKEN", "nu_test")
 
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"-url", srv.URL, "pair"}, strings.NewReader(""), &stdout, &stderr, nil)
