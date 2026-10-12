@@ -9,6 +9,7 @@ export interface User {
   created_at: number;
   last_seen_at: number;
   disabled_at: number | null;
+  invited_by?: string | null;
 }
 
 export interface Device {
@@ -40,9 +41,11 @@ const activeOwner = (table: string) => `JOIN users u ON u.id = ${table}.user_id 
 // --- users and invites ---
 
 /**
- * Stores an invite unless its creator already has [maxPending] unused ones;
- * the operator (createdBy "") is not capped. The check and the insert are one
- * statement, so concurrent requests cannot overshoot the cap.
+ * Stores an invite unless its creator has already issued [max], counting both
+ * unused invites and the users who signed up with one (otherwise a user could
+ * redeem their own invites for unlimited accounts). The operator (createdBy
+ * "") is not capped. The check and the insert are one statement, so
+ * concurrent requests cannot overshoot the cap.
  */
 export async function createInvite(
   db: D1Database,
@@ -50,15 +53,17 @@ export async function createInvite(
   createdBy: string,
   now: number,
   expiresAt: number,
-  maxPending: number,
+  max: number,
 ): Promise<boolean> {
   const result = await db
     .prepare(
       `INSERT INTO invites (code_hash, created_by, expires_at)
        SELECT ?, ?, ?
-       WHERE ? = '' OR (SELECT count(*) FROM invites WHERE created_by = ? AND expires_at > ?) < ?`,
+       WHERE ? = ''
+          OR (SELECT count(*) FROM invites WHERE created_by = ? AND expires_at > ?)
+           + (SELECT count(*) FROM users WHERE invited_by = ?) < ?`,
     )
-    .bind(codeHash, createdBy, expiresAt, createdBy, createdBy, now, maxPending)
+    .bind(codeHash, createdBy, expiresAt, createdBy, createdBy, now, createdBy, max)
     .run();
   return result.meta.changes === 1;
 }
@@ -79,13 +84,11 @@ export async function redeemInvite(
   const [inserted] = await db.batch([
     db
       .prepare(
-        `INSERT INTO users (id, name, token_hash, created_at, last_seen_at)
-         SELECT ?, ?, ?, ?, ?
-         WHERE EXISTS (
-           SELECT 1 FROM invites i
-           WHERE i.code_hash = ? AND i.expires_at > ?
-             AND (i.created_by = '' OR i.created_by IN (SELECT id FROM users WHERE disabled_at IS NULL))
-         )`,
+        `INSERT INTO users (id, name, token_hash, created_at, last_seen_at, invited_by)
+         SELECT ?, ?, ?, ?, ?, NULLIF(i.created_by, '')
+         FROM invites i
+         WHERE i.code_hash = ? AND i.expires_at > ?
+           AND (i.created_by = '' OR i.created_by IN (SELECT id FROM users WHERE disabled_at IS NULL))`,
       )
       .bind(user.id, user.name, tokenHash, now, now, codeHash, now),
     db.prepare("DELETE FROM invites WHERE code_hash = ? OR expires_at <= ?").bind(codeHash, now),
@@ -105,7 +108,7 @@ export async function userByTokenHash(db: D1Database, tokenHash: string, now: nu
 export async function listUsers(db: D1Database): Promise<(User & { devices: number })[]> {
   const { results } = await db
     .prepare(
-      `SELECT ${USER_COLUMNS}, (SELECT count(*) FROM devices WHERE user_id = users.id) AS devices
+      `SELECT ${USER_COLUMNS}, invited_by, (SELECT count(*) FROM devices WHERE user_id = users.id) AS devices
        FROM users ORDER BY created_at`,
     )
     .all<User & { devices: number }>();

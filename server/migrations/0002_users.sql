@@ -5,7 +5,8 @@ CREATE TABLE users (
   token_hash   TEXT NOT NULL UNIQUE,
   created_at   INTEGER NOT NULL,
   last_seen_at INTEGER NOT NULL,
-  disabled_at  INTEGER
+  disabled_at  INTEGER,
+  invited_by   TEXT -- the inviting user's ID; NULL when the operator invited
 );
 
 CREATE TABLE invites (
@@ -29,3 +30,4 @@ ALTER TABLE pairings ADD COLUMN user_id TEXT NOT NULL DEFAULT 'usr_owner';
 CREATE INDEX devices_user_id ON devices (user_id);
 CREATE INDEX api_keys_user_id ON api_keys (user_id);
 CREATE INDEX invites_created_by ON invites (created_by);
+CREATE INDEX users_invited_by ON users (invited_by);

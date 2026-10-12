@@ -6,7 +6,7 @@ import {
   INVITE_TTL_SECONDS,
   MAX_API_KEYS_PER_USER,
   MAX_DEVICES_PER_USER,
-  MAX_PENDING_INVITES_PER_USER,
+  MAX_INVITES_PER_USER,
   MAX_PENDING_PAIRINGS_PER_USER,
   PAIRING_TTL_SECONDS,
 } from "../src/app";
@@ -351,6 +351,13 @@ describe("users", () => {
 
     // Sending reaches only the sender's devices, even when naming another's.
     await call("POST", "/v1/notifications", aliceKey, { title: "hi", device_ids: [bobPhone.device_id] }, 404);
+    await call(
+      "POST",
+      "/v1/notifications",
+      aliceKey,
+      { title: "hi", device_ids: [alicePhone.device_id, bobPhone.device_id] },
+      404,
+    );
     await call("POST", "/v1/notifications", aliceKey, { title: "hi" }, 200);
     await call("POST", "/v1/notifications", bob, { title: "hi" }, 200);
     expect(sender.sent.map((m) => m.token)).toEqual(["fcm-alice", "fcm-bob"]);
@@ -428,17 +435,25 @@ describe("users", () => {
     await call("POST", "/v1/users", "", { invite: code, name: "alt" }, 403);
   });
 
-  it("caps API keys and pending invites per user", async () => {
+  it("caps API keys and invites per user, counting used invites", async () => {
     for (let i = 0; i < MAX_API_KEYS_PER_USER; i++) await apiKey();
     await call("POST", "/v1/keys", USER, { name: "one more" }, 403);
 
-    for (let i = 0; i < MAX_PENDING_INVITES_PER_USER; i++) await invite(USER);
+    // Redeeming one's own invites must not free their slots.
+    for (let i = 0; i < MAX_INVITES_PER_USER; i++) {
+      await call("POST", "/v1/users", "", { invite: await invite(USER), name: `alt${i}` }, 201);
+    }
     await call("POST", "/v1/invites", USER, undefined, 403);
     await invite(ADMIN);
+
+    const { id } = await call<{ id: string }>("GET", "/v1/user", USER, undefined, 200);
+    const users = await call<{ name: string; invited_by?: string }[]>("GET", "/v1/users", ADMIN, undefined, 200);
+    expect(users.filter((u) => u.invited_by === id)).toHaveLength(MAX_INVITES_PER_USER);
+    expect(users.find((u) => u.name === "alice")?.invited_by).toBeUndefined();
   });
 
   it("rate-limits notifications per user", async () => {
-    await pair("phone", "fcm-phone");
+    const reg = await pair("phone", "fcm-phone");
     const keys: string[] = [];
     const limited = {
       ...env,
@@ -450,7 +465,9 @@ describe("users", () => {
       },
     } as Env;
     await call("POST", "/v1/notifications", USER, { title: "hi" }, 429, limited);
-    expect(keys).toEqual([(await call<{ id: string }>("GET", "/v1/user", USER, undefined, 200)).id]);
+    await call("POST", "/v1/device/test", reg.device_token, undefined, 429, limited);
+    const { id } = await call<{ id: string }>("GET", "/v1/user", USER, undefined, 200);
+    expect(keys).toEqual([id, id]);
     expect(sender.sent).toEqual([]);
   });
 });

@@ -38,7 +38,7 @@ export const INVITE_TTL_SECONDS = 7 * 24 * 60 * 60;
 export const MESSAGE_TTL_SECONDS = 24 * 60 * 60;
 export const MAX_DEVICES_PER_USER = 20;
 export const MAX_API_KEYS_PER_USER = 20;
-export const MAX_PENDING_INVITES_PER_USER = 10;
+export const MAX_INVITES_PER_USER = 10;
 export const MAX_PENDING_PAIRINGS_PER_USER = 5;
 const MAX_REQUEST_BYTES = 16 * 1024;
 const MAX_TITLE_BYTES = 256;
@@ -196,6 +196,13 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     await next();
   };
 
+  /** One user's scripts or phones must not use up the FCM quota for everyone. */
+  async function rateLimit(env: Env, userId: string): Promise<void> {
+    if (!(await env.NOTIFY_LIMITER.limit({ key: userId })).success) {
+      fail(429, "too many notifications; try again in a minute");
+    }
+  }
+
   async function deliver(env: Env, d: Device, p: Payload): Promise<Delivery> {
     if (d.fcm_token === "") return { device_id: d.id, status: "unreachable" };
     try {
@@ -238,6 +245,7 @@ export function createApp(deps: Deps): Hono<AppEnv> {
         created_at: iso(u.created_at),
         last_seen_at: iso(u.last_seen_at),
         ...(u.disabled_at === null ? {} : { disabled_at: iso(u.disabled_at) }),
+        ...(u.invited_by ? { invited_by: u.invited_by } : {}),
       })),
     );
   });
@@ -268,8 +276,8 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     const code = newInviteCode();
     const expiresAt = now + INVITE_TTL_SECONDS;
     const hash = await inviteHash(code);
-    if (!(await store.createInvite(c.env.DB, hash, c.get("userId"), now, expiresAt, MAX_PENDING_INVITES_PER_USER))) {
-      fail(403, `at most ${MAX_PENDING_INVITES_PER_USER} unused invites at a time`);
+    if (!(await store.createInvite(c.env.DB, hash, c.get("userId"), now, expiresAt, MAX_INVITES_PER_USER))) {
+      fail(403, `at most ${MAX_INVITES_PER_USER} invites per user, counting those already used`);
     }
     return c.json({ code, expires_at: iso(expiresAt) }, 201);
   });
@@ -401,6 +409,7 @@ export function createApp(deps: Deps): Hono<AppEnv> {
   });
 
   app.post("/v1/device/test", device, async (c) => {
+    await rateLimit(c.env, c.get("userId"));
     const p: Payload = {
       id: newId("msg_"),
       title: "Test notification",
@@ -415,10 +424,7 @@ export function createApp(deps: Deps): Hono<AppEnv> {
 
   app.post("/v1/notifications", userOrApiKey, async (c) => {
     const userId = c.get("userId");
-    // One user's scripts must not use up the FCM quota for everyone.
-    if (!(await c.env.NOTIFY_LIMITER.limit({ key: userId })).success) {
-      fail(429, "too many notifications; try again in a minute");
-    }
+    await rateLimit(c.env, userId);
     const req = await readJson<{ title: string; body: string; priority: string; device_ids: string[] }>(c, [
       "title",
       "body",
@@ -440,8 +446,10 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     }
 
     const all = await store.listDevices(c.env.DB, userId);
+    const unknown = ids.find((id) => !all.some((d) => d.id === id));
+    if (unknown !== undefined) fail(404, `no paired device ${unknown}`);
     const targets = ids.length === 0 ? all : all.filter((d) => ids.includes(d.id));
-    if (targets.length === 0) fail(404, "no matching paired devices");
+    if (targets.length === 0) fail(404, "no paired devices");
 
     const p: Payload = { id: newId("msg_"), title, priority, sent_at: deps.now() };
     if (body !== "") p.body = body;

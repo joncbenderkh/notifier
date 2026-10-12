@@ -23,7 +23,7 @@ const PAGE = `<!doctype html>
   <h1>Pair a phone</h1>
   <form id="form" autocomplete="off">
     <label for="token">Your token</label>
-    <input id="token" type="password" required pattern="nu_[a-z2-7]+" placeholder="nu_…" spellcheck="false">
+    <input id="token" type="password" required pattern="\\s*nu_[a-z2-7]+\\s*" placeholder="nu_…" spellcheck="false">
     <button id="create" type="submit">Create pairing code</button>
   </form>
   <p id="status" role="status"></p>
