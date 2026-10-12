@@ -67,14 +67,19 @@ See `README.md` for the user-facing setup and API table.
   pairings carry `user_id`, and every store query is scoped by it; another
   user's IDs answer 404, never 403. Credentials of a disabled user resolve to
   nothing (the lookups join `users`). Per-user caps, enforced inside the INSERT so
-  concurrent requests cannot overshoot: 20 devices, 20 API keys, 10 pending
-  invites, 5 pending pairing codes, and 60 notifications a minute (Workers Rate Limiting
+  concurrent requests cannot overshoot: 20 devices, 20 API keys, 10 invites
+  (pending plus redeemed, recorded in `users.invited_by`, so redeeming one's
+  own invites cannot mint unlimited accounts), 5 pending pairing codes, and 60 notifications a minute (Workers Rate Limiting
   binding `NOTIFY_LIMITER`, approximate by design). Migration 0002 moved
   pre-user data to `usr_owner` (also the column default, for writes by the
   old Worker during deploy), reachable only after the operator reissues its
   token. **No rollback past migration 0002:** the earlier Worker ignores
-  `user_id` and would send to every user's phones; disable all users but
-  `usr_owner` first if one is ever unavoidable. OAuth sign-up is planned
+  `user_id` and `disabled_at`, so it would send to every user's phones and
+  accept every user's API keys, disabled or not. Never run it against a
+  database with more than one user. Disabling a user does not disable the
+  users they invited. The operator can act as any user by reissuing their
+  token (which revokes the old one), so `ADMIN_TOKEN` is not barred from
+  sending, only from doing so unnoticed. OAuth sign-up is planned
   separately (issue #10).
 - **Credentials:** operator token (`ADMIN_TOKEN` Worker secret: user
   management and invites only), user tokens (`nu_`), API keys (`nk_`, a

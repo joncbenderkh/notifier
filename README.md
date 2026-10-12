@@ -25,10 +25,11 @@ curl -X POST https://notifier.joncbender.workers.dev/v1/notifications \
 
 | Credential   | Held by                         | Allows                                         |
 |--------------|---------------------------------|------------------------------------------------|
-| Admin token  | Server operator (Worker secret) | Create pairing codes and API keys; list/remove devices and keys |
-| API key      | Each sending script/service     | Send notifications; list paired devices (IDs and names) |
+| Admin token  | Server operator (Worker secret) | Manage users (list, reissue token, disable); mint invites |
+| User token   | Each user, from sign-up         | Pair devices, manage their API keys and devices, invite, send |
+| API key      | A user's sending script/service | Send notifications; list paired devices (IDs and names) |
 | Device token | The paired phone                | Update its own FCM token, send itself a test, unpair |
-| Pairing code | Operator → phone, once          | Register one device, within 10 minutes         |
+| Pairing code | User → phone, once              | Register one device, within 10 minutes         |
 
 API keys and device tokens are 256-bit random secrets stored server-side only
 as SHA-256 digests, and each can be revoked independently.
@@ -100,8 +101,11 @@ curl -X POST https://notifier.joncbender.workers.dev/v1/users -d '{"invite": "0Z
 ```
 
 Users can invite others too (`POST /v1/invites` with their own token; at most
-ten unused at a time). A lost token cannot be recovered, only replaced: the
-operator calls `POST /v1/users/{id}/token`, which revokes the old one.
+ten each, used or not). `GET /v1/users` shows who invited whom; disabling a
+user does not disable the users they invited. A lost token cannot be
+recovered, only replaced: the operator calls `POST /v1/users/{id}/token`,
+which revokes the old one. That also means the operator can take over any
+account, though not without its owner's token stopping working.
 
 Upgrading a deployment from before users existed moves its phones and API
 keys to a user `usr_owner`. Nobody can sign in as it until the operator issues
