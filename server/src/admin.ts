@@ -24,7 +24,7 @@ const PAGE = `<!doctype html>
   <form id="form" autocomplete="off">
     <label for="token">Admin token</label>
     <input id="token" type="password" required minlength="32" spellcheck="false">
-    <button type="submit">Create pairing code</button>
+    <button id="create" type="submit">Create pairing code</button>
   </form>
   <p id="status" role="status"></p>
   <section id="result" hidden>
@@ -59,8 +59,7 @@ const SCRIPT = `"use strict";
 
   $("form").addEventListener("submit", async (event) => {
     event.preventDefault();
-    clearInterval(timer);
-    $("result").hidden = true;
+    $("create").disabled = true;
     showStatus("Creating…");
     let response, body;
     try {
@@ -72,6 +71,8 @@ const SCRIPT = `"use strict";
     } catch {
       showStatus("Could not reach the server.");
       return;
+    } finally {
+      $("create").disabled = false;
     }
     if (!response.ok) {
       showStatus(body.error || "HTTP " + response.status);
@@ -89,6 +90,7 @@ const SCRIPT = `"use strict";
       $("expiry").textContent =
         "Expires in " + Math.floor(left / 60) + ":" + String(left % 60).padStart(2, "0") + " · single use";
     };
+    clearInterval(timer);
     tick();
     timer = setInterval(tick, 1000);
   });
