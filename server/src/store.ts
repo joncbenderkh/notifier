@@ -93,7 +93,7 @@ export async function redeemInvite(
       .bind(user.id, user.name, tokenHash, now, now, codeHash, now),
     db.prepare("DELETE FROM invites WHERE code_hash = ? OR expires_at <= ?").bind(codeHash, now),
   ]);
-  return (inserted?.meta.changes ?? 0) === 1;
+  return (inserted?.meta.changes ?? 0) > 0; // also counts rows a trigger writes
 }
 
 export async function userByTokenHash(db: D1Database, tokenHash: string, now: number): Promise<User | null> {
@@ -173,7 +173,7 @@ export async function redeemPairing(
       .bind(device.id, device.name, tokenHash, device.seal_key, device.fcm_token, now, now, codeHash, now, maxDevices),
     db.prepare("DELETE FROM pairings WHERE code_hash = ? OR expires_at <= ?").bind(codeHash, now),
   ]);
-  return (inserted?.meta.changes ?? 0) === 1;
+  return (inserted?.meta.changes ?? 0) > 0; // also counts rows a trigger writes
 }
 
 export async function deviceByTokenHash(db: D1Database, tokenHash: string, now: number): Promise<Device | null> {
