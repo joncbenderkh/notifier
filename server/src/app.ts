@@ -83,6 +83,7 @@ function validName(raw: unknown): string {
   if (name === "" || utf8Length(name) > MAX_NAME_BYTES) {
     fail(400, "name is required and must be at most 64 bytes");
   }
+  if (!name.isWellFormed()) fail(400, "name must be valid UTF-8");
   return name;
 }
 
@@ -160,7 +161,10 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     } catch (err) {
       if (err instanceof UnregisteredError) {
         console.warn("push token unregistered; clearing", d.id);
-        await store.setFcmToken(env.DB, d.id, "");
+        // Other devices may already have been sent to; never turn this into a 500.
+        await store.setFcmToken(env.DB, d.id, "").catch((dbErr: unknown) => {
+          console.error("clear push token failed", d.id, dbErr);
+        });
         return { device_id: d.id, status: "unreachable" };
       }
       console.error("push send failed", d.id, err);
@@ -286,7 +290,9 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     if (title.trim() === "") fail(400, "title is required");
     if (utf8Length(title) > MAX_TITLE_BYTES) fail(400, "title is too long");
     if (utf8Length(body) > MAX_BODY_BYTES) fail(400, "body is too long");
-    const priority = req.priority === undefined || req.priority === "" ? "default" : req.priority;
+    if (!title.isWellFormed() || !body.isWellFormed()) fail(400, "title and body must be valid UTF-8");
+    const priority =
+      req.priority === undefined || req.priority === null || req.priority === "" ? "default" : req.priority;
     if (priority !== "default" && priority !== "high") fail(400, 'priority must be "default" or "high"');
     const ids = req.device_ids ?? [];
     if (!Array.isArray(ids) || !ids.every((id) => typeof id === "string")) {
@@ -299,8 +305,13 @@ export function createApp(deps: Deps): Hono<AppEnv> {
 
     const p: Payload = { id: newId("msg_"), title, priority, sent_at: deps.now() };
     if (body !== "") p.body = body;
-    // A failed warm-up is not fatal: each send retries and reports per device.
-    await deps.sender(c.env).prepare?.().catch((err: unknown) => console.error("push prepare failed", err));
+    // A failed warm-up (including a missing or invalid FCM_SERVICE_ACCOUNT)
+    // is not fatal: each send retries and reports per device.
+    try {
+      await deps.sender(c.env).prepare?.();
+    } catch (err) {
+      console.error("push prepare failed", err);
+    }
     const deliveries = await Promise.all(targets.map((d) => deliver(c.env, d, p)));
     return c.json({ id: p.id, deliveries });
   });

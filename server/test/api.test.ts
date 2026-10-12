@@ -101,10 +101,56 @@ describe("notifications", () => {
     }
   });
 
-  it("treats an empty priority as default", async () => {
+  it.each(["", null])("treats priority %j as default", async (priority) => {
     await pair("phone", "fcm-phone");
-    await call("POST", "/v1/notifications", await apiKey(), { title: "hi", priority: "" }, 200);
+    await call("POST", "/v1/notifications", await apiKey(), { title: "hi", priority }, 200);
     expect(sender.sent[0]!.high).toBe(false);
+  });
+
+  it("reports per-device failures when the sender cannot be built", async () => {
+    await pair("phone", "fcm-phone");
+    const key = await apiKey();
+    app = createApp({
+      sender: () => {
+        throw new Error("FCM_SERVICE_ACCOUNT secret is not set");
+      },
+      now: () => now,
+    });
+    const resp = await call<NotifyResponse>("POST", "/v1/notifications", key, { title: "hi" }, 200);
+    expect(resp.deliveries.map((d) => d.status)).toEqual(["failed"]);
+  });
+
+  it("still answers when clearing an unregistered token fails", async () => {
+    await pair("phone", "fcm-gone");
+    sender.unregistered.add("fcm-gone");
+    const key = await apiKey();
+    const failingDb = new Proxy(env.DB, {
+      get(target, prop, receiver) {
+        if (prop !== "prepare") return Reflect.get(target, prop, receiver) as unknown;
+        return (sql: string) =>
+          sql.startsWith("UPDATE devices SET fcm_token")
+            ? { bind: () => ({ run: () => Promise.reject(new Error("D1 unavailable")) }) }
+            : target.prepare(sql);
+      },
+    });
+    const resp = await call<NotifyResponse>(
+      "POST",
+      "/v1/notifications",
+      key,
+      { title: "hi" },
+      200,
+      { ...env, DB: failingDb },
+    );
+    expect(resp.deliveries[0]!.status).toBe("unreachable");
+  });
+
+  it("rejects oversized requests", async () => {
+    const res = await app.request(
+      "/v1/notifications",
+      { method: "POST", headers: { "content-type": "application/json" }, body: "x".repeat(20_000) },
+      env,
+    );
+    expect(res.status).toBe(413);
   });
 
   it("targets only the selected devices", async () => {
@@ -131,6 +177,8 @@ describe("notifications", () => {
     { title: "hi", device_id: "dev_x" },
     { title: "hi", priority: 0 },
     { title: "hi", priority: false },
+    { title: "a\ud800" },
+    { title: "hi", body: "b\udc00" },
   ])("rejects invalid request %j", async (body) => {
     await pair("phone", "fcm");
     await call("POST", "/v1/notifications", await apiKey(), body, 400);
@@ -176,6 +224,11 @@ describe("authentication", () => {
   it("tolerates extra whitespace after Bearer", async () => {
     const res = await app.request("/v1/keys", { headers: { authorization: `bearer   ${ADMIN}` } }, env);
     expect(res.status).toBe(200);
+  });
+
+  it("rejects names that are not valid UTF-8", async () => {
+    const { error } = await call<{ error: string }>("POST", "/v1/keys", ADMIN, { name: "a\ud800" }, 400);
+    expect(error).toBe("name must be valid UTF-8");
   });
 
   it("rejects a revoked API key", async () => {
