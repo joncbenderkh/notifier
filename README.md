@@ -350,6 +350,26 @@ category = notifier.homelab
 urgency = low
 ```
 
+For i3blocks, `notifyd/contrib/i3blocks/` has a status bar block:
+- `NTF 3` counts the messages the history window has not listed yet, and
+  turns red as `NTF off` when the service is not running.
+- Left-click opens the history in a window (`zenity`), where a message can
+  be opened in full.
+- Middle-click restarts the service.
+
+It needs `jq` and `zenity`:
+
+```sh
+mkdir -p ~/.config/i3blocks/notifier
+cp notifyd/contrib/i3blocks/{notifier,show-history} ~/.config/i3blocks/notifier/
+```
+
+```ini
+# ~/.config/i3blocks/config, with command=$SCRIPT_DIR/$BLOCK_NAME/$BLOCK_NAME
+[notifier]
+interval=5
+```
+
 `notifyd` stops, and systemd does not restart it, in two cases:
 - the device was unpaired on the server (exit status 4); pair it again
   with `notifyd pair -force LINK`;
