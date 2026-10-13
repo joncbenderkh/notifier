@@ -202,7 +202,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val pairing = _state.value.pairing ?: return
         val channels = _state.value.channels ?: return
         val ids = channels.filter { if (it.id == channelId) subscribed else it.subscribed }.map { it.id }
-        run(null) {
+        val name = channels.firstOrNull { it.id == channelId }?.name ?: return
+        run(if (subscribed) "Subscribed to $name." else "Unsubscribed from $name.") {
             val generation = ++channelsGeneration
             val updated = try {
                 withContext(Dispatchers.IO) { client.setChannels(pairing, ids) }

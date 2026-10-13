@@ -2,8 +2,10 @@
 package com.joncbenderkh.notifier.ui
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
+import android.provider.Settings
 import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -19,13 +21,19 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -52,6 +60,7 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -69,6 +78,7 @@ import com.joncbenderkh.notifier.data.DeviceChannel
 import com.joncbenderkh.notifier.data.NotifierLink
 import com.joncbenderkh.notifier.data.Pairing
 import com.joncbenderkh.notifier.push.ChannelRoute
+import java.net.URI
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -106,7 +116,16 @@ fun NotifierScreen(viewModel: MainViewModel = viewModel()) {
 
     screens.SaveableStateProvider("main") {
         Scaffold(
-            topBar = { TopAppBar(title = { Text("Notifier") }) },
+            topBar = {
+                TopAppBar(
+                    title = { Text("Notifier") },
+                    actions = {
+                        state.pairing?.let { pairing ->
+                            HomeMenu(pairing, enabled = !state.busy, onRefresh = viewModel::refreshChannels)
+                        }
+                    },
+                )
+            },
             snackbarHost = { SnackbarHost(snackbar) },
         ) { padding ->
             Column(
@@ -133,25 +152,21 @@ fun NotifierScreen(viewModel: MainViewModel = viewModel()) {
                     )
                 } else {
                     if (!permission.granted) NotificationPermissionCard(permission.request)
-                    PairedPanel(
-                        pairing,
-                        enabled = !state.busy,
-                        historyCount = history.size,
-                        onHistory = viewModel::openHistory,
-                        onTest = viewModel::sendTest,
-                        onUnpair = viewModel::unpair,
-                    )
-                    ChannelsCard(
+                    PairedHeader(pairing)
+                    ChannelList(
                         channels = state.channels,
                         enabled = !state.busy,
                         onToggle = viewModel::setSubscribed,
-                        onRefresh = viewModel::refreshChannels,
                     )
-                    JoinCard(
+                    PairedActions(
                         enabled = !state.busy,
+                        historyCount = history.size,
                         onJoin = viewModel::join,
                         onScanned = viewModel::openLink,
                         onScanFailed = viewModel::showMessage,
+                        onHistory = viewModel::openHistory,
+                        onTest = viewModel::sendTest,
+                        onUnpair = viewModel::unpair,
                     )
                 }
             }
@@ -437,37 +452,171 @@ private fun PasteLinkDialog(onDismiss: () -> Unit, onLink: (NotifierLink.Pair) -
     )
 }
 
+/** The top bar's overflow menu on the paired screen. */
 @Composable
-private fun PairedPanel(
-    pairing: Pairing,
+private fun HomeMenu(pairing: Pairing, enabled: Boolean, onRefresh: () -> Unit) {
+    val context = LocalContext.current
+    var open by remember { mutableStateOf(false) }
+    var about by rememberSaveable { mutableStateOf(false) }
+    IconButton(onClick = { open = true }) {
+        Icon(painterResource(R.drawable.ic_more_vert), contentDescription = "More options")
+    }
+    DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+        DropdownMenuItem(
+            text = { Text("Refresh channels") },
+            enabled = enabled,
+            onClick = {
+                open = false
+                onRefresh()
+            },
+        )
+        DropdownMenuItem(
+            text = { Text("Notification settings") },
+            onClick = {
+                open = false
+                context.startActivity(
+                    Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                        .putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+                )
+            },
+        )
+        DropdownMenuItem(
+            text = { Text("About this device") },
+            onClick = {
+                open = false
+                about = true
+            },
+        )
+    }
+    if (about) {
+        AlertDialog(
+            onDismissRequest = { about = false },
+            title = { Text("This device") },
+            text = {
+                SelectionContainer {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text("Server: ${pairing.serverUrl}")
+                        Text("Name: ${pairing.deviceName}")
+                        Text("Device ID: ${pairing.deviceId}")
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { about = false }) { Text("Close") } },
+        )
+    }
+}
+
+@Composable
+private fun PairedHeader(pairing: Pairing) {
+    val host = runCatching { URI(pairing.serverUrl).authority }.getOrNull() ?: pairing.serverUrl
+    Card(
+        Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
+    ) {
+        Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(
+                "Paired with $host",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(pairing.deviceName, style = MaterialTheme.typography.titleLarge)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.padding(top = 8.dp),
+            ) {
+                Icon(painterResource(R.drawable.ic_lock), contentDescription = null, modifier = Modifier.size(16.dp))
+                Text("End-to-end encrypted", style = MaterialTheme.typography.labelLarge)
+            }
+        }
+    }
+}
+
+@Composable
+private fun ChannelList(
+    channels: List<DeviceChannel>?,
+    enabled: Boolean,
+    onToggle: (String, Boolean) -> Unit,
+) {
+    Column {
+        Text("Channels", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(bottom = 4.dp))
+        if (channels == null) {
+            Text("Not loaded yet.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            return
+        }
+        channels.forEachIndexed { index, channel ->
+            // A send without a channel goes to default, so it stays on.
+            val isDefault = ChannelRoute.isDefaultChannel(channel.id)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.padding(vertical = 12.dp),
+            ) {
+                Column(Modifier.weight(1f).padding(end = 16.dp)) {
+                    Text(channel.name, style = MaterialTheme.typography.bodyLarge, fontFamily = FontFamily.Monospace)
+                    Text(
+                        if (isDefault) "Always subscribed"
+                        else "Gets its own notification settings once a message arrives",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(
+                    checked = channel.subscribed || isDefault,
+                    onCheckedChange = { onToggle(channel.id, it) },
+                    enabled = enabled && !isDefault,
+                )
+            }
+            if (index < channels.lastIndex) HorizontalDivider()
+        }
+    }
+}
+
+@Composable
+private fun PairedActions(
     enabled: Boolean,
     historyCount: Int,
+    onJoin: (String) -> Unit,
+    onScanned: (String) -> Unit,
+    onScanFailed: (String) -> Unit,
     onHistory: () -> Unit,
     onTest: () -> Unit,
     onUnpair: () -> Unit,
 ) {
-    Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Text("Paired", style = MaterialTheme.typography.titleLarge)
-            Text("Server: ${pairing.serverUrl}")
-            Text("Device: ${pairing.deviceName}")
-            Text("Device ID: ${pairing.deviceId}", style = MaterialTheme.typography.bodySmall)
+    var joining by rememberSaveable { mutableStateOf(false) }
+    var confirmUnpair by rememberSaveable { mutableStateOf(false) }
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        OutlinedButton(onClick = { joining = true }, enabled = enabled, modifier = Modifier.fillMaxWidth()) {
+            Text("Join channel")
+        }
+        Button(onClick = onHistory, modifier = Modifier.fillMaxWidth()) {
+            Text("History ($historyCount)")
+        }
+        TextButton(onClick = onTest, enabled = enabled, modifier = Modifier.fillMaxWidth()) {
+            Text("Send test notification")
+        }
+        TextButton(
+            onClick = { confirmUnpair = true },
+            enabled = enabled,
+            colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("Unpair")
         }
     }
-    Button(onClick = onHistory, modifier = Modifier.fillMaxWidth()) {
-        Text("History ($historyCount)")
-    }
-    OutlinedButton(onClick = onTest, enabled = enabled, modifier = Modifier.fillMaxWidth()) {
-        Text("Send test notification")
-    }
-    var confirmUnpair by rememberSaveable { mutableStateOf(false) }
-    TextButton(
-        onClick = { confirmUnpair = true },
-        enabled = enabled,
-        colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
-        modifier = Modifier.fillMaxWidth(),
-    ) {
-        Text("Unpair")
+
+    if (joining) {
+        JoinDialog(
+            onDismiss = { joining = false },
+            onScanned = {
+                joining = false
+                onScanned(it)
+            },
+            onScanFailed = onScanFailed,
+            onCode = {
+                joining = false
+                onJoin(it)
+            },
+        )
     }
 
     if (confirmUnpair) {
@@ -494,77 +643,81 @@ private fun PairedPanel(
     }
 }
 
-@Composable
-private fun ChannelsCard(
-    channels: List<DeviceChannel>?,
-    enabled: Boolean,
-    onToggle: (String, Boolean) -> Unit,
-    onRefresh: () -> Unit,
-) {
-    Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("Channels", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
-                TextButton(onClick = onRefresh, enabled = enabled) { Text("Refresh") }
-            }
-            if (channels == null) {
-                Text("Not loaded yet.")
-                return@Column
-            }
-            for (channel in channels) {
-                // A send without a channel goes to default, so it stays on.
-                val isDefault = ChannelRoute.isDefaultChannel(channel.id)
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text(channel.name)
-                        if (isDefault) Text("Always on", style = MaterialTheme.typography.bodySmall)
-                    }
-                    Switch(
-                        checked = channel.subscribed || isDefault,
-                        onCheckedChange = { onToggle(channel.id, it) },
-                        enabled = enabled && !isDefault,
-                    )
-                }
-            }
-        }
-    }
+/** Twelve letters or digits once dashes and spaces go; the server forgives the rest. */
+private fun looksLikeInviteCode(input: String) =
+    input.filterNot { it == '-' || it.isWhitespace() }.let { it.length == 12 && it.all(Char::isLetterOrDigit) }
+
+/** Why [input] is not a channel invite link, or null if it is one. */
+private fun joinLinkError(input: String): String? = when (NotifierLink.parse(input, allowHttp = BuildConfig.DEBUG)) {
+    is NotifierLink.Join -> null
+    is NotifierLink.Pair -> "That is a pairing link, not a channel invite."
+    null -> "Enter a notifier://join link or an XXXX-XXXX-XXXX code."
 }
 
+/**
+ * Takes a channel invite: scanned, or typed as a code or `notifier://join`
+ * link. A link goes through the same path as a scanned one, which asks
+ * before joining.
+ */
 @Composable
-private fun JoinCard(
-    enabled: Boolean,
-    onJoin: (String) -> Unit,
+private fun JoinDialog(
+    onDismiss: () -> Unit,
     onScanned: (String) -> Unit,
     onScanFailed: (String) -> Unit,
+    onCode: (String) -> Unit,
 ) {
-    var code by rememberSaveable { mutableStateOf("") }
-    val scan = rememberQrScanner(onScanned, onScanFailed)
-    Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("Join a channel", style = MaterialTheme.typography.titleLarge)
-            Text("Scan or enter an invite from the channel's owner (`notify channel invite`).")
-            OutlinedButton(onClick = scan, enabled = enabled, modifier = Modifier.fillMaxWidth()) {
-                Text("Scan invite QR code")
+    var text by rememberSaveable { mutableStateOf("") }
+    var error by rememberSaveable { mutableStateOf<String?>(null) }
+    val scan = rememberQrScanner(
+        onScanned = { raw ->
+            when (val problem = joinLinkError(raw.trim())) {
+                null -> onScanned(raw)
+                else -> error = problem
             }
-            OutlinedTextField(
-                value = code,
-                onValueChange = { code = it },
-                label = { Text("Invite code") },
-                placeholder = { Text("XXXX-XXXX-XXXX") },
-                singleLine = true,
-                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Characters),
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Button(
+        },
+        onScanFailed = onScanFailed,
+    )
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Join channel") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Use an invite from the channel's owner (`notify channel invite`).")
+                OutlinedButton(onClick = scan, modifier = Modifier.fillMaxWidth()) {
+                    Text("Scan invite QR code")
+                }
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = {
+                        text = it
+                        error = null
+                    },
+                    label = { Text("Invite link or code") },
+                    placeholder = { Text("XXXX-XXXX-XXXX") },
+                    singleLine = true,
+                    isError = error != null,
+                    supportingText = error?.let { { Text(it) } },
+                    keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Characters),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
                 onClick = {
-                    onJoin(code)
-                    code = ""
+                    val input = text.trim()
+                    if (looksLikeInviteCode(input)) {
+                        onCode(input)
+                    } else {
+                        when (val problem = joinLinkError(input)) {
+                            null -> onScanned(input)
+                            else -> error = problem
+                        }
+                    }
                 },
-                enabled = enabled && code.isNotBlank(),
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text("Join")
-            }
-        }
-    }
+                enabled = text.isNotBlank(),
+            ) { Text("Continue") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }
