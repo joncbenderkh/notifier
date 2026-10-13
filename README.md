@@ -20,6 +20,8 @@ curl -X POST https://notifier.joncbender.workers.dev/v1/notifications \
   decrypts incoming messages, and shows them as notifications.
 - **`notify/`** — `notify`, a single Go binary for sending from scripts and
   terminals.
+- **`notifyd/`** — `notifyd`, a daemon that shows notifications on a Linux
+  desktop (dunst, mako, GNOME, KDE, ...).
 
 ## Security model
 
@@ -287,6 +289,53 @@ Install a tagged release with
 in a subdirectory, so its versions are the `notify/vX.Y.Z` tags), or download
 a prebuilt binary from the
 [releases](https://github.com/joncbenderkh/notifier/releases).
+
+## Linux desktop: `notifyd`
+
+`notifyd` pairs a Linux desktop like a phone and shows each message through
+the desktop's notification service (`org.freedesktop.Notifications`). FCM
+does not reach desktops, so it receives over the server's
+[WebSocket transport](#websocket-transport). Messages sent while the
+machine is asleep or offline are queued for up to a day.
+
+```sh
+go install github.com/joncbenderkh/notifier/notifyd@latest
+notify pair                       # prints the QR code and a notifier://pair link
+notifyd pair 'notifier://pair?server=...&code=...'   # or: notifyd pair -server URL CODE
+install -Dm644 notifyd/notifyd.service ~/.config/systemd/user/notifyd.service
+systemctl --user enable --now notifyd
+notifyd test                      # sends this desktop a test notification
+```
+
+The unit runs `~/go/bin/notifyd`, where `go install` puts it; with a
+downloaded binary from the releases, edit `ExecStart` to point at it.
+
+The pairing is kept in `~/.config/notifier/notifyd.json`, mode 0600 (set
+`NOTIFYD_STATE` to move it). `notifyd unpair` removes it, both from the
+server and locally. The unit starts with `graphical-session.target`. On a
+window manager that does not reach that target (plain i3 or sway), use
+`default.target` in the unit instead; systemd restarts `notifyd` until the
+notification daemon is up.
+
+High-priority messages are shown with critical urgency. A message sent to a
+channel carries the category `notifier.<channel>`, so notification daemon
+rules can treat channels differently. For dunst:
+
+```ini
+[notifier-homelab]
+category = notifier.homelab
+urgency = low
+```
+
+`notifyd` stops, and systemd does not restart it, in two cases:
+- the device was unpaired on the server (exit status 4); pair it again
+  with `notifyd pair -force LINK`;
+- another `notifyd` connected as the same device (exit status 5);
+- it is not paired at all (exit status 4).
+
+A message the notification service refuses outright is logged and
+dropped, so it cannot hold up the ones behind it. A message in a newer
+envelope format stays queued on the server until `notifyd` is updated.
 
 ## API
 

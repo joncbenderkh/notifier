@@ -26,7 +26,8 @@ type Config struct {
 }
 
 // configPath is $NOTIFIER_CONFIG, or config.json in $XDG_CONFIG_HOME/notifier
-// (default ~/.config/notifier), which the desktop daemon reads too.
+// (default ~/.config/notifier). The desktop daemon, notifyd, keeps its own
+// notifyd.json beside it.
 func configPath() (string, error) {
 	if p := os.Getenv("NOTIFIER_CONFIG"); p != "" {
 		return p, nil

@@ -14,6 +14,8 @@ notifications to the user's own phone via an HTTP API. A monorepo:
   data messages, decrypts them, and posts notifications.
 - `notify/` — Go CLI that sends notifications and manages the account
   (sign-up, pairing, keys, channels).
+- `notifyd/` — Go daemon for Linux desktops (issue #7). Pairs over the
+  WebSocket transport and shows messages via `org.freedesktop.Notifications`.
 
 See `README.md` for the user-facing setup and API table.
 
@@ -43,8 +45,9 @@ See `README.md` for the user-facing setup and API table.
   Settings: flags > env (`NOTIFIER_URL`, `NOTIFIER_API_KEY`,
   `NOTIFIER_TOKEN`; `NOTIFIER_ADMIN_TOKEN` as a legacy alias, honoured only
   when it starts with `nu_`, since it once held the operator secret) > JSON config
-  at `$XDG_CONFIG_HOME/notifier/config.json` (issue #8; the daemon of #7
-  shares it). Unknown fields are rejected, and a file with credentials must
+  at `$XDG_CONFIG_HOME/notifier/config.json` (issue #8; `notifyd` keeps
+  its own `notifyd.json` instead, so neither program's strict parsing
+  constrains the other). Unknown fields are rejected, and a file with credentials must
   be 0600; writes are atomic and 0600. Flags default to empty and resolve
   after parsing, so `-h` never prints a secret. Sending uses the API key or
   user token from the highest level that sets one; other commands need the
@@ -78,6 +81,34 @@ See `README.md` for the user-facing setup and API table.
 - **Delivery:** Firebase Cloud Messaging, **data-only** messages (a
   `notification` block would be rendered by the system without the app
   decrypting it).
+- **notifyd (issue #7):** a separate Go module (`godbus/dbus/v5`,
+  `coder/websocket`), Linux only. `notifyd pair` takes the
+  `notifier://pair` link (bare-origin rules as in `NotifierLink.kt`; plain
+  http only for loopback), registers with `"transport": "ws"`, and stores
+  `{url, device_id, device_token, seal_key, name}` in 0600 `notifyd.json`
+  (`NOTIFYD_STATE` overrides). It pings every 30 s and treats 75 s of
+  silence as a dead connection. It reconnects with jittered exponential
+  backoff (1 s to 5 min, reset after a connection that held a minute).
+
+  A message is shown, then acked. If the desktop is missing or not
+  answering (ServiceUnknown, NoReply, Timeout, Disconnected, or a closed
+  bus, which `Notify` reconnects), the message is not acked, so it is
+  replayed. If the service refuses that message (any other D-Bus error,
+  wrapped as `errRejected`), it is acked and dropped; otherwise one bad
+  message would block the queue behind it. NUL characters, which JSON
+  allows but D-Bus forbids, are removed first. A message that cannot be
+  opened is acked and dropped. A newer envelope version is left unacked,
+  so it waits in the queue for an updated daemon. The last 500 IDs are
+  remembered to drop replays. Dialling and every D-Bus call have
+  timeouts. `pair -force` saves the new pairing before unpairing the old
+  one.
+
+  Close 4001, 401/404 on connect, or no state file exits 4; close 4000
+  exits 5. The
+  unit's `RestartPreventExitStatus=4 5` stops systemd from looping on
+  them. Notify mapping: summary = title, body = body (markup-escaped when
+  the server advertises `body-markup`), urgency normal/critical by
+  priority, and `category` `notifier.<channel label>`.
 - **WebSocket transport (issue #7):** FCM cannot reach Linux desktops, so
   `devices.transport` is `fcm` or `ws` (migration 0004). A `ws` device has
   a SQLite-backed Durable Object (`src/stream.ts`, `DeviceStream`, bound as
@@ -200,6 +231,12 @@ See `README.md` for the user-facing setup and API table.
   client, name → ID resolution), `pair.go` (terminal QR). `main_test.go` and
   `commands_test.go` run it against `httptest` servers; `TestMain` clears
   `NOTIFIER_*` and points `NOTIFIER_CONFIG` at a missing file.
+- `notifyd/` — `main.go` (subcommands: `pair`, `run`, `test`, `unpair`,
+  `version`; exit codes), `state.go` (`notifyd.json`), `link.go`
+  (`notifier://pair` parsing), `seal.go` (envelope v1 open, pinned by the
+  shared vector), `stream.go` (connection loop), `desktop.go` (D-Bus),
+  `notifyd.service` (systemd user unit). The tests use `httptest`
+  WebSocket servers and a fake `Desktop`.
 - `android/app/src/main/java/com/joncbenderkh/notifier/`
   - `data/` — `PairingStore`, `ServerClient` (blocking; callers pick the
     thread), `NotifierLink` (pure JVM, unit-tested).
@@ -217,7 +254,7 @@ Server (from `server/`):
   (needs `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` secrets); manual
   `npm run db:migrate:remote && npm run deploy`.
 
-CLI (from `notify/`):
+CLI and daemon (from `notify/` or `notifyd/`):
 
 - Test: `go test -race ./...`; lint: `gofmt -l .` (must print nothing), `go vet ./...`
 
@@ -241,11 +278,12 @@ them the released APK cannot pair.
 
 SemVer 2.0.0, starting at 0.1.0. One version for the whole repo:
 `versionName` in `android/app/build.gradle.kts`, `version` in
-`server/package.json`, and `version` in `notify/main.go` must match; the tag
-`vX.Y.Z` mirrors them (release builds also inject it into `notify` via
-`-ldflags -X`). Because `notify/` is a nested Go module, also push
-`notify/vX.Y.Z` on the same commit, or `go install …/notify@latest` resolves
-to an untagged pseudo-version. The Worker deploys continuously from `main`,
+`server/package.json`, and `version` in `notify/main.go` and
+`notifyd/main.go` must match; the tag `vX.Y.Z` mirrors them (release builds
+also inject it into both via `-ldflags -X`). Because `notify/` and
+`notifyd/` are nested Go modules, also push `notify/vX.Y.Z` and
+`notifyd/vX.Y.Z` on the same commit, or `go install …@latest` resolves to
+an untagged pseudo-version. The Worker deploys continuously from `main`,
 independent of tags. `versionCode` increments by one each release.
 
 ## Working on notifier
