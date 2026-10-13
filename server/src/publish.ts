@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Sealing a message for each device and handing it to its transport, shared
-// by sends through the API and the heartbeat alerts the cron trigger raises.
+// by sends through the API, heartbeat alerts and inbound webhooks.
 
 import type { Delivery, Deps, Payload } from "./app";
 import { fromBase64, toBase64 } from "./encoding";
@@ -95,5 +95,34 @@ export function publisher(deps: Deps) {
     return { deliveries, members };
   }
 
-  return { deliver, publish };
+  /**
+   * Publishes [p] from [userId] to one of their channels, or to their
+   * default channel if it has been deleted (its heartbeats and hooks moved
+   * there). False when there were devices to reach but none took the
+   * message, so a retry could still succeed; a channel nobody listens to
+   * counts as done.
+   */
+  async function publishToChannel(env: Env, userId: string, channelId: string, p: Payload): Promise<boolean> {
+    const ch =
+      (await store.ownedChannel(env.DB, userId, channelId)) ??
+      (await store.ownedChannel(env.DB, userId, store.defaultChannelId(userId)));
+    if (!ch) {
+      console.warn("channel missing", userId, channelId);
+      return false;
+    }
+    const targets = new Map<string, Target>();
+    await addSubscribers(env.DB, [ch], targets);
+    if (targets.size === 0) {
+      // Nobody listens, unless the channel was deleted during the lookup.
+      if (await store.ownedChannel(env.DB, userId, ch.id)) return true;
+      const fallback = await store.ownedChannel(env.DB, userId, store.defaultChannelId(userId));
+      if (fallback) await addSubscribers(env.DB, [fallback], targets);
+      if (targets.size === 0) return fallback !== null;
+    }
+    const { deliveries, members } = await publish(env, userId, targets.values(), p);
+    const taken = (s: Delivery["status"]) => s === "sent" || s === "queued";
+    return deliveries.some((d) => taken(d.status)) || (members.sent ?? 0) + (members.queued ?? 0) > 0;
+  }
+
+  return { deliver, publish, publishToChannel };
 }

@@ -275,6 +275,22 @@ See `README.md` for the user-facing setup and API table.
   `triggers.crons` is set. Deploy `"triggers": {"crons": []}` with it, or
   remove the trigger in the dashboard, or the schedule keeps invoking a
   Worker with no `scheduled` handler every minute.
+- **Inbound webhooks (issue #34):** `hooks` (migration 0007, additive,
+  so rollback is safe) maps a secret (`nw_`, hashed like the others) to a
+  user's channel and a `format`. `POST /v1/hooks/<format>/<secret>`
+  parses the tool's payload (`src/hooks.ts` `FORMATS`: `alertmanager`,
+  `grafana`, `generic`; Uptime Kuma and GitHub are to follow) and
+  publishes through `publishToChannel` (`publish.ts`, shared with the
+  heartbeat alerts: a deleted channel falls back to `default`, and
+  deleting a channel moves its hooks there). `format` has no CHECK, so a
+  new format needs no table rebuild; the path's format must match the
+  hook's. Parsing is lenient, since these schemas evolve: unknown fields
+  are ignored, and text is cleaned and cut (`cleanText`, keeping the
+  head) instead of refused. The body limit is 1 MiB, as for pings. The
+  send limit applies per user (429). When devices exist but none took
+  the alert it answers 503 so the tool retries, which can repeat an alert
+  on devices that did get it; no notice is queued server-side. A
+  disabled user's hooks answer 404.
 - **Wire format (envelope v1):** FCM data `{"v":"1","n":<b64 nonce>,"c":<b64
   ciphertext>}`; AES-256-GCM, 12-byte nonce, 128-bit tag, per-device key,
   AAD = device ID. Plaintext is the JSON `Payload` (`server/src/app.ts`,
@@ -327,7 +343,8 @@ See `README.md` for the user-facing setup and API table.
 - `server/src/{pairing,pairPage}.ts` — the `notifier://pair` link and QR, and
   the static `/pair` page.
 - `server/src/publish.ts` — sealing and fan-out to devices, shared by
-  `POST /v1/notifications` and heartbeat alerts.
+  `POST /v1/notifications`, heartbeat alerts and inbound webhooks.
+- `server/src/hooks.ts` — inbound webhook formats (payload → message).
 - `server/src/heartbeats.ts` — heartbeat alerts and the cron check;
   `server/src/text.ts` — what text and names may hold, and `cleanTail`.
 - `server/src/index.ts` — the deployed entry point (`fetch` and the
