@@ -129,6 +129,9 @@ See `README.md` for the user-facing setup and API table.
   Reading deduplicates by ID, keeping the first arrival, and returns the
   newest first: at most 500, none older than 30 days. Past 600 lines the
   file is rewritten to that. Pairing and unpairing clear it.
+  `notifyd history delete ID…` and the history window
+  (`cmd/notifyd-history`, issue #64) change it under the same lock; the
+  file code is shared in `internal/histfile`.
   `notifyd history` replaces control and format characters (escapes, bidi
   overrides) in what it prints, and `--json` escapes them, since senders
   choose the text. Its tests' `TestMain` points `NOTIFYD_STATE`
@@ -365,7 +368,15 @@ See `README.md` for the user-facing setup and API table.
   writes), `history.go` (the history file), `link.go`
   (`notifier://pair` parsing), `seal.go` (envelope v1 open, pinned by the
   shared vector), `stream.go` (connection loop), `desktop.go` (D-Bus),
-  `notifyd.service` (systemd user unit), `contrib/i3blocks/` (a status
+  `notifyd.service` (systemd user unit), `internal/histfile` (the
+  history file and its lock, shared with the window),
+  `cmd/notifyd-history` (the GTK 4 / libadwaita history window, gotk4;
+  its GTK-free logic is in `internal/histview` with tests; the window
+  shows sender text as plain text, replacing control and format
+  characters, and only search highlights use markup, escaped; it writes
+  the i3blocks block's `bar-seen` list for what it lists; the
+  bindings target libadwaita 1.9, so CI builds notifyd in a Fedora
+  container), `contrib/i3blocks/` (a status
   bar block and its zenity history viewer, plain shell over `notifyd
   history --json`; the viewer strips control and format characters, since
   senders choose the text). The tests use `httptest`
@@ -391,6 +402,9 @@ Server (from `server/`):
 CLI and daemon (from `notify/` or `notifyd/`):
 
 - Test: `go test -race ./...`; lint: `gofmt -l .` (must print nothing), `go vet ./...`
+- In `notifyd/`, `./...` includes the GTK window, which needs the
+  libadwaita 1.9 headers (`libadwaita-devel`) and a slow first cgo build;
+  without them, check `. ./internal/...` instead.
 
 Android (from `android/`, needs a full JDK 17+ — the system JDK 25 here is a
 JRE without `javac`; use `JAVA_HOME=~/.jdks/jbr-21.0.11`):
