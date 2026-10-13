@@ -25,7 +25,7 @@ import (
 )
 
 // version is set by release builds with -ldflags "-X main.version=...".
-var version = "0.1.0"
+var version = "0.2.0"
 
 const (
 	exitError = 1
