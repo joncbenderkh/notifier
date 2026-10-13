@@ -18,6 +18,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.LinearProgressIndicator
@@ -298,8 +299,37 @@ private fun PairedPanel(
     OutlinedButton(onClick = onTest, enabled = enabled, modifier = Modifier.fillMaxWidth()) {
         Text("Send test notification")
     }
-    OutlinedButton(onClick = onUnpair, enabled = enabled, modifier = Modifier.fillMaxWidth()) {
+    var confirmUnpair by rememberSaveable { mutableStateOf(false) }
+    TextButton(
+        onClick = { confirmUnpair = true },
+        enabled = enabled,
+        colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
         Text("Unpair")
+    }
+
+    if (confirmUnpair) {
+        AlertDialog(
+            onDismissRequest = { confirmUnpair = false },
+            title = { Text("Unpair this phone?") },
+            text = {
+                Text(
+                    "This disconnects this phone from your server and clears all notification history " +
+                        "on this phone. You will need a new pairing code to reconnect."
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        confirmUnpair = false
+                        onUnpair()
+                    },
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                ) { Text("Unpair") }
+            },
+            dismissButton = { TextButton(onClick = { confirmUnpair = false }) { Text("Cancel") } },
+        )
     }
 }
 
