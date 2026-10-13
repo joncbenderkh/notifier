@@ -88,11 +88,13 @@ fun NotifierScreen(viewModel: MainViewModel = viewModel()) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val snackbar = remember { SnackbarHostState() }
 
-    LaunchedEffect(state.message) {
-        state.message?.let {
-            snackbar.showSnackbar(it)
-            viewModel.dismissMessage()
-        }
+    // One at a time, removed only once shown, so none is lost to a
+    // rotation or to two arriving together.
+    val notice = state.messages.firstOrNull()
+    LaunchedEffect(notice?.id) {
+        notice ?: return@LaunchedEffect
+        snackbar.showSnackbar(notice.text)
+        viewModel.messageShown(notice.id)
     }
 
     val permission = rememberNotificationPermission()
