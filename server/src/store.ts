@@ -20,6 +20,7 @@ export interface Device {
   /** base64 AES-256 key */
   seal_key: string;
   fcm_token: string;
+  transport: "fcm" | "ws";
   created_at: number;
   last_seen_at: number;
 }
@@ -33,7 +34,7 @@ export interface ApiKey {
 }
 
 const USER_COLUMNS = "id, name, created_at, last_seen_at, disabled_at";
-const DEVICE_COLUMNS = "d.id, d.user_id, d.name, d.seal_key, d.fcm_token, d.created_at, d.last_seen_at";
+const DEVICE_COLUMNS = "d.id, d.user_id, d.name, d.seal_key, d.fcm_token, d.transport, d.created_at, d.last_seen_at";
 const API_KEY_COLUMNS = "k.id, k.user_id, k.name, k.created_at, k.last_used_at";
 
 /** Joins the owner of the rows aliased [table], keeping only enabled owners. */
@@ -165,13 +166,25 @@ export async function redeemPairing(
   const [inserted] = await db.batch([
     db
       .prepare(
-        `INSERT INTO devices (id, user_id, name, token_hash, seal_key, fcm_token, created_at, last_seen_at)
-         SELECT ?, p.user_id, ?, ?, ?, ?, ?, ?
+        `INSERT INTO devices (id, user_id, name, token_hash, seal_key, fcm_token, transport, created_at, last_seen_at)
+         SELECT ?, p.user_id, ?, ?, ?, ?, ?, ?, ?
          FROM pairings p ${activeOwner("p")}
          WHERE p.code_hash = ? AND p.expires_at > ?
            AND (SELECT count(*) FROM devices WHERE user_id = p.user_id) < ?`,
       )
-      .bind(device.id, device.name, tokenHash, device.seal_key, device.fcm_token, now, now, codeHash, now, maxDevices),
+      .bind(
+        device.id,
+        device.name,
+        tokenHash,
+        device.seal_key,
+        device.fcm_token,
+        device.transport,
+        now,
+        now,
+        codeHash,
+        now,
+        maxDevices,
+      ),
     db.prepare("DELETE FROM pairings WHERE code_hash = ? OR expires_at <= ?").bind(codeHash, now),
   ]);
   return (inserted?.meta.changes ?? 0) > 0; // also counts rows a trigger writes
@@ -197,6 +210,14 @@ export async function listDevices(db: D1Database, userId: string): Promise<Devic
 export async function setFcmToken(db: D1Database, deviceId: string, fcmToken: string): Promise<boolean> {
   const result = await db.prepare("UPDATE devices SET fcm_token = ? WHERE id = ?").bind(fcmToken, deviceId).run();
   return result.meta.changes === 1;
+}
+
+/** The transport of the user's device [id], or null when they have no such device. */
+export async function deviceTransport(db: D1Database, userId: string, id: string): Promise<Device["transport"] | null> {
+  return db
+    .prepare("SELECT transport FROM devices WHERE id = ? AND user_id = ?")
+    .bind(id, userId)
+    .first<Device["transport"]>("transport");
 }
 
 export async function deleteDevice(db: D1Database, userId: string, id: string): Promise<boolean> {

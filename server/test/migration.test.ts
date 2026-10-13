@@ -5,7 +5,7 @@ import { createApp } from "../src/app";
 import { LogSender } from "../src/push";
 import { sha256Hex } from "../src/token";
 
-const [initial, users, channels] = env.TEST_MIGRATIONS;
+const [initial, users, channels, transport] = env.TEST_MIGRATIONS;
 
 /** Rebuilds the database at the pre-user schema. */
 beforeEach(async () => {
@@ -51,7 +51,13 @@ describe("0002_users", () => {
     // Today's code runs on the fully migrated schema.
     await applyD1Migrations(env.DB, env.TEST_MIGRATIONS);
 
-    const app = createApp({ sender: () => new LogSender(), now: () => 1_790_000_000 });
+    const app = createApp({
+      sender: () => new LogSender(),
+      stream: () => {
+        throw new Error("no WebSocket devices here");
+      },
+      now: () => 1_790_000_000,
+    });
     const req = (path: string, token: string, method = "GET") =>
       app.request(path, { method, headers: { authorization: `Bearer ${token}` } }, env);
     expect((await req("/v1/devices", "nk_old")).status).toBe(200);
@@ -103,5 +109,26 @@ describe("0003_channels", () => {
       { device_id: "dev_b", owner_id: "usr_b", name: "default" },
       { device_id: "dev_c", owner_id: "usr_c", name: "default" },
     ]);
+  });
+});
+
+describe("0004_device_transport", () => {
+  it("keeps existing devices, and those the previous Worker pairs, on FCM", async () => {
+    await applyD1Migrations(env.DB, [initial!, users!, channels!]);
+    const insert = (id: string, hash: string) =>
+      env.DB.prepare(
+        `INSERT INTO devices (id, user_id, name, token_hash, seal_key, fcm_token, created_at, last_seen_at)
+         VALUES (?, 'usr_owner', 'phone', ?, 'AAAA', 'fcm', 1, 1)`,
+      ).bind(id, hash);
+    await insert("dev_old", "h1").run();
+    await applyD1Migrations(env.DB, [initial!, users!, channels!, transport!]);
+    await insert("dev_new", "h2").run();
+
+    const rows = await env.DB.prepare("SELECT id, transport FROM devices ORDER BY id").all();
+    expect(rows.results).toEqual([
+      { id: "dev_new", transport: "fcm" },
+      { id: "dev_old", transport: "fcm" },
+    ]);
+    await expect(env.DB.prepare("UPDATE devices SET transport = 'apns'").run()).rejects.toThrow(/CHECK/);
   });
 });

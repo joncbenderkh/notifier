@@ -19,6 +19,7 @@ import { fromBase64 } from "../src/encoding";
 import { UnregisteredError } from "../src/push";
 import type { PushMessage, Sender } from "../src/push";
 import { open } from "../src/seal";
+import type { Stream, StreamMessage } from "../src/stream";
 
 const ADMIN = env.ADMIN_TOKEN;
 
@@ -29,6 +30,29 @@ class FakeSender implements Sender {
     if (this.unregistered.has(message.token)) return Promise.reject(new UnregisteredError("gone"));
     this.sent.push(message);
     return Promise.resolve();
+  }
+}
+
+class FakeStreams {
+  delivered = new Map<string, StreamMessage[]>();
+  connected = new Set<string>();
+  closed: string[] = [];
+  failing = false;
+  closeFails = false;
+  for(deviceId: string): Stream {
+    return {
+      deliver: (m) => {
+        if (this.failing) return Promise.reject(new Error("object unavailable"));
+        this.delivered.set(deviceId, [...(this.delivered.get(deviceId) ?? []), m]);
+        return Promise.resolve(this.connected.has(deviceId) ? "sent" : "queued");
+      },
+      close: () => {
+        if (this.closeFails) return Promise.reject(new Error("object unavailable"));
+        this.closed.push(deviceId);
+        return Promise.resolve();
+      },
+      fetch: () => Promise.resolve(new Response(`stream of ${deviceId}`)),
+    };
   }
 }
 
@@ -45,6 +69,7 @@ interface NotifyResponse {
 
 let USER: string;
 let sender: FakeSender;
+let streams: FakeStreams;
 let now: number;
 let app: ReturnType<typeof createApp>;
 
@@ -60,8 +85,9 @@ beforeEach(async () => {
     ),
   ]);
   sender = new FakeSender();
+  streams = new FakeStreams();
   now = 1_790_000_000;
-  app = createApp({ sender: () => sender, now: () => now });
+  app = createApp({ sender: () => sender, stream: (_, id) => streams.for(id), now: () => now });
   USER = await signup("alice");
 });
 
@@ -143,6 +169,7 @@ describe("notifications", () => {
       sender: () => {
         throw new Error("FCM_SERVICE_ACCOUNT secret is not set");
       },
+      stream: (_, id) => streams.for(id),
       now: () => now,
     });
     const resp = await call<NotifyResponse>("POST", "/v1/notifications", key, { title: "hi" }, 200);
@@ -240,7 +267,7 @@ describe("authentication", () => {
   it("lets API keys list devices without activity timestamps", async () => {
     const reg = await pair("phone", "fcm-phone");
     const devices = await call<object[]>("GET", "/v1/devices", await apiKey(), undefined, 200);
-    expect(devices).toEqual([{ id: reg.device_id, name: "phone", reachable: true }]);
+    expect(devices).toEqual([{ id: reg.device_id, name: "phone", transport: "fcm", reachable: true }]);
     const full = await call<object[]>("GET", "/v1/devices", USER, undefined, 200);
     expect(full[0]).toHaveProperty("last_seen_at");
   });
@@ -298,6 +325,108 @@ describe("device self-management", () => {
 
     await call("DELETE", "/v1/device", reg.device_token, undefined, 204);
     await call("POST", "/v1/device/test", reg.device_token, undefined, 401);
+  });
+});
+
+describe("WebSocket transport", () => {
+  async function pairDesktop(name = "desktop", owner = USER): Promise<Registration> {
+    const { code } = await call<{ code: string }>("POST", "/v1/pairings", owner, undefined, 201);
+    return call<Registration>("POST", "/v1/devices", "", { code, name, transport: "ws" }, 201);
+  }
+
+  const stream = (token: string, headers: Record<string, string> = { upgrade: "websocket" }) =>
+    app.request("/v1/device/stream", { headers: { authorization: `Bearer ${token}`, ...headers } }, env);
+
+  it("pairs without an FCM token and counts as reachable", async () => {
+    const desktop = await pairDesktop();
+    const devices = await call<object[]>("GET", "/v1/devices", await apiKey(), undefined, 200);
+    expect(devices).toEqual([{ id: desktop.device_id, name: "desktop", transport: "ws", reachable: true }]);
+  });
+
+  it.each([
+    { transport: "ws", fcm_token: "x" },
+    { transport: "ws", fcm_token: "" },
+    { transport: "apns", fcm_token: "x" },
+    { transport: "fcm" },
+  ])("rejects pairing request %j", async (fields) => {
+    const { code } = await call<{ code: string }>("POST", "/v1/pairings", USER, undefined, 201);
+    await call("POST", "/v1/devices", "", { code, name: "d", ...fields }, 400);
+  });
+
+  it("queues a sealed frame, reporting sent only while connected", async () => {
+    const desktop = await pairDesktop();
+    await pair("phone", "fcm-phone");
+    const key = await apiKey();
+
+    const queued = await call<NotifyResponse>("POST", "/v1/notifications", key, { title: "hi", priority: "high" }, 200);
+    expect(queued.deliveries.map((d) => d.status).sort()).toEqual(["queued", "sent"]);
+    expect(sender.sent.map((m) => m.token)).toEqual(["fcm-phone"]);
+
+    const [m] = streams.delivered.get(desktop.device_id)!;
+    expect(m!.id).toBe(queued.id);
+    expect(m!.expiresAt).toBe(now + 24 * 60 * 60);
+    const frame = JSON.parse(m!.frame) as Record<string, string>;
+    expect(Object.keys(frame).sort()).toEqual(["c", "id", "n", "type", "v"]);
+    expect(frame).toMatchObject({ type: "message", id: queued.id, v: "1" });
+    const plaintext = await open(fromBase64(desktop.seal_key), desktop.device_id, {
+      nonce: fromBase64(frame.n!),
+      ciphertext: fromBase64(frame.c!),
+    });
+    expect(JSON.parse(new TextDecoder().decode(plaintext))).toMatchObject({ id: queued.id, title: "hi", priority: "high" });
+
+    streams.connected.add(desktop.device_id);
+    const sent = await call<NotifyResponse>("POST", "/v1/notifications", key, { title: "again" }, 200);
+    expect(sent.deliveries.map((d) => d.status)).toEqual(["sent", "sent"]);
+  });
+
+  it("reports a failing stream as failed", async () => {
+    await pairDesktop();
+    streams.failing = true;
+    const resp = await call<NotifyResponse>("POST", "/v1/notifications", USER, { title: "hi" }, 200);
+    expect(resp.deliveries).toEqual([expect.objectContaining({ status: "failed" })]);
+  });
+
+  it("hands the upgrade to the device's own stream", async () => {
+    const desktop = await pairDesktop();
+    const phone = await pair("phone", "fcm-phone");
+
+    const res = await stream(desktop.device_token);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe(`stream of ${desktop.device_id}`);
+    expect((await stream(desktop.device_token, {})).status).toBe(426);
+    expect((await stream(phone.device_token)).status).toBe(409);
+    expect((await stream(await apiKey())).status).toBe(401);
+    expect((await stream(USER)).status).toBe(401);
+    await call("PUT", "/v1/device", desktop.device_token, { fcm_token: "x" }, 409);
+  });
+
+  it("closes the stream when the device is unpaired", async () => {
+    const a = await pairDesktop("a");
+    const b = await pairDesktop("b");
+    const phone = await pair("phone", "fcm-phone");
+    await call("DELETE", `/v1/devices/${a.device_id}`, USER, undefined, 204);
+    await call("DELETE", "/v1/device", b.device_token, undefined, 204);
+    await call("DELETE", `/v1/devices/${phone.device_id}`, USER, undefined, 204);
+    expect(streams.closed).toEqual([a.device_id, b.device_id]);
+    expect((await stream(b.device_token)).status).toBe(401);
+  });
+
+  it("keeps the device for a retry when its stream cannot be closed", async () => {
+    const desktop = await pairDesktop();
+    streams.closeFails = true;
+    await call("DELETE", `/v1/devices/${desktop.device_id}`, USER, undefined, 503);
+    await call("DELETE", "/v1/device", desktop.device_token, undefined, 503);
+    expect(await call<object[]>("GET", "/v1/devices", USER, undefined, 200)).toHaveLength(1);
+
+    streams.closeFails = false;
+    await call("DELETE", `/v1/devices/${desktop.device_id}`, USER, undefined, 204);
+    expect(streams.closed).toEqual([desktop.device_id]);
+  });
+
+  it("does not close another user's device stream", async () => {
+    const desktop = await pairDesktop();
+    await call("DELETE", `/v1/devices/${desktop.device_id}`, await signup("mallory"), undefined, 404);
+    expect(streams.closed).toEqual([]);
   });
 });
 
