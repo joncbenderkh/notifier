@@ -5,9 +5,8 @@
 // alerts the heartbeat's channel, once, when a check-in is overdue. A later
 // ping announces the recovery.
 
-import type { Delivery, Deps, Payload } from "./app";
-import { addSubscribers, publisher } from "./publish";
-import type { Target } from "./publish";
+import type { Deps, Payload } from "./app";
+import { publisher } from "./publish";
 import * as store from "./store";
 import type { Heartbeat } from "./store";
 import { newId } from "./token";
@@ -50,36 +49,13 @@ interface Notice {
 }
 
 export function heartbeatAlerts(deps: Deps) {
-  const { publish } = publisher(deps);
+  const { publishToChannel } = publisher(deps);
 
-  /**
-   * Publishes to the heartbeat's channel. False when there were devices to
-   * reach but none took the message, so a retry could still succeed; a
-   * channel nobody listens to counts as done.
-   */
-  async function notify(env: Env, hb: Heartbeat, title: string, body: string, priority: Payload["priority"]): Promise<boolean> {
-    // A channel deleted since [hb] was read: its heartbeats moved to default.
-    const ch =
-      (await store.ownedChannel(env.DB, hb.user_id, hb.channel_id)) ??
-      (await store.ownedChannel(env.DB, hb.user_id, store.defaultChannelId(hb.user_id)));
-    if (!ch) {
-      console.warn("heartbeat channel missing", hb.id, hb.channel_id);
-      return false;
-    }
-    const targets = new Map<string, Target>();
-    await addSubscribers(env.DB, [ch], targets);
-    if (targets.size === 0) {
-      // Nobody listens, unless the channel was deleted during the lookup.
-      if (await store.ownedChannel(env.DB, hb.user_id, ch.id)) return true;
-      const fallback = await store.ownedChannel(env.DB, hb.user_id, store.defaultChannelId(hb.user_id));
-      if (fallback) await addSubscribers(env.DB, [fallback], targets);
-      if (targets.size === 0) return fallback !== null;
-    }
+  /** Publishes to the heartbeat's channel; see publishToChannel. */
+  function notify(env: Env, hb: Heartbeat, title: string, body: string, priority: Payload["priority"]): Promise<boolean> {
     const p: Payload = { id: newId("msg_"), title, priority, sent_at: deps.now() };
     if (body !== "") p.body = body;
-    const { deliveries, members } = await publish(env, hb.user_id, targets.values(), p);
-    const taken = (s: Delivery["status"]) => s === "sent" || s === "queued";
-    return deliveries.some((d) => taken(d.status)) || (members.sent ?? 0) + (members.queued ?? 0) > 0;
+    return publishToChannel(env, hb.user_id, hb.channel_id, p);
   }
 
   /**
