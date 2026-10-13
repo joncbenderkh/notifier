@@ -38,9 +38,14 @@ See `README.md` for the user-facing setup and API table.
   service-account JSON verbatim), declared in `src/env.d.ts` because
   `wrangler types` cannot see secrets. Locally they live in the gitignored
   `server/.dev.vars`.
-- **CLI stack:** Go stdlib (`flag`, `net/http`) plus `skip2/go-qrcode` for
-  `notify pair`, which draws the QR with half blocks in explicit black/white
-  ANSI colours so it scans on dark terminals too. `-to` accepts names or IDs;
+- **CLI stack:** `spf13/cobra` (issue #54; both `notify` and `notifyd`,
+  each with a `cmd.go` holding the command tree), `net/http`, and
+  `skip2/go-qrcode` for `notify pair`, which draws the QR with half blocks
+  in explicit black/white ANSI colours so it scans on dark terminals too.
+  Long flags take two dashes since 0.4.0; an old single-dash spelling is
+  refused with a hint (`oldStyleFlag`). Handlers return exit codes, which
+  `exitCode` errors carry through Cobra unchanged; Cobra's own errors exit
+  2. A command that only groups others exits 2 when run alone. `--to` accepts names or IDs;
   names resolve through `GET /v1/devices`, which API keys may call.
   Settings: flags > env (`NOTIFIER_URL`, `NOTIFIER_API_KEY`,
   `NOTIFIER_TOKEN`; `NOTIFIER_ADMIN_TOKEN` as a legacy alias, honoured only
@@ -49,12 +54,12 @@ See `README.md` for the user-facing setup and API table.
   its own `notifyd.json` instead, so neither program's strict parsing
   constrains the other). Unknown fields are rejected, and a file with credentials must
   be 0600; writes are atomic and 0600. Flags default to empty and resolve
-  after parsing, so `-h` never prints a secret. Sending uses the API key or
+  after parsing, so `--help` never prints a secret. Sending uses the API key or
   user token from the highest level that sets one; other commands need the
-  user token. Subcommand flags come before their arguments. Subcommand
-  words are reserved only in a command's shape (no-argument commands alone,
-  the rest with arguments), so scripts sending arbitrary titles keep
-  working. Sign-up rewrites the config with only the new account's
+  user token. Only `notify send TITLE [BODY | -]` sends, so a first word is
+  always a command; `send` stops parsing flags at TITLE
+  (`SetInterspersed(false)`), so a body from a variable never acts as a
+  flag. Sign-up rewrites the config with only the new account's
   settings.
 - **QR pairing:** the link is `notifier://pair?server=<origin>&code=<code>`
   (and `notifier://join?...` for a channel invite), built by
@@ -100,7 +105,7 @@ See `README.md` for the user-facing setup and API table.
   opened is acked and dropped. A newer envelope version is left unacked,
   so it waits in the queue for an updated daemon. The last 500 IDs are
   remembered to drop replays. Dialling and every D-Bus call have
-  timeouts. `pair -force` saves the new pairing before unpairing the old
+  timeouts. `pair --force` saves the new pairing before unpairing the old
   one.
 
   Bare `notifyd` prints usage instead of running (issue #22): the server
@@ -125,7 +130,7 @@ See `README.md` for the user-facing setup and API table.
   newest first: at most 500, none older than 30 days. Past 600 lines the
   file is rewritten to that. Pairing and unpairing clear it.
   `notifyd history` replaces control and format characters (escapes, bidi
-  overrides) in what it prints, and `-json` escapes them, since senders
+  overrides) in what it prints, and `--json` escapes them, since senders
   choose the text. Its tests' `TestMain` points `NOTIFYD_STATE`
   and `NOTIFYD_HISTORY` at missing temporary files.
 
@@ -349,19 +354,20 @@ See `README.md` for the user-facing setup and API table.
   `server/src/text.ts` — what text and names may hold, and `cleanTail`.
 - `server/src/index.ts` — the deployed entry point (`fetch` and the
   `scheduled` cron handler).
-- `notify/` — `main.go` (flags, settings, sending, exit codes),
-  `commands.go` (subcommands), `config.go` (config file), `client.go` (API
+- `notify/` — `cmd.go` (the Cobra command tree and flags), `main.go`
+  (settings, sending, exit codes), `commands.go` (the other commands), `config.go` (config file), `client.go` (API
   client, name → ID resolution), `pair.go` (terminal QR). `main_test.go` and
   `commands_test.go` run it against `httptest` servers; `TestMain` clears
   `NOTIFIER_*` and points `NOTIFIER_CONFIG` at a missing file.
-- `notifyd/` — `main.go` (subcommands: `pair`, `run`, `test`, `history`,
-  `unpair`, `version`; exit codes), `state.go` (`notifyd.json`, atomic
+- `notifyd/` — `cmd.go` (the Cobra command tree: `pair`, `run`, `test`,
+  `history`, `unpair`, `version`, `completion`), `main.go` (the commands and
+  exit codes), `state.go` (`notifyd.json`, atomic
   writes), `history.go` (the history file), `link.go`
   (`notifier://pair` parsing), `seal.go` (envelope v1 open, pinned by the
   shared vector), `stream.go` (connection loop), `desktop.go` (D-Bus),
   `notifyd.service` (systemd user unit), `contrib/i3blocks/` (a status
   bar block and its zenity history viewer, plain shell over `notifyd
-  history -json`; the viewer strips control and format characters, since
+  history --json`; the viewer strips control and format characters, since
   senders choose the text). The tests use `httptest`
   WebSocket servers and a fake `Desktop`.
 - `android/app/src/main/java/com/joncbenderkh/notifier/`

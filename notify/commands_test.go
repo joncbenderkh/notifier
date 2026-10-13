@@ -57,7 +57,7 @@ func newFakeAPI(t *testing.T, routes map[string]any) *fakeAPI {
 
 func (f *fakeAPI) run(args ...string) (int, string, string) {
 	var stdout, stderr bytes.Buffer
-	code := run(append([]string{"-url", f.URL}, args...), strings.NewReader(""), &stdout, &stderr, nil)
+	code := run(append([]string{"--url", f.URL}, args...), strings.NewReader(""), &stdout, &stderr, nil)
 	return code, stdout.String(), stderr.String()
 }
 
@@ -92,7 +92,7 @@ func TestConfigFileSuppliesServerCredentialAndTargets(t *testing.T) {
 	useConfig(t, &Config{URL: f.URL, APIKey: "nk_file", Channels: []string{"ci"}, Priority: "high"}, 0o600)
 
 	var stdout, stderr bytes.Buffer
-	if code := run([]string{"Build done"}, strings.NewReader(""), &stdout, &stderr, nil); code != 0 {
+	if code := run([]string{"send", "Build done"}, strings.NewReader(""), &stdout, &stderr, nil); code != 0 {
 		t.Fatalf("exit %d: %s", code, stderr.String())
 	}
 	got := f.got[0]
@@ -108,8 +108,8 @@ func TestFlagsBeatEnvironmentBeatConfig(t *testing.T) {
 	t.Setenv("NOTIFIER_API_KEY", "nk_env")
 
 	var stdout, stderr bytes.Buffer
-	run([]string{"-c", "alerts", "Hi"}, strings.NewReader(""), &stdout, &stderr, nil)
-	run([]string{"-token", "nu_flag", "Hi"}, strings.NewReader(""), &stdout, &stderr, nil)
+	run([]string{"send", "-c", "alerts", "Hi"}, strings.NewReader(""), &stdout, &stderr, nil)
+	run([]string{"send", "--token", "nu_flag", "Hi"}, strings.NewReader(""), &stdout, &stderr, nil)
 	if len(f.got) != 2 {
 		t.Fatalf("got %d requests: %s", len(f.got), stderr.String())
 	}
@@ -123,7 +123,7 @@ func TestFlagsBeatEnvironmentBeatConfig(t *testing.T) {
 func TestConfigFileWithCredentialsMustBePrivate(t *testing.T) {
 	useConfig(t, &Config{URL: "https://example.com", Token: testToken}, 0o644)
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"Hi"}, strings.NewReader(""), &stdout, &stderr, nil)
+	code := run([]string{"send", "Hi"}, strings.NewReader(""), &stdout, &stderr, nil)
 	if code != exitUsage || !strings.Contains(stderr.String(), "chmod 600") {
 		t.Fatalf("exit %d, stderr %q", code, stderr.String())
 	}
@@ -134,7 +134,7 @@ func TestConfigFileRejectsUnknownFields(t *testing.T) {
 	os.MkdirAll(filepath.Dir(path), 0o700)
 	os.WriteFile(path, []byte(`{"url": "https://example.com", "apikey": "nk_typo"}`), 0o600)
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"Hi"}, strings.NewReader(""), &stdout, &stderr, nil)
+	code := run([]string{"send", "Hi"}, strings.NewReader(""), &stdout, &stderr, nil)
 	if code != exitUsage || !strings.Contains(stderr.String(), "apikey") {
 		t.Fatalf("exit %d, stderr %q", code, stderr.String())
 	}
@@ -143,7 +143,7 @@ func TestConfigFileRejectsUnknownFields(t *testing.T) {
 func TestConfigInitWritesGivenSettingsPrivately(t *testing.T) {
 	path := useConfig(t, nil, 0)
 	var stdout, stderr bytes.Buffer
-	args := []string{"-url", "https://notifier.example", "-token", testToken, "config", "init"}
+	args := []string{"--url", "https://notifier.example", "--token", testToken, "config", "init"}
 	if code := run(args, strings.NewReader(""), &stdout, &stderr, nil); code != 0 {
 		t.Fatalf("exit %d: %s", code, stderr.String())
 	}
@@ -192,7 +192,7 @@ func TestSendsToChannelsWithUserToken(t *testing.T) {
 		Deliveries: []Delivery{{DeviceID: "dev_phone", Status: "sent"}},
 		Members:    map[string]int{"sent": 2, "unreachable": 1},
 	}})
-	code, stdout, stderr := f.run("-token", testToken, "-c", "ci,alerts", "-c", "homelab", "Deploy", "done")
+	code, stdout, stderr := f.run("send", "--token", testToken, "-c", "ci,alerts", "-c", "homelab", "Deploy", "done")
 	if code != 0 {
 		t.Fatalf("exit %d: %s", code, stderr)
 	}
@@ -209,7 +209,7 @@ func TestUndeliveredWhenNoMemberDeviceGotIt(t *testing.T) {
 	f := newFakeAPI(t, map[string]any{"POST /v1/notifications": NotifyResult{
 		ID: "msg_1", Deliveries: []Delivery{}, Members: map[string]int{"failed": 1},
 	}})
-	if code, _, _ := f.run("-key", testKey, "-c", "shared", "Hi"); code != exitUndelivered {
+	if code, _, _ := f.run("send", "--key", testKey, "-c", "shared", "Hi"); code != exitUndelivered {
 		t.Fatalf("exit %d", code)
 	}
 }
@@ -218,7 +218,7 @@ func TestDeliveredWhenOnlyMemberDevicesQueuedIt(t *testing.T) {
 	f := newFakeAPI(t, map[string]any{"POST /v1/notifications": NotifyResult{
 		ID: "msg_1", Deliveries: []Delivery{}, Members: map[string]int{"queued": 1, "failed": 1},
 	}})
-	code, stdout, _ := f.run("-key", testKey, "-c", "shared", "Hi")
+	code, stdout, _ := f.run("send", "--key", testKey, "-c", "shared", "Hi")
 	if code != 0 || !strings.Contains(stdout, "1 queued, 1 failed") {
 		t.Fatalf("exit %d, stdout %q", code, stdout)
 	}
@@ -226,7 +226,7 @@ func TestDeliveredWhenOnlyMemberDevicesQueuedIt(t *testing.T) {
 
 func TestCreatesScopedKey(t *testing.T) {
 	f := newFakeAPI(t, map[string]any{"POST /v1/keys": APIKey{ID: "key_1", Name: "ci", Key: "nk_new", Channels: []string{"ci"}}})
-	code, stdout, stderr := f.run("-token", testToken, "key", "create", "-c", "ci", "ci")
+	code, stdout, stderr := f.run("--token", testToken, "key", "create", "-c", "ci", "ci")
 	if code != 0 || strings.TrimSpace(stdout) != "nk_new" {
 		t.Fatalf("exit %d, stdout %q, stderr %q", code, stdout, stderr)
 	}
@@ -254,21 +254,21 @@ func TestChannelCommandsResolveNames(t *testing.T) {
 		"DELETE /v1/channels/ch_alice/members/usr_me": nil,
 	})
 
-	code, stdout, stderr := f.run("-token", testToken, "channel", "invite", "homelab")
+	code, stdout, stderr := f.run("--token", testToken, "channel", "invite", "homelab")
 	if code != 0 || !strings.Contains(stdout, "channel join ABCD-EFGH-JKMN") || !strings.Contains(stdout, "▀") {
 		t.Fatalf("invite: exit %d, stdout %q, stderr %q", code, stdout, stderr)
 	}
-	if code, _, stderr := f.run("-token", testToken, "channel", "invite", "alice/alerts"); code != exitError ||
+	if code, _, stderr := f.run("--token", testToken, "channel", "invite", "alice/alerts"); code != exitError ||
 		!strings.Contains(stderr, "not your channel") {
 		t.Fatalf("invite to a joined channel: exit %d, %s", code, stderr)
 	}
-	if code, _, stderr := f.run("-token", testToken, "channel", "remove", "homelab", "bob"); code != 0 {
+	if code, _, stderr := f.run("--token", testToken, "channel", "remove", "homelab", "bob"); code != 0 {
 		t.Fatalf("remove: exit %d, %s", code, stderr)
 	}
-	if code, _, stderr := f.run("-token", testToken, "channel", "leave", "alice/alerts"); code != 0 {
+	if code, _, stderr := f.run("--token", testToken, "channel", "leave", "alice/alerts"); code != 0 {
 		t.Fatalf("leave: exit %d, %s", code, stderr)
 	}
-	if code, _, _ := f.run("-token", testToken, "channel", "delete", "nope"); code != exitError {
+	if code, _, _ := f.run("--token", testToken, "channel", "delete", "nope"); code != exitError {
 		t.Fatalf("unknown channel: exit %d", code)
 	}
 	for _, want := range []string{
@@ -284,7 +284,7 @@ func TestChannelCommandsResolveNames(t *testing.T) {
 func TestSubcommandsNeedTheUserToken(t *testing.T) {
 	f := newFakeAPI(t, nil)
 	for _, args := range [][]string{{"invite"}, {"channels"}, {"keys"}, {"channel", "create", "ci"}} {
-		code, _, stderr := f.run(append([]string{"-key", testKey}, args...)...)
+		code, _, stderr := f.run(append([]string{"--key", testKey}, args...)...)
 		if code != exitUsage || !strings.Contains(stderr, "NOTIFIER_TOKEN") {
 			t.Errorf("%v: exit %d, stderr %q", args, code, stderr)
 		}
@@ -303,33 +303,28 @@ func TestAmbiguousChannelNamesNeedAnID(t *testing.T) {
 		"GET /v1/user": User{ID: "usr_me"},
 		"DELETE /v1/channels/ch_2/members/usr_me": nil,
 	})
-	if code, _, stderr := f.run("-token", testToken, "channel", "leave", "alice/alerts"); code != exitError ||
+	if code, _, stderr := f.run("--token", testToken, "channel", "leave", "alice/alerts"); code != exitError ||
 		!strings.Contains(stderr, "use an ID") {
 		t.Fatalf("exit %d, stderr %q", code, stderr)
 	}
-	if code, _, stderr := f.run("-token", testToken, "channel", "leave", "ch_2"); code != 0 {
+	if code, _, stderr := f.run("--token", testToken, "channel", "leave", "ch_2"); code != 0 {
 		t.Fatalf("leave by ID: exit %d, %s", code, stderr)
 	}
-	if code, _, stderr := f.run("-token", testToken, "channel", "leave", "mine"); code != exitError ||
+	if code, _, stderr := f.run("--token", testToken, "channel", "leave", "mine"); code != exitError ||
 		!strings.Contains(stderr, "channel delete") {
 		t.Fatalf("leave own: exit %d, stderr %q", code, stderr)
 	}
 }
 
-func TestSubcommandWordsStayTitlesUnlessShapedLikeCommands(t *testing.T) {
-	f := newFakeAPI(t, map[string]any{"POST /v1/notifications": sent})
-	// A lone argument-taking word, or a no-argument word with a body, is a message.
-	for _, args := range [][]string{{"channel"}, {"signup"}, {"invite", "sent"}, {"keys", "rotated"}} {
-		if code, _, stderr := f.run(append([]string{"-key", testKey}, args...)...); code != 0 {
+func TestGroupsNeedASubcommand(t *testing.T) {
+	f := newFakeAPI(t, nil)
+	for _, args := range [][]string{{"channel"}, {"channel", "busy"}, {"key"}, {"heartbeat", "body"}, {"hook", "body"}, {"invite", "sent"}, {"keys", "rotated"}} {
+		if code, _, stderr := f.run(append([]string{"--token", testToken}, args...)...); code != exitUsage {
 			t.Errorf("%v: exit %d, %s", args, code, stderr)
 		}
 	}
-	// An argument-taking word with a body could be either: refuse to guess.
-	if code, _, _ := f.run("-key", testKey, "channel", "busy"); code != exitUsage {
-		t.Errorf("channel busy: exit %d", code)
-	}
-	if len(f.got) != 4 {
-		t.Fatalf("sent %v", f.routesCalled())
+	if len(f.got) != 0 {
+		t.Fatalf("called %v", f.routesCalled())
 	}
 }
 
@@ -338,7 +333,7 @@ func TestLegacyAdminTokenIsNeverSentUnlessAUserToken(t *testing.T) {
 	useConfig(t, &Config{URL: f.URL, APIKey: "nk_file"}, 0o600)
 	t.Setenv("NOTIFIER_ADMIN_TOKEN", "operator-secret-operator-secret-operator")
 	var stdout, stderr bytes.Buffer
-	if code := run([]string{"Hi"}, strings.NewReader(""), &stdout, &stderr, nil); code != 0 {
+	if code := run([]string{"send", "Hi"}, strings.NewReader(""), &stdout, &stderr, nil); code != 0 {
 		t.Fatalf("exit %d: %s", code, stderr.String())
 	}
 	if f.got[0].Auth != "Bearer nk_file" || !strings.Contains(stderr.String(), "ignoring NOTIFIER_ADMIN_TOKEN") {
@@ -350,7 +345,7 @@ func TestHighFalseOverridesConfigPriority(t *testing.T) {
 	f := newFakeAPI(t, map[string]any{"POST /v1/notifications": sent})
 	useConfig(t, &Config{URL: f.URL, APIKey: "nk_file", Priority: "high"}, 0o600)
 	var stdout, stderr bytes.Buffer
-	run([]string{"-high=false", "Hi"}, strings.NewReader(""), &stdout, &stderr, nil)
+	run([]string{"send", "--high=false", "Hi"}, strings.NewReader(""), &stdout, &stderr, nil)
 	if p, _ := f.got[0].Body["priority"].(string); p == "high" {
 		t.Fatalf("priority %q", p)
 	}
@@ -361,11 +356,11 @@ func TestConfigRejectsTrailingDataButInitCanReplaceIt(t *testing.T) {
 	os.MkdirAll(filepath.Dir(path), 0o700)
 	os.WriteFile(path, []byte(`{"url": "https://example.com"} {"api_key": "nk_x"}`), 0o600)
 	var stdout, stderr bytes.Buffer
-	if code := run([]string{"Hi"}, strings.NewReader(""), &stdout, &stderr, nil); code != exitUsage ||
+	if code := run([]string{"send", "Hi"}, strings.NewReader(""), &stdout, &stderr, nil); code != exitUsage ||
 		!strings.Contains(stderr.String(), "after the JSON object") {
 		t.Fatalf("exit %d, stderr %q", code, stderr.String())
 	}
-	args := []string{"-url", "https://example.com", "config", "init", "-force"}
+	args := []string{"--url", "https://example.com", "config", "init", "--force"}
 	if code := run(args, strings.NewReader(""), &stdout, &stderr, nil); code != 0 {
 		t.Fatalf("init -force: exit %d, %s", code, stderr.String())
 	}
@@ -403,7 +398,7 @@ func TestHeartbeatCommands(t *testing.T) {
 		"DELETE /v1/heartbeats/hb_2": nil,
 	})
 
-	code, stdout, stderr := f.run("-token", testToken, "heartbeat", "create", "-every", "1d12h", "-grace", "10m", "-c", "ops", "backup")
+	code, stdout, stderr := f.run("--token", testToken, "heartbeat", "create", "--every", "1d12h", "--grace", "10m", "-c", "ops", "backup")
 	if code != 0 || strings.TrimSpace(stdout) != "https://n.example/v1/ping/nh_x" || !strings.Contains(stderr, "curl -fsS") {
 		t.Fatalf("exit %d, stdout %q, stderr %q", code, stdout, stderr)
 	}
@@ -411,28 +406,19 @@ func TestHeartbeatCommands(t *testing.T) {
 		t.Fatalf("got %+v", got)
 	}
 
-	code, stdout, _ = f.run("-token", testToken, "heartbeats")
+	code, stdout, _ = f.run("--token", testToken, "heartbeats")
 	if code != 0 || !strings.Contains(stdout, "backup") || !strings.Contains(stdout, "1d") || !strings.Contains(stdout, "1h30m") {
 		t.Fatalf("exit %d, stdout %q", code, stdout)
 	}
 
-	if code, stdout, stderr = f.run("-token", testToken, "heartbeat", "delete", "sync"); code != 0 || !strings.Contains(stdout, "hb_2") {
+	if code, stdout, stderr = f.run("--token", testToken, "heartbeat", "delete", "sync"); code != 0 || !strings.Contains(stdout, "hb_2") {
 		t.Fatalf("exit %d, stdout %q, stderr %q", code, stdout, stderr)
 	}
-	if code, _, _ = f.run("-token", testToken, "heartbeat", "create", "-every", "soon", "x"); code != exitUsage {
+	if code, _, _ = f.run("--token", testToken, "heartbeat", "create", "--every", "soon", "x"); code != exitUsage {
 		t.Fatalf("bad -every: exit %d", code)
 	}
-	if code, _, _ = f.run("-token", testToken, "heartbeat", "delete", "nosuch"); code != exitError {
+	if code, _, _ = f.run("--token", testToken, "heartbeat", "delete", "nosuch"); code != exitError {
 		t.Fatalf("no match: exit %d", code)
-	}
-	// "heartbeats" with a body is a message; "heartbeat" with one is a command.
-	sent := len(f.got)
-	f.run("-token", testToken, "heartbeats", "body")
-	if len(f.got) != sent+1 || f.got[sent].Route != "POST /v1/notifications" || f.got[sent].Body["title"] != "heartbeats" {
-		t.Fatalf("heartbeats BODY sent %+v", f.got[sent:])
-	}
-	if code, _, _ = f.run("-token", testToken, "heartbeat", "body"); code != exitUsage {
-		t.Fatalf("heartbeat BODY: exit %d", code)
 	}
 }
 
@@ -441,10 +427,10 @@ func TestHeartbeatDeletePrefersAnExactID(t *testing.T) {
 		"GET /v1/heartbeats":         []Heartbeat{{ID: "hb_1", Name: "a"}, {ID: "hb_2", Name: "hb_1"}, {ID: "hb_3", Name: "dup"}, {ID: "hb_4", Name: "dup"}},
 		"DELETE /v1/heartbeats/hb_1": nil,
 	})
-	if code, stdout, stderr := f.run("-token", testToken, "heartbeat", "delete", "hb_1"); code != 0 || !strings.Contains(stdout, "hb_1") {
+	if code, stdout, stderr := f.run("--token", testToken, "heartbeat", "delete", "hb_1"); code != 0 || !strings.Contains(stdout, "hb_1") {
 		t.Fatalf("exit %d, stdout %q, stderr %q", code, stdout, stderr)
 	}
-	if code, _, stderr := f.run("-token", testToken, "heartbeat", "delete", "dup"); code != exitError || !strings.Contains(stderr, "2 heartbeats match") {
+	if code, _, stderr := f.run("--token", testToken, "heartbeat", "delete", "dup"); code != exitError || !strings.Contains(stderr, "2 heartbeats match") {
 		t.Fatalf("ambiguous: exit %d, stderr %q", code, stderr)
 	}
 }
@@ -460,7 +446,7 @@ func TestHookCommands(t *testing.T) {
 		"DELETE /v1/hooks/hk_2": nil,
 	})
 
-	code, stdout, stderr := f.run("-token", testToken, "hook", "create", "-c", "ops", "alertmanager", "am")
+	code, stdout, stderr := f.run("--token", testToken, "hook", "create", "-c", "ops", "alertmanager", "am")
 	if code != 0 || strings.TrimSpace(stdout) != "https://n.example/v1/hooks/alertmanager/nw_x" || !strings.Contains(stderr, "webhook_configs") {
 		t.Fatalf("exit %d, stdout %q, stderr %q", code, stdout, stderr)
 	}
@@ -468,28 +454,19 @@ func TestHookCommands(t *testing.T) {
 		t.Fatalf("got %+v", got)
 	}
 
-	code, stdout, _ = f.run("-token", testToken, "hooks")
+	code, stdout, _ = f.run("--token", testToken, "hooks")
 	if code != 0 || !strings.Contains(stdout, "alertmanager") || !strings.Contains(stdout, "never") || !strings.Contains(stdout, used.Local().Format(time.DateTime)) {
 		t.Fatalf("exit %d, stdout %q", code, stdout)
 	}
 
-	if code, stdout, stderr = f.run("-token", testToken, "hook", "delete", "ci"); code != 0 || !strings.Contains(stdout, "hk_2") {
+	if code, stdout, stderr = f.run("--token", testToken, "hook", "delete", "ci"); code != 0 || !strings.Contains(stdout, "hk_2") {
 		t.Fatalf("exit %d, stdout %q, stderr %q", code, stdout, stderr)
 	}
-	if code, _, _ = f.run("-token", testToken, "hook", "create", "am"); code != exitUsage {
+	if code, _, _ = f.run("--token", testToken, "hook", "create", "am"); code != exitUsage {
 		t.Fatalf("missing NAME: exit %d", code)
 	}
-	if code, _, _ = f.run("-token", testToken, "hook", "delete", "nosuch"); code != exitError {
+	if code, _, _ = f.run("--token", testToken, "hook", "delete", "nosuch"); code != exitError {
 		t.Fatalf("no match: exit %d", code)
-	}
-	// "hooks" with a body is a message; "hook" with one is a command.
-	sent := len(f.got)
-	f.run("-token", testToken, "hooks", "body")
-	if len(f.got) != sent+1 || f.got[sent].Route != "POST /v1/notifications" || f.got[sent].Body["title"] != "hooks" {
-		t.Fatalf("hooks BODY sent %+v", f.got[sent:])
-	}
-	if code, _, _ = f.run("-token", testToken, "hook", "body"); code != exitUsage {
-		t.Fatalf("hook BODY: exit %d", code)
 	}
 }
 

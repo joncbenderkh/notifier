@@ -28,7 +28,7 @@ if ! systemctl --user is-active --quiet notifyd; then
 	exit 0
 fi
 
-unread=$("$NOTIFYD" history -json -n 0 2>/dev/null |
+unread=$("$NOTIFYD" history --json -n 0 2>/dev/null |
 	jq --arg seen "$(cat "$SEEN" 2>/dev/null)" \
 		'($seen | split("\n")) as $s | [.[] | select(.id | IN($s[]) | not)] | length' 2>/dev/null)
 echo "NTF ${unread:-?}"

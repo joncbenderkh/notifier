@@ -151,7 +151,7 @@ func TestHistoryCommand(t *testing.T) {
 	}
 
 	stdout.Reset()
-	a.run([]string{"history", "-json", "-n", "0"})
+	a.run([]string{"history", "--json", "-n", "0"})
 	var entries []historyEntry
 	if err := json.Unmarshal(stdout.Bytes(), &entries); err != nil || ids(entries) != "m3,m2,m1" {
 		t.Fatalf("json: %v, %q", err, ids(entries))
@@ -165,7 +165,7 @@ func TestHistoryCommand(t *testing.T) {
 		t.Fatalf("clear: exit %d", code)
 	}
 	stdout.Reset()
-	a.run([]string{"history", "-json"})
+	a.run([]string{"history", "--json"})
 	if strings.TrimSpace(stdout.String()) != "[]" {
 		t.Fatalf("after clear: %q", stdout)
 	}
@@ -184,7 +184,7 @@ func TestPairingAndUnpairingClearTheHistory(t *testing.T) {
 	a, _, stderr := newTestApp(t)
 
 	newHistory(a.historyPath, a.now).record(Payload{ID: "from_before"})
-	if code := a.run([]string{"pair", "-server", api.URL, "CODE"}); code != 0 {
+	if code := a.run([]string{"pair", "--server", api.URL, "CODE"}); code != 0 {
 		t.Fatalf("pair: exit %d: %s", code, stderr)
 	}
 	if _, err := os.Stat(a.historyPath); !os.IsNotExist(err) {
