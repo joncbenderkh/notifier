@@ -214,6 +214,39 @@ The URL is the credential, so treat it like an API key. The server checks
 every minute; intervals run from 1 minute to 30 days, grace from 1 minute
 to a day (default 5 minutes), and each user has up to 20 heartbeats.
 
+### Webhooks
+
+A hook lets a monitoring tool notify you in its own alert format, with no
+glue code. Its URL is secret and publishes to one of your channels:
+
+```sh
+notify hook create -c alerts alertmanager prometheus   # prints the URL, once
+```
+
+```yaml
+# alertmanager.yml
+receivers:
+  - name: notifier
+    webhook_configs:
+      - url: https://…/v1/hooks/alertmanager/nw_…
+```
+
+| Format | For | Title | Priority |
+|---|---|---|---|
+| `alertmanager` | Prometheus Alertmanager | `[FIRING:2] HostDown` or `[RESOLVED] HostDown` | high when a firing alert's `severity` label is `critical`, `high`, `page` or `error` |
+| `grafana` | a Grafana contact point of type Webhook | Grafana's own title | as `alertmanager` |
+| `generic` | anything that can POST JSON | `{"title", "body"?, "priority"?}` (`default` or `high`) | as given |
+
+The body lists one line per alert (its `summary` or `description` and
+`instance`), ending with "and N more" when they do not fit. Unknown fields
+are ignored, and text is cleaned and cut to the usual limits rather than
+refused, since a tool cannot be asked to fix it. Payloads may be up to
+1 MiB. When devices exist but none took the alert, the hook answers 503 so
+the tool retries, which can repeat an alert. `notify hooks` lists them;
+`notify hook delete NAME` removes one. Deleting a channel moves its hooks
+to `default`. The URL is the credential, so treat it like an API key; each
+user has up to 20 hooks, and they count toward the send limit.
+
 ### History
 
 The app keeps the notifications it received, so one dismissed by accident
@@ -298,8 +331,8 @@ notify -c homelab "disk full"
 Flags must come before TITLE or the subcommand; everything from TITLE on is
 message text, so a body taken from a variable can never act as a flag. A
 subcommand word counts only in a command's shape: `devices`, `pair`,
-`invite`, `keys`, `channels`, `heartbeats` and `version` alone, and
-`signup`, `config`, `key`, `channel` and `heartbeat` with arguments; so `notify channel` sends a message,
+`invite`, `keys`, `channels`, `heartbeats`, `hooks` and `version` alone, and
+`signup`, `config`, `key`, `channel`, `heartbeat` and `hook` with arguments; so `notify channel` sends a message,
 while `notify channel "$BODY"` is refused rather than guessed. Put `--`
 before a title that starts with `-` or is meant as a message in one of
 those shapes.
@@ -457,6 +490,10 @@ another user's device or key IDs answer 404.
 | `DELETE /v1/heartbeats/{id}`      | User                 | |
 | `GET`/`POST /v1/ping/{secret}`    | The URL              | A check-in; announces a recovery from `down` or `failed` |
 | `GET`/`POST /v1/ping/{secret}/fail` | The URL            | Reports a failure at once; a POSTed body becomes the message |
+| `POST /v1/hooks`                  | User                 | `{"name", "format", "channel"?}` (`alertmanager`, `grafana` or `generic`; channel defaults to `default`). Returns `url`, once. At most 20 per user |
+| `GET /v1/hooks`                   | User                 | With `format`, `channel`, `last_used_at` |
+| `DELETE /v1/hooks/{id}`           | User                 | |
+| `POST /v1/hooks/{format}/{secret}` | The URL             | An alert in the hook's format; 503 asks the tool to retry |
 | `GET /healthz`                    | —                    | |
 
 Limits: title 256 bytes, body 2048 bytes. Titles and bodies may not
