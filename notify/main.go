@@ -30,8 +30,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -299,6 +301,11 @@ func (c *cli) send(n Notification, to []string, body []string) int {
 				return fail(c.stderr, err, c.sendCredName)
 			}
 			text, dropped = strings.TrimRight(string(b), "\r\n"), more
+			if i := strings.IndexByte(text, '\n'); dropped && i >= 0 {
+				// The cut may split a line, and an escape sequence in it.
+				text = text[i+1:]
+			}
+			text = strings.TrimRight(clean(text), "\n")
 		}
 		n.Body = fitBody(text, dropped)
 	}
@@ -442,10 +449,37 @@ func readTail(r io.Reader, max int) (tail []byte, more bool, err error) {
 	}
 }
 
-// fitTitle makes s valid UTF-8 and shortens it to the server's limit,
-// keeping the start and marking the cut.
-func fitTitle(s string) string {
+// terminalEscape matches ANSI escape sequences: CSI (colours, cursor
+// moves), OSC (titles, links), nF (charset choices such as tput's ESC ( B),
+// and the two-byte ones.
+var terminalEscape = regexp.MustCompile(`\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[ -/]+[0-~]|[@-Z\\-_])`)
+
+// clean makes s valid UTF-8 and removes what the server refuses in a
+// message: terminal escapes (a coloured log loses its colours), carriage
+// returns (line ends, or a progress bar's redraws, become newlines), and
+// any other control or bidi override character, replaced with U+FFFD.
+func clean(s string) string {
 	s = strings.ToValidUTF8(s, "\uFFFD")
+	s = terminalEscape.ReplaceAllString(s, "")
+	s = strings.NewReplacer("\r\n", "\n", "\r", "\n").Replace(s)
+	return strings.Map(func(r rune) rune {
+		if r == '\t' || r == '\n' || !unicode.IsControl(r) && !bidiOverride(r) {
+			return r
+		}
+		return '\uFFFD'
+	}, s)
+}
+
+// bidiOverride reports the embeddings, overrides and isolates, which
+// reorder how text is shown; marks and joiners are fine.
+func bidiOverride(r rune) bool {
+	return r >= 0x202A && r <= 0x202E || r >= 0x2066 && r <= 0x2069
+}
+
+// fitTitle cleans s and shortens it to the server's limit, keeping the
+// start and marking the cut.
+func fitTitle(s string) string {
+	s = clean(s)
 	if len(s) <= maxTitleBytes {
 		return s
 	}
@@ -456,12 +490,12 @@ func fitTitle(s string) string {
 	return s[:end] + truncated
 }
 
-// fitBody makes s valid UTF-8 (JSON encoding would otherwise expand each
-// invalid byte to three) and shortens it to the server's limit, keeping the
-// end — for piped logs that is where the error usually is — and marking any
+// fitBody cleans s (invalid UTF-8 would otherwise also cost three bytes
+// of JSON each) and shortens it to the server's limit, keeping the end —
+// for piped logs that is where the error usually is — and marking any
 // cut, including one made earlier while reading.
 func fitBody(s string, dropped bool) string {
-	s = strings.ToValidUTF8(s, "\uFFFD")
+	s = clean(s)
 	if !dropped && len(s) <= maxBodyBytes {
 		return s
 	}

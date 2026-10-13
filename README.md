@@ -280,7 +280,9 @@ those shapes.
 
 A `BODY` of `-` reads standard input, so a long job can report when it
 finishes: `make test 2>&1 | tail -5 | notify "Tests" -`. Only the last 8 KiB
-of a piped stream is held in memory. Invalid UTF-8 is replaced, and text over
+of a piped stream is held in memory. Terminal escapes (colours) are
+removed, carriage returns become newlines, invalid UTF-8 and other
+characters the server refuses are replaced, and text over
 the server's limits is shortened and marked with `…`: a title (256 bytes)
 keeps its start, a body (2048 bytes) keeps its end, where a log's error
 usually is.
