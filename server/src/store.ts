@@ -388,6 +388,13 @@ export async function deleteChannel(db: D1Database, ownerId: string, id: string)
     ...["channel_members", "subscriptions", "channel_invites"].map((table) =>
       db.prepare(`DELETE FROM ${table} WHERE channel_id = ? AND NOT EXISTS (SELECT 1 FROM channels WHERE id = ?)`).bind(id, id),
     ),
+    // Monitoring must not stop silently: heartbeats fall back to default.
+    db
+      .prepare(
+        `UPDATE heartbeats SET channel_id = 'ch_default_' || user_id
+         WHERE channel_id = ? AND NOT EXISTS (SELECT 1 FROM channels WHERE id = ?)`,
+      )
+      .bind(id, id),
   ]);
   return deleted?.meta.changes === 1;
 }
@@ -552,5 +559,201 @@ export async function subscribers(db: D1Database, channelId: string): Promise<De
     )
     .bind(channelId)
     .all<Device>();
+  return results;
+}
+
+// --- heartbeats ---
+
+export interface Heartbeat {
+  id: string;
+  user_id: string;
+  channel_id: string;
+  name: string;
+  interval_s: number;
+  grace_s: number;
+  created_at: number;
+  last_ping_at: number | null;
+  /** When the cron trigger alerts unless a ping comes first. */
+  due_at: number;
+  state: "up" | "down" | "failed";
+  /** When it last went down, failed, or recovered. */
+  changed_at: number;
+  /** A notice that reached no device yet (JSON Notice), or null. */
+  pending_notice: string | null;
+  /** When the cron trigger may next try the pending notice. */
+  notice_due_at: number | null;
+}
+
+const HEARTBEAT_COLUMNS =
+  "h.id, h.user_id, h.channel_id, h.name, h.interval_s, h.grace_s, h.created_at, h.last_ping_at, h.due_at, h.state, h.changed_at, h.pending_notice, h.notice_due_at";
+
+/**
+ * Stores a heartbeat unless the user has one of that name ("exists"), already
+ * has [max] ("full"), or its channel was deleted meanwhile ("gone").
+ */
+export async function createHeartbeat(
+  db: D1Database,
+  h: Heartbeat,
+  secretHash: string,
+  max: number,
+): Promise<"created" | "exists" | "full" | "gone"> {
+  const { meta } = await db
+    .prepare(
+      `INSERT INTO heartbeats (id, user_id, channel_id, name, secret_hash, interval_s, grace_s, created_at, due_at, state, changed_at)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, 'up', ?
+       WHERE (SELECT count(*) FROM heartbeats WHERE user_id = ?) < ?
+         AND NOT EXISTS (SELECT 1 FROM heartbeats WHERE user_id = ? AND name = ?)
+         AND EXISTS (SELECT 1 FROM channels WHERE id = ? AND owner_id = ?)`,
+    )
+    .bind(h.id, h.user_id, h.channel_id, h.name, secretHash, h.interval_s, h.grace_s, h.created_at, h.due_at, h.created_at, h.user_id, max, h.user_id, h.name, h.channel_id, h.user_id)
+    .run();
+  if (meta.changes === 1) return "created";
+  const named = await db.prepare("SELECT 1 FROM heartbeats WHERE user_id = ? AND name = ?").bind(h.user_id, h.name).first();
+  if (named) return "exists";
+  const channel = await db.prepare("SELECT 1 FROM channels WHERE id = ?").bind(h.channel_id).first();
+  return channel ? "full" : "gone";
+}
+
+/** The user's heartbeats with the name of the channel each alerts. */
+export async function listHeartbeats(db: D1Database, userId: string): Promise<(Heartbeat & { channel_name: string })[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT ${HEARTBEAT_COLUMNS}, coalesce(c.name, 'default') AS channel_name FROM heartbeats h
+       LEFT JOIN channels c ON c.id = h.channel_id
+       WHERE h.user_id = ? ORDER BY h.name`,
+    )
+    .bind(userId)
+    .all<Heartbeat & { channel_name: string }>();
+  return results;
+}
+
+export async function deleteHeartbeat(db: D1Database, userId: string, id: string): Promise<boolean> {
+  const { meta } = await db.prepare("DELETE FROM heartbeats WHERE id = ? AND user_id = ?").bind(id, userId).run();
+  return meta.changes === 1;
+}
+
+/** The heartbeat a ping URL's secret belongs to; nothing for a disabled user's. */
+export async function heartbeatBySecretHash(db: D1Database, secretHash: string): Promise<Heartbeat | null> {
+  return db
+    .prepare(`SELECT ${HEARTBEAT_COLUMNS} FROM heartbeats h ${activeOwner("h")} WHERE h.secret_hash = ?`)
+    .bind(secretHash)
+    .first<Heartbeat>();
+}
+
+/**
+ * Records a check-in: the next one is due an interval (plus grace) from now.
+ * [failed] marks it failed instead of up. Returns the state it left, with
+ * when it entered it, if this ping changed it (of two concurrent pings, only
+ * one does), or null. The batch is one transaction, so a cron run cannot
+ * change the state between the read and the update.
+ */
+export async function recordPing(
+  db: D1Database,
+  id: string,
+  now: number,
+  failed: boolean,
+): Promise<Pick<Heartbeat, "state" | "changed_at"> | null> {
+  const state = failed ? "failed" : "up";
+  const [before, changed] = await db.batch([
+    db.prepare("SELECT state, changed_at FROM heartbeats WHERE id = ?").bind(id),
+    db
+      .prepare("UPDATE heartbeats SET state = ?, changed_at = ? WHERE id = ? AND state != ?")
+      .bind(state, now, id, state),
+    db
+      .prepare("UPDATE heartbeats SET last_ping_at = ?, due_at = ? + interval_s + grace_s WHERE id = ?")
+      .bind(now, now, id),
+  ]);
+  if (changed?.meta.changes !== 1) return null;
+  return (before?.results[0] as Pick<Heartbeat, "state" | "changed_at"> | undefined) ?? null;
+}
+
+/**
+ * Heartbeats of enabled users whose check-in is overdue, the most overdue
+ * first. A failed one is checked too: a job that reported a failure and then
+ * stopped running is still missing.
+ */
+export async function dueHeartbeats(db: D1Database, now: number, limit: number): Promise<Heartbeat[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT ${HEARTBEAT_COLUMNS} FROM heartbeats h ${activeOwner("h")}
+       WHERE h.state IN ('up', 'failed') AND h.due_at <= ? ORDER BY h.due_at LIMIT ?`,
+    )
+    .bind(now, limit)
+    .all<Heartbeat>();
+  return results;
+}
+
+/**
+ * Marks an overdue heartbeat down; false if a ping or another run got there
+ * first. A pending recovery notice is dropped, since the missed check-in
+ * contradicts it; a pending failure notice, with the job's log, stays.
+ */
+export async function markDown(db: D1Database, id: string, now: number): Promise<boolean> {
+  const { meta } = await db
+    .prepare(
+      `UPDATE heartbeats SET state = 'down', changed_at = ?,
+         notice_due_at = CASE WHEN json_extract(pending_notice, '$.kind') = 'recovered' THEN NULL ELSE notice_due_at END,
+         pending_notice = CASE WHEN json_extract(pending_notice, '$.kind') = 'recovered' THEN NULL ELSE pending_notice END
+       WHERE id = ? AND state IN ('up', 'failed') AND due_at <= ?`,
+    )
+    .bind(now, id, now)
+    .run();
+  return meta.changes === 1;
+}
+
+/**
+ * Undoes markDown when its alert reached nobody, so a later run tries again;
+ * not if a ping has come in since. The retry is due at [retryAt], behind
+ * heartbeats that went overdue earlier, so failing ones cannot crowd the
+ * rest out of a run. A notice markDown dropped is put back.
+ */
+export async function unmarkDown(db: D1Database, hb: Heartbeat, markedAt: number, retryAt: number): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE heartbeats SET state = ?, changed_at = ?, due_at = ?, pending_notice = ?, notice_due_at = ?
+       WHERE id = ? AND state = 'down' AND changed_at = ?`,
+    )
+    .bind(hb.state, hb.changed_at, retryAt, hb.pending_notice, hb.notice_due_at, hb.id, markedAt)
+    .run();
+}
+
+/**
+ * Keeps [notice] as the heartbeat's pending notice, replacing an older one,
+ * not to be tried by the cron trigger before [dueAt].
+ */
+export async function setPendingNotice(db: D1Database, id: string, notice: string, dueAt: number): Promise<void> {
+  await db.prepare("UPDATE heartbeats SET pending_notice = ?, notice_due_at = ? WHERE id = ?").bind(notice, dueAt, id).run();
+}
+
+/**
+ * Moves a pending notice's next try to [dueAt] if it is still [notice] and,
+ * when [ifDueBy] is given, due by then. As a claim, of two cron runs only
+ * one gets true.
+ */
+export async function deferNotice(db: D1Database, id: string, notice: string, dueAt: number, ifDueBy?: number): Promise<boolean> {
+  const { meta } = await db
+    .prepare("UPDATE heartbeats SET notice_due_at = ? WHERE id = ? AND pending_notice = ? AND notice_due_at <= ?")
+    .bind(dueAt, id, notice, ifDueBy ?? Number.MAX_SAFE_INTEGER)
+    .run();
+  return meta.changes === 1;
+}
+
+/** Clears a pending notice once delivered, unless a newer one replaced it meanwhile. */
+export async function clearPendingNotice(db: D1Database, id: string, notice: string): Promise<void> {
+  await db
+    .prepare("UPDATE heartbeats SET pending_notice = NULL, notice_due_at = NULL WHERE id = ? AND pending_notice = ?")
+    .bind(id, notice)
+    .run();
+}
+
+/** Heartbeats of enabled users with a notice due for a retry, the longest waiting first. */
+export async function pendingNotices(db: D1Database, now: number, limit: number): Promise<Heartbeat[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT ${HEARTBEAT_COLUMNS} FROM heartbeats h ${activeOwner("h")}
+       WHERE h.pending_notice IS NOT NULL AND h.notice_due_at <= ? ORDER BY h.notice_due_at LIMIT ?`,
+    )
+    .bind(now, limit)
+    .all<Heartbeat>();
   return results;
 }

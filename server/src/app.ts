@@ -14,6 +14,16 @@ import { Hono } from "hono";
 import type { Context, MiddlewareHandler } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { HTTPException } from "hono/http-exception";
+import {
+  DEFAULT_GRACE_SECONDS,
+  HEARTBEAT_SECRET_PREFIX,
+  heartbeatAlerts,
+  MAX_GRACE_SECONDS,
+  MAX_HEARTBEATS_PER_USER,
+  MAX_INTERVAL_SECONDS,
+  MIN_GRACE_SECONDS,
+  MIN_INTERVAL_SECONDS,
+} from "./heartbeats";
 import { pairPageRoutes } from "./pairPage";
 import { toBase64 } from "./encoding";
 import { joinUri, pairingUri, qrSvg } from "./pairing";
@@ -22,6 +32,7 @@ import { addSubscribers, channelLabel, publisher } from "./publish";
 import type { Target } from "./publish";
 import type { Stream } from "./stream";
 import { newSealKey } from "./seal";
+import { cleanTail, UNSAFE_IN_NAME, UNSAFE_IN_TEXT, utf8Length } from "./text";
 import * as store from "./store";
 import type { Channel, Device, User } from "./store";
 import {
@@ -52,18 +63,10 @@ export const MAX_PENDING_INVITES_PER_CHANNEL = 10;
 export const MAX_CHANNELS_PER_REQUEST = 20;
 const CHANNEL_NAME = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 const MAX_REQUEST_BYTES = 16 * 1024;
+const MAX_PING_BYTES = 1024 * 1024;
 const MAX_TITLE_BYTES = 256;
 const MAX_BODY_BYTES = 2048;
 const MAX_NAME_BYTES = 64;
-/**
- * Characters a client could be spoofed or driven by: C0 and C1 controls
- * and DEL (terminal escapes), and the bidi embeddings, overrides and
- * isolates (reordering what is shown). Bidi marks and joiners stay
- * allowed: right-to-left text and emoji sequences need them.
- */
-const UNSAFE_IN_NAME = /[\p{Cc}\u202A-\u202E\u2066-\u2069]/u;
-/** As in names, but a message may span lines and hold tabs. */
-const UNSAFE_IN_TEXT = /[^\P{Cc}\t\n]|[\u202A-\u202E\u2066-\u2069]/u;
 const MIN_ADMIN_TOKEN_LENGTH = 32;
 
 export interface Deps {
@@ -107,7 +110,6 @@ export interface Delivery {
   error?: string;
 }
 
-const utf8Length = (s: string) => new TextEncoder().encode(s).length;
 const iso = (seconds: number) => new Date(seconds * 1000).toISOString().replace(".000Z", "Z");
 
 function fail(status: 400 | 401 | 403 | 404 | 409 | 426 | 429 | 503, message: string): never {
@@ -299,8 +301,24 @@ export function createApp(deps: Deps): Hono<AppEnv> {
   }
 
   const { deliver, publish } = publisher(deps);
+  const alerts = heartbeatAlerts(deps);
 
-  app.use("*", bodyLimit({ maxSize: MAX_REQUEST_BYTES, onError: (c) => c.json({ error: "request too large" }, 413) }));
+  /** Whole seconds within [min, max], or [fallback] when absent. */
+  function seconds(raw: unknown, field: string, min: number, max: number, fallback?: number): number {
+    if ((raw === undefined || raw === null) && fallback !== undefined) return fallback;
+    if (typeof raw !== "number" || !Number.isInteger(raw) || raw < min || raw > max) {
+      fail(400, `${field} must be whole seconds from ${min} to ${max}`);
+    }
+    return raw;
+  }
+
+  // A failure report may post a whole log, of which only the tail is kept.
+  const tooLarge = (c: Context) => c.json({ error: "request too large" }, 413);
+  const apiLimit: MiddlewareHandler<AppEnv> = bodyLimit({ maxSize: MAX_REQUEST_BYTES, onError: tooLarge });
+  const pingLimit: MiddlewareHandler<AppEnv> = bodyLimit({ maxSize: MAX_PING_BYTES, onError: tooLarge });
+  const limit: MiddlewareHandler<AppEnv> = (c, next) =>
+    c.req.path.startsWith("/v1/ping/") ? pingLimit(c, next) : apiLimit(c, next);
+  app.use("*", limit);
 
   app.get("/healthz", (c) => c.json({ status: "ok" }));
   pairPageRoutes(app);
@@ -648,6 +666,101 @@ export function createApp(deps: Deps): Hono<AppEnv> {
       sent_at: deps.now(),
     };
     return c.json({ id: p.id, deliveries: [await deliver(c.env, c.get("device"), p)] });
+  });
+
+  // --- heartbeats ---
+
+  app.post("/v1/heartbeats", user, async (c) => {
+    const req = await readJson<{ name: string; interval: number; grace: number; channel: string }>(c, [
+      "name",
+      "interval",
+      "grace",
+      "channel",
+    ]);
+    const userId = c.get("userId");
+    const name = validName(req.name);
+    const interval = seconds(req.interval, "interval", MIN_INTERVAL_SECONDS, MAX_INTERVAL_SECONDS);
+    const grace = seconds(req.grace, "grace", MIN_GRACE_SECONDS, MAX_GRACE_SECONDS, DEFAULT_GRACE_SECONDS);
+    const [channel] = await ownedChannels(c.env.DB, userId, channelNames([req.channel ?? "default"]));
+    const now = deps.now();
+    const hb: store.Heartbeat = {
+      id: newId("hb_"),
+      user_id: userId,
+      channel_id: channel!.id,
+      name,
+      interval_s: interval,
+      grace_s: grace,
+      created_at: now,
+      last_ping_at: null,
+      due_at: now + interval + grace,
+      state: "up",
+      changed_at: now,
+      pending_notice: null,
+      notice_due_at: null,
+    };
+    const secret = newSecret(HEARTBEAT_SECRET_PREFIX);
+    const created = await store.createHeartbeat(c.env.DB, hb, await sha256Hex(secret), MAX_HEARTBEATS_PER_USER);
+    if (created === "exists") fail(409, `you already have a heartbeat named "${name}"`);
+    if (created === "full") fail(403, `at most ${MAX_HEARTBEATS_PER_USER} heartbeats per user`);
+    if (created === "gone") fail(404, `you have no channel named "${channel!.name}"`);
+    return c.json(
+      {
+        id: hb.id,
+        name,
+        channel: channel!.name,
+        interval,
+        grace,
+        ping_url: `${new URL(c.req.url).origin}/v1/ping/${secret}`,
+        created_at: iso(now),
+      },
+      201,
+    );
+  });
+
+  app.get("/v1/heartbeats", user, async (c) => {
+    const heartbeats = await store.listHeartbeats(c.env.DB, c.get("userId"));
+    return c.json(
+      heartbeats.map((hb) => ({
+        id: hb.id,
+        name: hb.name,
+        channel: hb.channel_name,
+        interval: hb.interval_s,
+        grace: hb.grace_s,
+        state: hb.state,
+        ...(hb.last_ping_at === null ? {} : { last_ping_at: iso(hb.last_ping_at) }),
+        due_at: iso(hb.due_at),
+        created_at: iso(hb.created_at),
+      })),
+    );
+  });
+
+  app.delete("/v1/heartbeats/:id", user, async (c) => {
+    if (!(await store.deleteHeartbeat(c.env.DB, c.get("userId"), c.req.param("id")))) fail(404, "not found");
+    return c.body(null, 204);
+  });
+
+  // The secret in the path is the credential, so cron jobs need only curl.
+  app.on(["GET", "POST"], ["/v1/ping/:secret", "/v1/ping/:secret/fail"], async (c) => {
+    const secret = c.req.param("secret");
+    const hb = secret.startsWith(HEARTBEAT_SECRET_PREFIX)
+      ? await store.heartbeatBySecretHash(c.env.DB, await sha256Hex(secret))
+      : null;
+    if (!hb) fail(404, "no such heartbeat");
+    // Link checkers and unfurlers send HEAD; only a real request counts.
+    if (c.req.method === "HEAD") return c.body(null, 200);
+    if (!(await c.env.NOTIFY_LIMITER.limit({ key: `ping:${hb.id}` })).success) fail(429, "too many pings; try again in a minute");
+    const failed = c.req.path.endsWith("/fail");
+    const details = failed && c.req.method === "POST" ? cleanTail(await c.req.text(), MAX_BODY_BYTES) : "";
+    const left = await store.recordPing(c.env.DB, hb.id, deps.now(), failed);
+    // Every reported failure is news; a plain ping only when it ends a
+    // failure or outage. Past the user's send limit, the notice waits for
+    // the cron trigger (one a minute per heartbeat) instead of going out now.
+    if (failed || left) {
+      const later = !(await c.env.NOTIFY_LIMITER.limit({ key: hb.user_id })).success;
+      if (failed) await alerts.failed(c.env, hb, details, later);
+      else await alerts.recovered(c.env, hb, left!, later);
+    }
+    return c.json({ state: failed ? "failed" : "up" });
   });
 
   // --- notifications ---
