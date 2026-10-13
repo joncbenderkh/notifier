@@ -15,12 +15,13 @@ import type { Context, MiddlewareHandler } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { HTTPException } from "hono/http-exception";
 import { pairPageRoutes } from "./pairPage";
-import { fromBase64, toBase64 } from "./encoding";
+import { toBase64 } from "./encoding";
 import { joinUri, pairingUri, qrSvg } from "./pairing";
-import { UnregisteredError } from "./push";
 import type { Sender } from "./push";
+import { addSubscribers, channelLabel, publisher } from "./publish";
+import type { Target } from "./publish";
 import type { Stream } from "./stream";
-import { newSealKey, seal } from "./seal";
+import { newSealKey } from "./seal";
 import * as store from "./store";
 import type { Channel, Device, User } from "./store";
 import {
@@ -38,7 +39,7 @@ import {
 
 export const PAIRING_TTL_SECONDS = 10 * 60;
 export const INVITE_TTL_SECONDS = 7 * 24 * 60 * 60;
-export const MESSAGE_TTL_SECONDS = 24 * 60 * 60;
+export { MESSAGE_TTL_SECONDS } from "./publish";
 export const MAX_DEVICES_PER_USER = 20;
 export const MAX_API_KEYS_PER_USER = 20;
 export const MAX_INVITES_PER_USER = 10;
@@ -63,7 +64,6 @@ const MAX_NAME_BYTES = 64;
 const UNSAFE_IN_NAME = /[\p{Cc}\u202A-\u202E\u2066-\u2069]/u;
 /** As in names, but a message may span lines and hold tabs. */
 const UNSAFE_IN_TEXT = /[^\P{Cc}\t\n]|[\u202A-\u202E\u2066-\u2069]/u;
-const ENVELOPE_VERSION = "1";
 const MIN_ADMIN_TOKEN_LENGTH = 32;
 
 export interface Deps {
@@ -173,9 +173,6 @@ async function apiKeyFromToken(c: Context<AppEnv>, now: number): Promise<store.A
   if (!secret.startsWith(API_KEY_PREFIX)) return null;
   return store.apiKeyByHash(c.env.DB, await sha256Hex(secret), now);
 }
-
-/** How a member sees a channel: bare when they own it, "owner/name" otherwise. */
-const channelLabel = (ch: Channel, viewer: string) => (ch.owner_id === viewer ? ch.name : `${ch.owner_name}/${ch.name}`);
 
 function stringList(raw: unknown, field: string): string[] {
   if (raw === undefined || raw === null) return [];
@@ -301,34 +298,7 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     return store.deleteDevice(env.DB, userId, deviceId);
   }
 
-  async function deliver(env: Env, d: Device, p: Payload): Promise<Delivery> {
-    if (d.transport === "fcm" && d.fcm_token === "") return { device_id: d.id, status: "unreachable" };
-    try {
-      const envelope = await seal(fromBase64(d.seal_key), d.id, new TextEncoder().encode(JSON.stringify(p)));
-      const data = { v: ENVELOPE_VERSION, n: toBase64(envelope.nonce), c: toBase64(envelope.ciphertext) };
-      if (d.transport === "ws") {
-        const status = await deps.stream(env, d.id).deliver({
-          id: p.id,
-          frame: JSON.stringify({ type: "message", id: p.id, ...data }),
-          expiresAt: deps.now() + MESSAGE_TTL_SECONDS,
-        });
-        return { device_id: d.id, status };
-      }
-      await deps.sender(env).send({ token: d.fcm_token, high: p.priority === "high", ttlSeconds: MESSAGE_TTL_SECONDS, data });
-      return { device_id: d.id, status: "sent" };
-    } catch (err) {
-      if (err instanceof UnregisteredError) {
-        console.warn("push token unregistered; clearing", d.id);
-        // Other devices may already have been sent to; never turn this into a 500.
-        await store.setFcmToken(env.DB, d.id, "").catch((dbErr: unknown) => {
-          console.error("clear push token failed", d.id, dbErr);
-        });
-        return { device_id: d.id, status: "unreachable" };
-      }
-      console.error("push send failed", d.id, err);
-      return { device_id: d.id, status: "failed", error: "push transport error" };
-    }
-  }
+  const { deliver, publish } = publisher(deps);
 
   app.use("*", bodyLimit({ maxSize: MAX_REQUEST_BYTES, onError: (c) => c.json({ error: "request too large" }, 413) }));
 
@@ -715,12 +685,8 @@ export function createApp(deps: Deps): Hono<AppEnv> {
 
     // Each device gets the message once, labelled with the first requested
     // channel it subscribes to; devices named directly carry no channel.
-    const targets = new Map<string, { device: Device; channel?: Channel }>();
-    for (const ch of channels) {
-      for (const d of await store.subscribers(c.env.DB, ch.id)) {
-        if (!targets.has(d.id)) targets.set(d.id, { device: d, channel: ch });
-      }
-    }
+    const targets = new Map<string, Target>();
+    await addSubscribers(c.env.DB, channels, targets);
     if (ids.length > 0) {
       const own = await store.listDevices(c.env.DB, userId);
       const unknown = ids.find((id) => !own.some((d) => d.id === id));
@@ -733,25 +699,7 @@ export function createApp(deps: Deps): Hono<AppEnv> {
 
     const base: Payload = { id: newId("msg_"), title, priority, sent_at: deps.now() };
     if (body !== "") base.body = body;
-    // A failed warm-up (including a missing or invalid FCM_SERVICE_ACCOUNT)
-    // is not fatal: each send retries and reports per device.
-    try {
-      await deps.sender(c.env).prepare?.();
-    } catch (err) {
-      console.error("push prepare failed", err);
-    }
-    const all = await Promise.all(
-      [...targets.values()].map(async ({ device: d, channel: ch }) => ({
-        own: d.user_id === userId,
-        delivery: await deliver(c.env, d, ch ? { ...base, channel: channelLabel(ch, d.user_id), channel_id: ch.id } : base),
-      })),
-    );
-    // Other members' device IDs are theirs to know; the sender gets counts.
-    const deliveries = all.filter((x) => x.own).map((x) => x.delivery);
-    const members: Partial<Record<Delivery["status"], number>> = {};
-    for (const { own, delivery } of all) {
-      if (!own) members[delivery.status] = (members[delivery.status] ?? 0) + 1;
-    }
+    const { deliveries, members } = await publish(c.env, userId, targets.values(), base);
     return c.json({ id: base.id, deliveries, ...(Object.keys(members).length > 0 ? { members } : {}) });
   });
 
