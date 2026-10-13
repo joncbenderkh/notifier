@@ -449,6 +449,50 @@ func TestHeartbeatDeletePrefersAnExactID(t *testing.T) {
 	}
 }
 
+func TestHookCommands(t *testing.T) {
+	used := time.Now()
+	f := newFakeAPI(t, map[string]any{
+		"POST /v1/hooks": Hook{ID: "hk_1", Name: "am", Format: "alertmanager", URL: "https://n.example/v1/hooks/alertmanager/nw_x"},
+		"GET /v1/hooks": []Hook{
+			{ID: "hk_1", Name: "am", Format: "alertmanager", Channel: "ops"},
+			{ID: "hk_2", Name: "ci", Format: "generic", Channel: "default", LastUsedAt: &used},
+		},
+		"DELETE /v1/hooks/hk_2": nil,
+	})
+
+	code, stdout, stderr := f.run("-token", testToken, "hook", "create", "-c", "ops", "alertmanager", "am")
+	if code != 0 || strings.TrimSpace(stdout) != "https://n.example/v1/hooks/alertmanager/nw_x" || !strings.Contains(stderr, "webhook_configs") {
+		t.Fatalf("exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+	if got := f.got[0].Body; got["name"] != "am" || got["format"] != "alertmanager" || got["channel"] != "ops" {
+		t.Fatalf("got %+v", got)
+	}
+
+	code, stdout, _ = f.run("-token", testToken, "hooks")
+	if code != 0 || !strings.Contains(stdout, "alertmanager") || !strings.Contains(stdout, "never") || !strings.Contains(stdout, used.Local().Format(time.DateTime)) {
+		t.Fatalf("exit %d, stdout %q", code, stdout)
+	}
+
+	if code, stdout, stderr = f.run("-token", testToken, "hook", "delete", "ci"); code != 0 || !strings.Contains(stdout, "hk_2") {
+		t.Fatalf("exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+	if code, _, _ = f.run("-token", testToken, "hook", "create", "am"); code != exitUsage {
+		t.Fatalf("missing NAME: exit %d", code)
+	}
+	if code, _, _ = f.run("-token", testToken, "hook", "delete", "nosuch"); code != exitError {
+		t.Fatalf("no match: exit %d", code)
+	}
+	// "hooks" with a body is a message; "hook" with one is a command.
+	sent := len(f.got)
+	f.run("-token", testToken, "hooks", "body")
+	if len(f.got) != sent+1 || f.got[sent].Route != "POST /v1/notifications" || f.got[sent].Body["title"] != "hooks" {
+		t.Fatalf("hooks BODY sent %+v", f.got[sent:])
+	}
+	if code, _, _ = f.run("-token", testToken, "hook", "body"); code != exitUsage {
+		t.Fatalf("hook BODY: exit %d", code)
+	}
+}
+
 func TestParseEvery(t *testing.T) {
 	good := map[string]time.Duration{"30m": 30 * time.Minute, "6h": 6 * time.Hour, "1d": 24 * time.Hour, "2d6h30m": 54*time.Hour + 30*time.Minute, "90s": 90 * time.Second}
 	for in, want := range good {

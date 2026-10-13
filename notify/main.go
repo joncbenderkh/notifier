@@ -88,6 +88,9 @@ const usage = `Usage:
   notify heartbeats
   notify heartbeat create [-every 1d] [-grace 5m] [-c CHANNEL] NAME
   notify heartbeat delete NAME|ID
+  notify hooks
+  notify hook create [-c CHANNEL] FORMAT NAME
+  notify hook delete NAME|ID
   notify version
 
 Flags must come before TITLE or the subcommand.
@@ -102,8 +105,8 @@ Flags:
 // with a usage error instead of acting.
 var subcommands = map[string]bool{
 	"version": false, "invite": false, "devices": false, "pair": false, "keys": false, "channels": false,
-	"heartbeats": false,
-	"config":     true, "signup": true, "key": true, "channel": true, "heartbeat": true,
+	"heartbeats": false, "hooks": false,
+	"config": true, "signup": true, "key": true, "channel": true, "heartbeat": true, "hook": true,
 }
 
 // isSubcommand reports whether rest starts a command rather than a message.
@@ -215,6 +218,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, transport htt
 		return c.heartbeats(rest)
 	case "heartbeat":
 		return c.heartbeat(rest)
+	case "hooks":
+		return c.hooks(rest)
+	case "hook":
+		return c.hook(rest)
 	}
 
 	if len(rest) < 1 || len(rest) > 2 {

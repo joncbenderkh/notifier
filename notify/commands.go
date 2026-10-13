@@ -530,17 +530,7 @@ func (c *cli) heartbeat(argv []string) int {
 		if err != nil {
 			return fail(c.stderr, err, "user token")
 		}
-		// An exact ID wins, even over a heartbeat named like it.
-		var matches []Heartbeat
-		for _, hb := range hbs {
-			if hb.ID == args[0] {
-				matches = []Heartbeat{hb}
-				break
-			}
-			if hb.Name == args[0] {
-				matches = append(matches, hb)
-			}
-		}
+		matches := byIDOrName(hbs, args[0], func(hb Heartbeat) (string, string) { return hb.ID, hb.Name })
 		if len(matches) != 1 {
 			fmt.Fprintf(c.stderr, "notify: %d heartbeats match %q; use an ID from `notify heartbeats`\n", len(matches), args[0])
 			return exitError
@@ -552,6 +542,120 @@ func (c *cli) heartbeat(argv []string) int {
 		return 0
 	}
 	fmt.Fprintln(c.stderr, "Usage: notify heartbeat create [-every 1d] [-grace 5m] [-c CHANNEL] NAME\n       notify heartbeat delete NAME|ID")
+	return exitUsage
+}
+
+// byIDOrName returns the items [arg] names: an exact ID wins, even over
+// an item named like it; otherwise every item of that name.
+func byIDOrName[T any](items []T, arg string, idName func(T) (string, string)) []T {
+	var matches []T
+	for _, it := range items {
+		id, name := idName(it)
+		if id == arg {
+			return []T{it}
+		}
+		if name == arg {
+			matches = append(matches, it)
+		}
+	}
+	return matches
+}
+
+func (c *cli) hooks(argv []string) int {
+	if _, ok := c.subFlags("hooks", "", argv, 0, 0, nil); !ok {
+		return exitUsage
+	}
+	client, ok := c.userClient()
+	if !ok {
+		return exitUsage
+	}
+	ctx, cancel := c.context()
+	defer cancel()
+	hooks, err := client.Hooks(ctx)
+	if err != nil {
+		return fail(c.stderr, err, "user token")
+	}
+	w := table(c.stdout, "ID\tNAME\tFORMAT\tCHANNEL\tLAST USED")
+	for _, h := range hooks {
+		last := "never"
+		if h.LastUsedAt != nil {
+			last = h.LastUsedAt.Local().Format(time.DateTime)
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", h.ID, h.Name, h.Format, h.Channel, last)
+	}
+	w.Flush()
+	return 0
+}
+
+// hookHints tell how to point each format's tool at a hook's URL.
+var hookHints = map[string]string{
+	"alertmanager": "In alertmanager.yml:\n" +
+		"  receivers:\n" +
+		"    - name: notifier\n" +
+		"      webhook_configs:\n" +
+		"        - url: %s\n",
+	"grafana": "In Grafana, add a contact point of type Webhook with this URL:\n  %s\n",
+	"generic": "POST JSON to it:\n" +
+		"  curl -fsS -m 10 -d '{\"title\":\"Deploy done\",\"body\":\"v1.2.3\",\"priority\":\"default\"}' %s\n",
+}
+
+func (c *cli) hook(argv []string) int {
+	action := ""
+	if len(argv) > 0 {
+		action, argv = argv[0], argv[1:]
+	}
+	switch action {
+	case "create":
+		channel := ""
+		args, ok := c.subFlags("hook create", "[-c CHANNEL] FORMAT NAME", argv, 2, 2, func(fs *flag.FlagSet) {
+			fs.StringVar(&channel, "c", channel, "publish to this `channel`, which you own (default: default)")
+		})
+		if !ok {
+			return exitUsage
+		}
+		client, ok := c.userClient()
+		if !ok {
+			return exitUsage
+		}
+		ctx, cancel := c.context()
+		defer cancel()
+		h, err := client.CreateHook(ctx, args[1], args[0], channel)
+		if err != nil {
+			return fail(c.stderr, err, "user token")
+		}
+		fmt.Fprintf(c.stdout, "%s\n", h.URL)
+		fmt.Fprintf(c.stderr, "Created hook %s (%s); its URL is shown only this once.\n", h.Name, h.ID)
+		if hint, ok := hookHints[h.Format]; ok {
+			fmt.Fprintf(c.stderr, hint, h.URL)
+		}
+		return 0
+	case "delete":
+		args, ok := c.subFlags("hook delete", "NAME|ID", argv, 1, 1, nil)
+		if !ok {
+			return exitUsage
+		}
+		client, ok := c.userClient()
+		if !ok {
+			return exitUsage
+		}
+		ctx, cancel := c.context()
+		defer cancel()
+		hooks, err := client.Hooks(ctx)
+		if err != nil {
+			return fail(c.stderr, err, "user token")
+		}
+		matches := byIDOrName(hooks, args[0], func(h Hook) (string, string) { return h.ID, h.Name })
+		if len(matches) != 1 {
+			fmt.Fprintf(c.stderr, "notify: %d hooks match %q; use an ID from `notify hooks`\n", len(matches), args[0])
+			return exitError
+		}
+		if err := client.DeleteHook(ctx, matches[0].ID); err != nil {
+			return fail(c.stderr, err, "user token")
+		}
+		fmt.Fprintln(c.stdout, "Deleted hook", matches[0].ID)
+		return 0
+	}
+	fmt.Fprintln(c.stderr, "Usage: notify hook create [-c CHANNEL] FORMAT NAME\n       notify hook delete NAME|ID\nFormats: alertmanager, grafana, generic")
 	return exitUsage
 }
 

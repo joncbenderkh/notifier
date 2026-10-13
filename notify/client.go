@@ -310,3 +310,33 @@ func (c *Client) CreateHeartbeat(ctx context.Context, name string, interval, gra
 func (c *Client) DeleteHeartbeat(ctx context.Context, id string) error {
 	return c.do(ctx, http.MethodDelete, "/v1/heartbeats/"+url.PathEscape(id), nil, nil)
 }
+
+type Hook struct {
+	ID         string     `json:"id"`
+	Name       string     `json:"name"`
+	Format     string     `json:"format"`
+	Channel    string     `json:"channel"`
+	URL        string     `json:"url,omitempty"`
+	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
+}
+
+func (c *Client) Hooks(ctx context.Context) ([]Hook, error) {
+	var hooks []Hook
+	return hooks, c.do(ctx, http.MethodGet, "/v1/hooks", nil, &hooks)
+}
+
+// CreateHook creates a hook reading [format] that publishes to [channel],
+// or default when empty.
+func (c *Client) CreateHook(ctx context.Context, name, format, channel string) (Hook, error) {
+	in := struct {
+		Name    string `json:"name"`
+		Format  string `json:"format"`
+		Channel string `json:"channel,omitempty"`
+	}{name, format, channel}
+	var h Hook
+	return h, c.do(ctx, http.MethodPost, "/v1/hooks", in, &h)
+}
+
+func (c *Client) DeleteHook(ctx context.Context, id string) error {
+	return c.do(ctx, http.MethodDelete, "/v1/hooks/"+url.PathEscape(id), nil, nil)
+}
