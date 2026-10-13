@@ -640,31 +640,39 @@ export async function heartbeatBySecretHash(db: D1Database, secretHash: string):
     .first<Heartbeat>();
 }
 
+/** What recordPing saw: the state a ping left, if it changed it, and its place in line. */
+export interface Ping {
+  /** The state the ping ended, with when it began; null if it changed nothing. */
+  left: Pick<Heartbeat, "state" | "changed_at"> | null;
+  /** Its ping_seq, which setPendingNotice requires to still be current. */
+  seq: number;
+}
+
 /**
  * Records a check-in: the next one is due an interval (plus grace) from now.
- * [failed] marks it failed instead of up. Returns the state it left, with
- * when it entered it, if this ping changed it (of two concurrent pings, only
- * one does), or null. The batch is one transaction, so a cron run cannot
- * change the state between the read and the update.
+ * [failed] marks it failed instead of up. Of two concurrent pings, only one
+ * changes the state. A ping that announces something (a failure, or the end
+ * of one or of an outage) advances ping_seq. The batch is one transaction,
+ * so a cron run cannot change the state between the read and the update.
  */
-export async function recordPing(
-  db: D1Database,
-  id: string,
-  now: number,
-  failed: boolean,
-): Promise<Pick<Heartbeat, "state" | "changed_at"> | null> {
+export async function recordPing(db: D1Database, id: string, now: number, failed: boolean): Promise<Ping> {
   const state = failed ? "failed" : "up";
-  const [before, changed] = await db.batch([
+  const results = await db.batch([
     db.prepare("SELECT state, changed_at FROM heartbeats WHERE id = ?").bind(id),
     db
-      .prepare("UPDATE heartbeats SET state = ?, changed_at = ? WHERE id = ? AND state != ?")
+      .prepare("UPDATE heartbeats SET state = ?, changed_at = ?, ping_seq = ping_seq + 1 WHERE id = ? AND state != ?")
       .bind(state, now, id, state),
     db
-      .prepare("UPDATE heartbeats SET last_ping_at = ?, due_at = ? + interval_s + grace_s WHERE id = ?")
-      .bind(now, now, id),
+      .prepare(
+        `UPDATE heartbeats SET last_ping_at = ?, due_at = ? + interval_s + grace_s,
+           ping_seq = ping_seq + ? WHERE id = ?`,
+      )
+      .bind(now, now, failed ? 1 : 0, id),
+    db.prepare("SELECT ping_seq FROM heartbeats WHERE id = ?").bind(id),
   ]);
-  if (changed?.meta.changes !== 1) return null;
-  return (before?.results[0] as Pick<Heartbeat, "state" | "changed_at"> | undefined) ?? null;
+  const changed = results[1]?.meta.changes === 1;
+  const left = changed ? ((results[0]?.results[0] as Ping["left"] | undefined) ?? null) : null;
+  return { left, seq: (results[3]?.results[0] as { ping_seq: number } | undefined)?.ping_seq ?? 0 };
 }
 
 /**
@@ -683,46 +691,84 @@ export async function dueHeartbeats(db: D1Database, now: number, limit: number):
   return results;
 }
 
+/** A pending recovery notice markDown removed, or nulls if it removed none. */
+export type DroppedNotice = Pick<Heartbeat, "pending_notice" | "notice_due_at">;
+
 /**
- * Marks an overdue heartbeat down; false if a ping or another run got there
+ * Marks an overdue heartbeat down; null if a ping or another run got there
  * first. A pending recovery notice is dropped, since the missed check-in
- * contradicts it; a pending failure notice, with the job's log, stays.
+ * contradicts it, and returned so unmarkDown can put it back; a pending
+ * failure notice, with the job's log, stays.
  */
-export async function markDown(db: D1Database, id: string, now: number): Promise<boolean> {
-  const { meta } = await db
-    .prepare(
-      `UPDATE heartbeats SET state = 'down', changed_at = ?,
-         notice_due_at = CASE WHEN json_extract(pending_notice, '$.kind') = 'recovered' THEN NULL ELSE notice_due_at END,
-         pending_notice = CASE WHEN json_extract(pending_notice, '$.kind') = 'recovered' THEN NULL ELSE pending_notice END
-       WHERE id = ? AND state IN ('up', 'failed') AND due_at <= ?`,
-    )
-    .bind(now, id, now)
-    .run();
-  return meta.changes === 1;
+export async function markDown(db: D1Database, id: string, now: number): Promise<DroppedNotice | null> {
+  const recovered = "json_extract(pending_notice, '$.kind') = 'recovered'";
+  const [before, changed] = await db.batch([
+    db
+      .prepare(
+        `SELECT CASE WHEN ${recovered} THEN pending_notice END AS pending_notice,
+           CASE WHEN ${recovered} THEN notice_due_at END AS notice_due_at
+         FROM heartbeats WHERE id = ?`,
+      )
+      .bind(id),
+    db
+      .prepare(
+        `UPDATE heartbeats SET state = 'down', changed_at = ?,
+           notice_due_at = CASE WHEN ${recovered} THEN NULL ELSE notice_due_at END,
+           pending_notice = CASE WHEN ${recovered} THEN NULL ELSE pending_notice END
+         WHERE id = ? AND state IN ('up', 'failed') AND due_at <= ?`,
+      )
+      .bind(now, id, now),
+  ]);
+  if (changed?.meta.changes !== 1) return null;
+  return (before?.results[0] as DroppedNotice | undefined) ?? { pending_notice: null, notice_due_at: null };
 }
 
 /**
  * Undoes markDown when its alert reached nobody, so a later run tries again;
  * not if a ping has come in since. The retry is due at [retryAt], behind
  * heartbeats that went overdue earlier, so failing ones cannot crowd the
- * rest out of a run. A notice markDown dropped is put back.
+ * rest out of a run. Only the notice markDown [dropped] is put back: a
+ * failure notice it kept may have been delivered meanwhile.
  */
-export async function unmarkDown(db: D1Database, hb: Heartbeat, markedAt: number, retryAt: number): Promise<void> {
+export async function unmarkDown(
+  db: D1Database,
+  hb: Heartbeat,
+  dropped: DroppedNotice,
+  markedAt: number,
+  retryAt: number,
+): Promise<void> {
+  const restore = dropped.pending_notice === null ? 0 : 1;
   await db
     .prepare(
-      `UPDATE heartbeats SET state = ?, changed_at = ?, due_at = ?, pending_notice = ?, notice_due_at = ?
+      `UPDATE heartbeats SET state = ?, changed_at = ?, due_at = ?,
+         pending_notice = CASE WHEN ? THEN ? ELSE pending_notice END,
+         notice_due_at = CASE WHEN ? THEN ? ELSE notice_due_at END
        WHERE id = ? AND state = 'down' AND changed_at = ?`,
     )
-    .bind(hb.state, hb.changed_at, retryAt, hb.pending_notice, hb.notice_due_at, hb.id, markedAt)
+    .bind(hb.state, hb.changed_at, retryAt, restore, dropped.pending_notice, restore, dropped.notice_due_at, hb.id, markedAt)
     .run();
 }
 
 /**
  * Keeps [notice] as the heartbeat's pending notice, replacing an older one,
- * not to be tried by the cron trigger before [dueAt].
+ * not to be tried by the cron trigger before [dueAt]. False, keeping
+ * nothing, unless the heartbeat is still in [state], the one the notice
+ * announces, and no later ping has announced anything since [seq]: a
+ * request that stalled must not replace a newer notice.
  */
-export async function setPendingNotice(db: D1Database, id: string, notice: string, dueAt: number): Promise<void> {
-  await db.prepare("UPDATE heartbeats SET pending_notice = ?, notice_due_at = ? WHERE id = ?").bind(notice, dueAt, id).run();
+export async function setPendingNotice(
+  db: D1Database,
+  id: string,
+  state: Heartbeat["state"],
+  seq: number,
+  notice: string,
+  dueAt: number,
+): Promise<boolean> {
+  const { meta } = await db
+    .prepare("UPDATE heartbeats SET pending_notice = ?, notice_due_at = ? WHERE id = ? AND state = ? AND ping_seq = ?")
+    .bind(notice, dueAt, id, state, seq)
+    .run();
+  return meta.changes === 1;
 }
 
 /**

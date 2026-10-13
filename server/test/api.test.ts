@@ -1018,6 +1018,141 @@ describe("heartbeats", () => {
     ]);
   });
 
+  /** Resolves once [ready] holds, yielding to other requests meanwhile. */
+  async function until(ready: () => boolean): Promise<void> {
+    while (!ready()) await new Promise((r) => setTimeout(r, 1));
+  }
+
+  /** A promise to hold an operation at, and the function that lets it go on. */
+  function gate(): [Promise<void>, () => void] {
+    let release!: () => void;
+    return [new Promise<void>((r) => (release = r)), () => release()];
+  }
+
+  const titles = (phone: Registration) => Promise.all(sender.sent.map((_, i) => payloadFor(phone, i).then((p) => p.title)));
+  const depsWith = (s: Sender) => ({ sender: () => s, stream: (_: Env, id: string) => streams.for(id), now: () => now });
+
+  it("drops a recovery notice that a failure overtook", async () => {
+    const phone = await pair("phone", "fcm-phone");
+    const hb = await create({ name: "backup", interval: 3600 });
+    now += 3600 + 300;
+    await check();
+    // The recovery ping stalls at the send limiter while a failure comes in.
+    const owner = await userId();
+    const [held, release] = gate();
+    let reached = false;
+    const stalled = {
+      ...env,
+      NOTIFY_LIMITER: {
+        limit: async ({ key }: { key: string }) => {
+          if (key === owner) {
+            reached = true;
+            await held;
+          }
+          return { success: true };
+        },
+      },
+    } as Env;
+    const recovery = app.request(new URL(hb.ping_url).pathname, {}, stalled);
+    await until(() => reached);
+    await ping(hb.ping_url, "/fail");
+    release();
+    expect((await recovery).status).toBe(200);
+    now += 600;
+    await check();
+    expect(await titles(phone)).toEqual(["backup: missed check-in", "backup: failed"]);
+    const list = await call<Listed[]>("GET", "/v1/heartbeats", USER, undefined, 200);
+    expect(list[0]).toMatchObject({ state: "failed" });
+  });
+
+  it("keeps a newer failure's log over a stalled older one", async () => {
+    const phone = await pair("phone", "fcm-phone");
+    const hb = await create({ name: "build", interval: 3600 });
+    // Failure A stalls at the send limiter; failure B is recorded after it
+    // and its delivery fails, so its notice waits for the cron trigger.
+    const owner = await userId();
+    const [held, release] = gate();
+    let reached = false;
+    const stalled = {
+      ...env,
+      NOTIFY_LIMITER: {
+        limit: async ({ key }: { key: string }) => {
+          if (key === owner && !reached) {
+            reached = true;
+            await held;
+          }
+          return { success: true };
+        },
+      },
+    } as Env;
+    const path = new URL(hb.ping_url).pathname + "/fail";
+    const first = app.request(path, { method: "POST", body: "old error" }, stalled);
+    await until(() => reached);
+    const failing: Sender = { send: () => Promise.reject(new Error("FCM down")) };
+    await createApp(depsWith(failing)).request(path, { method: "POST", body: "new error" }, env);
+    release();
+    expect((await first).status).toBe(200);
+    now += 60;
+    await check();
+    const bodies = await Promise.all(sender.sent.map((_, i) => payloadFor(phone, i).then((p) => p.body)));
+    expect(bodies).toEqual(["new error"]);
+  });
+
+  it("delivers each of two identical failure notices", async () => {
+    const phone = await pair("phone", "fcm-phone");
+    const hb = await create({ name: "build", interval: 3600 });
+    // The first failure's delivery stalls; the second's fails meanwhile.
+    const [held, release] = gate();
+    let reached = false;
+    const slow: Sender = {
+      send: async (m) => {
+        reached = true;
+        await held;
+        await sender.send(m);
+      },
+    };
+    const failing: Sender = { send: () => Promise.reject(new Error("FCM down")) };
+    const first = createApp(depsWith(slow)).request(new URL(hb.ping_url).pathname + "/fail", {}, env);
+    await until(() => reached);
+    await createApp(depsWith(failing)).request(new URL(hb.ping_url).pathname + "/fail", {}, env);
+    release();
+    expect((await first).status).toBe(200);
+    now += 60;
+    await check();
+    expect(await titles(phone)).toEqual(["build: failed", "build: failed"]);
+  });
+
+  it("does not resend a failure notice delivered while a missed alert was undone", async () => {
+    const phone = await pair("phone", "fcm-phone");
+    const hb = await create({ name: "build", interval: 3600 });
+    const failing: Sender = { send: () => Promise.reject(new Error("FCM down")) };
+    await createApp(depsWith(failing)).request(new URL(hb.ping_url).pathname + "/fail", {}, env); // kept pending
+    now += 3600 + 300;
+    // Run A's missed alert stalls, then fails; run B delivers the pending
+    // failure notice meanwhile.
+    const [held, release] = gate();
+    let reached = false;
+    const flaky: Sender = {
+      send: async (m) => {
+        if (reached) return sender.send(m);
+        reached = true;
+        await held;
+        throw new Error("FCM down");
+      },
+    };
+    const runA = heartbeatAlerts(depsWith(flaky)).check(env);
+    await until(() => reached);
+    await check();
+    release();
+    await runA;
+    now += 60;
+    await check();
+    await check();
+    const got = await titles(phone);
+    expect(got.filter((t) => t === "build: failed")).toHaveLength(1);
+    expect(got).toContain("build: missed check-in");
+  });
+
   it("ignores HEAD requests to ping URLs", async () => {
     const phone = await pair("phone", "fcm-phone");
     const hb = await create({ name: "build", interval: 3600 });

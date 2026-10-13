@@ -751,14 +751,14 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     if (!(await c.env.NOTIFY_LIMITER.limit({ key: `ping:${hb.id}` })).success) fail(429, "too many pings; try again in a minute");
     const failed = c.req.path.endsWith("/fail");
     const details = failed && c.req.method === "POST" ? cleanTail(await c.req.text(), MAX_BODY_BYTES) : "";
-    const left = await store.recordPing(c.env.DB, hb.id, deps.now(), failed);
+    const { left, seq } = await store.recordPing(c.env.DB, hb.id, deps.now(), failed);
     // Every reported failure is news; a plain ping only when it ends a
     // failure or outage. Past the user's send limit, the notice waits for
     // the cron trigger (one a minute per heartbeat) instead of going out now.
     if (failed || left) {
       const later = !(await c.env.NOTIFY_LIMITER.limit({ key: hb.user_id })).success;
-      if (failed) await alerts.failed(c.env, hb, details, later);
-      else await alerts.recovered(c.env, hb, left!, later);
+      if (failed) await alerts.failed(c.env, hb, seq, details, later);
+      else await alerts.recovered(c.env, hb, seq, left!, later);
     }
     return c.json({ state: failed ? "failed" : "up" });
   });
