@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# systemd user unit for notifyd. ExecStart assumes `go install` with the
+# default GOPATH; for a downloaded binary, change it to where you put it
+# (e.g. %h/.local/bin/notifyd). Install with:
+#   install -Dm644 notifyd.service ~/.config/systemd/user/notifyd.service
+#   systemctl --user enable --now notifyd
+# It starts with the graphical session, which provides the D-Bus
+# notification service. Window managers that do not start
+# graphical-session.target (i3, sway without a session manager) can use
+# default.target in both places below: until the notification daemon is
+# up, notifyd exits and systemd restarts it every 10 seconds.
+
+[Unit]
+Description=notifier desktop notifications
+Documentation=https://github.com/joncbenderkh/notifier#linux-desktop-notifyd
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/go/bin/notifyd run
+Restart=on-failure
+RestartSec=10
+# 4: unpaired, 5: another notifyd took over; restarting cannot help.
+RestartPreventExitStatus=4 5
+
+[Install]
+WantedBy=graphical-session.target
