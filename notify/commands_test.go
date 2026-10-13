@@ -214,6 +214,16 @@ func TestUndeliveredWhenNoMemberDeviceGotIt(t *testing.T) {
 	}
 }
 
+func TestDeliveredWhenOnlyMemberDevicesQueuedIt(t *testing.T) {
+	f := newFakeAPI(t, map[string]any{"POST /v1/notifications": NotifyResult{
+		ID: "msg_1", Deliveries: []Delivery{}, Members: map[string]int{"queued": 1, "failed": 1},
+	}})
+	code, stdout, _ := f.run("-key", testKey, "-c", "shared", "Hi")
+	if code != 0 || !strings.Contains(stdout, "1 queued, 1 failed") {
+		t.Fatalf("exit %d, stdout %q", code, stdout)
+	}
+}
+
 func TestCreatesScopedKey(t *testing.T) {
 	f := newFakeAPI(t, map[string]any{"POST /v1/keys": APIKey{ID: "key_1", Name: "ci", Key: "nk_new", Channels: []string{"ci"}}})
 	code, stdout, stderr := f.run("-token", testToken, "key", "create", "-c", "ci", "ci")

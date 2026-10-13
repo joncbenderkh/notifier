@@ -26,6 +26,7 @@ type Client struct {
 type Device struct {
 	ID        string `json:"id"`
 	Name      string `json:"name"`
+	Transport string `json:"transport"`
 	Reachable bool   `json:"reachable"`
 }
 

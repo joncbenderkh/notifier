@@ -23,6 +23,11 @@
       "simple": { "limit": 60, "period": 60 }
     }
   ],
+  // One per WebSocket-transport device (src/stream.ts): its socket and queue.
+  "durable_objects": {
+    "bindings": [{ "name": "DEVICE_STREAM", "class_name": "DeviceStream" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["DeviceStream"] }],
   "d1_databases": [
     {
       "binding": "DB",

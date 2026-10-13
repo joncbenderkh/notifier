@@ -15,7 +15,7 @@ curl -X POST https://notifier.joncbender.workers.dev/v1/notifications \
 
 - **`server/`** — a Cloudflare Worker (TypeScript, Hono, D1) that issues
   credentials, pairs phones, and relays notifications through Firebase Cloud
-  Messaging.
+  Messaging (or, for Linux desktops, its own WebSocket transport).
 - **`android/`** — a Kotlin + Jetpack Compose app that pairs with the server,
   decrypts incoming messages, and shows them as notifications.
 - **`notify/`** — `notify`, a single Go binary for sending from scripts and
@@ -271,12 +271,16 @@ the server's limits is shortened and marked with `…`: a title (256 bytes)
 keeps its start, a body (2048 bytes) keeps its end, where a log's error
 usually is.
 
-Exit status is 0 when every one of your targeted phones accepted the
-message; 3 when nothing reached one of them (a delivery failed, a phone was
-unreachable or unpaired before sending, or no phone matched or subscribed),
-or when the message reached no phone at all; 1 on other errors; and 2 on
-usage errors. Other members' phones on a shared channel are reported as
-counts and do not affect the exit status unless none got the message.
+Exit status is 0 when every one of your targeted devices accepted the
+message. That includes a desktop that is offline: its queue holds the
+message, reported as `queued`, so a desktop abandoned without unpairing
+still counts as reached (unpair it with `DELETE /v1/devices/{id}`). Exit
+status is 3 when nothing reached one of them (a delivery failed, a phone
+was unreachable or unpaired before sending, or no phone matched or
+subscribed), or when the message reached no device at all; 1 on other
+errors; and 2 on usage errors. Other members' devices on a shared channel
+are reported as counts and do not affect the exit status unless none got
+the message.
 
 Install a tagged release with
 `go install github.com/joncbenderkh/notifier/notify@latest` (the module lives
@@ -294,7 +298,7 @@ another user's device or key IDs answer 404.
 | Method & path                     | Auth                 | Body / notes |
 |-----------------------------------|----------------------|--------------|
 | `POST /v1/notifications`          | User or API key      | `{"title", "body"?, "priority"?: "default"\|"high", "channels"?: [names], "device_ids"?: [...]}` — reaches devices subscribed to the named channels (the caller's own) plus the listed devices, each once; with neither, the `default` channel. Returns per-device delivery status for the sender's own devices, and `members` (counts by status) for other members'. At most 60 a minute per user (429 after). |
-| `GET /v1/devices`                 | User or API key      | Activity timestamps only with a user token |
+| `GET /v1/devices`                 | User or API key      | `transport` (`fcm` or `ws`); activity timestamps only with a user token |
 | `POST /v1/pairings`               | User                 | Returns a single-use code valid for 10 minutes and its `notifier://pair` link (`uri`); `?qr=svg` adds `qr_svg`. At most 20 devices and 5 unused codes per user. |
 | `GET /pair`                       | —                    | Static page that calls `POST /v1/pairings` with a pasted user token and shows the QR code (`/admin/pair` redirects here) |
 | `DELETE /v1/devices/{id}`         | User                 | |
@@ -315,8 +319,9 @@ another user's device or key IDs answer 404.
 | `GET /v1/users`                   | Operator             | |
 | `POST /v1/users/{id}/token`       | Operator             | Issues a new token, revoking the old one |
 | `POST /v1/users/{id}/disable`     | Operator             | Rejects the user's token, API keys, and devices; `/enable` undoes it |
-| `POST /v1/devices`                | Pairing code         | Used by the app: `{"code", "name", "fcm_token"}` |
-| `PUT /v1/device`                  | Device               | Used by the app: `{"fcm_token"}` |
+| `POST /v1/devices`                | Pairing code         | Used by the app: `{"code", "name", "fcm_token"}`; the Linux daemon sends `{"code", "name", "transport": "ws"}` instead |
+| `PUT /v1/device`                  | Device               | Used by the app: `{"fcm_token"}` (409 for a `ws` device) |
+| `GET /v1/device/stream`           | Device (`ws`)        | WebSocket upgrade: see [WebSocket transport](#websocket-transport) |
 | `POST /v1/device/test`            | Device               | Used by the app |
 | `DELETE /v1/device`               | Device               | Used by the app (unpair) |
 | `GET /v1/device/channels`         | Device               | Channels its owner can subscribe to, with `subscribed` |
@@ -325,6 +330,33 @@ another user's device or key IDs answer 404.
 | `GET /healthz`                    | —                    | |
 
 Limits: title 256 bytes, body 2048 bytes.
+
+### WebSocket transport
+
+FCM does not reach Linux desktops, so a device paired with
+`"transport": "ws"` receives over a WebSocket instead
+(`GET /v1/device/stream`, with its device token as the Bearer). Each such
+device has a queue on the server. Every message is queued, and also sent
+right away when the device is connected, as a text frame:
+
+```json
+{"type": "message", "id": "msg_...", "v": "1", "n": "<base64 nonce>", "c": "<base64 ciphertext>"}
+```
+
+`v`, `n` and `c` are the same sealed envelope that FCM carries. The device
+answers `{"ack": "msg_..."}` once it has shown the message, which removes
+it from the queue. Messages are not acknowledged until shown, so a message
+can arrive twice; the device drops IDs it has already seen.
+
+On connect, the server replays everything still queued, oldest first.
+Queued messages expire after 24 hours, and a queue holds at most the 200
+newest. While the device is offline, its deliveries report `queued`
+instead of `sent`.
+
+The text frame `ping` is answered with `pong`, for keepalives. A newer
+connection for the same device closes the older one with code 4000.
+Unpairing closes the connection with code 4001 and drops the queue; if
+that fails, the unpair answers 503 and can be retried.
 
 ## License
 

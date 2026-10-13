@@ -151,6 +151,15 @@ func TestUndeliveredExitCode(t *testing.T) {
 	}
 }
 
+func TestQueuedCountsAsDelivered(t *testing.T) {
+	f := newFakeServer(t)
+	f.statuses["dev_phone"] = "queued"
+	code, stdout, stderr := f.run("", "-to", "Pixel", "Hi")
+	if code != 0 || !strings.Contains(stdout, "dev_phone: queued") {
+		t.Fatalf("exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+}
+
 func TestRejectedKey(t *testing.T) {
 	f := newFakeServer(t)
 	var stdout, stderr bytes.Buffer

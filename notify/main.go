@@ -337,7 +337,7 @@ func (c *cli) send(n Notification, to []string, body []string) int {
 		if d.Error != "" {
 			line += " (" + d.Error + ")"
 		}
-		if d.Status != "sent" {
+		if !delivered(d.Status) {
 			code = exitUndelivered
 			fmt.Fprintln(c.stderr, line)
 		} else {
@@ -349,16 +349,20 @@ func (c *cli) send(n Notification, to []string, body []string) int {
 	if len(result.Members) > 0 {
 		fmt.Fprintf(c.stdout, "other members' devices: %s\n", countsLine(result.Members))
 	}
-	if len(result.Deliveries) == 0 && result.Members["sent"] == 0 {
+	if len(result.Deliveries) == 0 && result.Members["sent"]+result.Members["queued"] == 0 {
 		code = exitUndelivered
 	}
 	return code
 }
 
+// delivered reports whether a device has the message or will get it: a
+// desktop that is offline gets its queued messages when it reconnects.
+func delivered(status string) bool { return status == "sent" || status == "queued" }
+
 // countsLine formats delivery counts by status, in a stable order.
 func countsLine(counts map[string]int) string {
 	var parts []string
-	for _, status := range []string{"sent", "unreachable", "failed"} {
+	for _, status := range []string{"sent", "queued", "unreachable", "failed"} {
 		if counts[status] > 0 {
 			parts = append(parts, fmt.Sprintf("%d %s", counts[status], status))
 		}

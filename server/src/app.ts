@@ -7,7 +7,8 @@
 //   within that user's own devices;
 // - a user's API keys (nk_): sending and listing devices, for scripts,
 //   optionally limited to some of the user's channels;
-// - a device's token (nd_): a paired phone managing its own registration.
+// - a device's token (nd_): a paired phone or desktop managing its own
+//   registration and, for the WebSocket transport, receiving messages.
 
 import { Hono } from "hono";
 import type { Context, MiddlewareHandler } from "hono";
@@ -18,6 +19,7 @@ import { fromBase64, toBase64 } from "./encoding";
 import { joinUri, pairingUri, qrSvg } from "./pairing";
 import { UnregisteredError } from "./push";
 import type { Sender } from "./push";
+import type { Stream } from "./stream";
 import { newSealKey, seal } from "./seal";
 import * as store from "./store";
 import type { Channel, Device, User } from "./store";
@@ -57,6 +59,8 @@ const MIN_ADMIN_TOKEN_LENGTH = 32;
 
 export interface Deps {
   sender: (env: Env) => Sender;
+  /** The Durable Object holding a WebSocket-transport device's socket and queue. */
+  stream: (env: Env, deviceId: string) => Stream;
   /** Unix seconds. */
   now: () => number;
 }
@@ -89,14 +93,15 @@ export interface Payload {
 
 export interface Delivery {
   device_id: string;
-  status: "sent" | "failed" | "unreachable";
+  /** "queued": held for a WebSocket device that is offline, for up to a day. */
+  status: "sent" | "queued" | "failed" | "unreachable";
   error?: string;
 }
 
 const utf8Length = (s: string) => new TextEncoder().encode(s).length;
 const iso = (seconds: number) => new Date(seconds * 1000).toISOString().replace(".000Z", "Z");
 
-function fail(status: 400 | 401 | 403 | 404 | 409 | 429, message: string): never {
+function fail(status: 400 | 401 | 403 | 404 | 409 | 426 | 429 | 503, message: string): never {
   throw new HTTPException(status, { message });
 }
 
@@ -269,16 +274,37 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     }));
   }
 
+  /**
+   * Unpairs a device. A WebSocket device's stream is closed first, while the
+   * row still exists, so a failure leaves the device in place for a retry
+   * instead of an open socket and queue nothing can reach any more.
+   */
+  async function unpair(env: Env, userId: string, deviceId: string, transport: Device["transport"]): Promise<boolean> {
+    if (transport === "ws") {
+      try {
+        await deps.stream(env, deviceId).close();
+      } catch (err) {
+        console.error("close stream failed", deviceId, err);
+        fail(503, "could not disconnect the device; try again");
+      }
+    }
+    return store.deleteDevice(env.DB, userId, deviceId);
+  }
+
   async function deliver(env: Env, d: Device, p: Payload): Promise<Delivery> {
-    if (d.fcm_token === "") return { device_id: d.id, status: "unreachable" };
+    if (d.transport === "fcm" && d.fcm_token === "") return { device_id: d.id, status: "unreachable" };
     try {
       const envelope = await seal(fromBase64(d.seal_key), d.id, new TextEncoder().encode(JSON.stringify(p)));
-      await deps.sender(env).send({
-        token: d.fcm_token,
-        high: p.priority === "high",
-        ttlSeconds: MESSAGE_TTL_SECONDS,
-        data: { v: ENVELOPE_VERSION, n: toBase64(envelope.nonce), c: toBase64(envelope.ciphertext) },
-      });
+      const data = { v: ENVELOPE_VERSION, n: toBase64(envelope.nonce), c: toBase64(envelope.ciphertext) };
+      if (d.transport === "ws") {
+        const status = await deps.stream(env, d.id).deliver({
+          id: p.id,
+          frame: JSON.stringify({ type: "message", id: p.id, ...data }),
+          expiresAt: deps.now() + MESSAGE_TTL_SECONDS,
+        });
+        return { device_id: d.id, status };
+      }
+      await deps.sender(env).send({ token: d.fcm_token, high: p.priority === "high", ttlSeconds: MESSAGE_TTL_SECONDS, data });
       return { device_id: d.id, status: "sent" };
     } catch (err) {
       if (err instanceof UnregisteredError) {
@@ -395,14 +421,18 @@ export function createApp(deps: Deps): Hono<AppEnv> {
       devices.map((d) => ({
         id: d.id,
         name: d.name,
-        reachable: d.fcm_token !== "",
+        transport: d.transport,
+        // A WebSocket device's queue holds messages while it is offline.
+        reachable: d.transport === "ws" || d.fcm_token !== "",
         ...(full ? { created_at: iso(d.created_at), last_seen_at: iso(d.last_seen_at) } : {}),
       })),
     );
   });
 
   app.delete("/v1/devices/:id", user, async (c) => {
-    if (!(await store.deleteDevice(c.env.DB, c.get("userId"), c.req.param("id")))) fail(404, "not found");
+    const id = c.req.param("id");
+    const transport = await store.deviceTransport(c.env.DB, c.get("userId"), id);
+    if (transport === null || !(await unpair(c.env, c.get("userId"), id, transport))) fail(404, "not found");
     return c.body(null, 204);
   });
 
@@ -572,14 +602,28 @@ export function createApp(deps: Deps): Hono<AppEnv> {
   });
 
   app.post("/v1/devices", async (c) => {
-    const req = await readJson<{ code: string; name: string; fcm_token: string }>(c, ["code", "name", "fcm_token"]);
+    const req = await readJson<{ code: string; name: string; fcm_token: string; transport: string }>(c, [
+      "code",
+      "name",
+      "fcm_token",
+      "transport",
+    ]);
     const name = validName(req.name);
-    if (typeof req.fcm_token !== "string" || req.fcm_token === "") fail(400, "fcm_token is required");
+    const transport = req.transport ?? "fcm";
+    if (transport !== "fcm" && transport !== "ws") fail(400, 'transport must be "fcm" or "ws"');
+    let fcmToken = "";
+    if (transport === "ws") {
+      if (req.fcm_token !== undefined) fail(400, "fcm_token is only for the fcm transport");
+    } else {
+      if (typeof req.fcm_token !== "string" || req.fcm_token === "") fail(400, "fcm_token is required");
+      fcmToken = req.fcm_token;
+    }
     const d: Omit<Device, "user_id"> = {
       id: newId("dev_"),
       name,
       seal_key: toBase64(newSealKey()),
-      fcm_token: req.fcm_token,
+      fcm_token: fcmToken,
+      transport,
       created_at: 0,
       last_seen_at: 0,
     };
@@ -593,6 +637,7 @@ export function createApp(deps: Deps): Hono<AppEnv> {
   });
 
   app.put("/v1/device", device, async (c) => {
+    if (c.get("device").transport !== "fcm") fail(409, "this device uses the WebSocket transport");
     const req = await readJson<{ fcm_token: string }>(c, ["fcm_token"]);
     if (typeof req.fcm_token !== "string" || req.fcm_token === "") fail(400, "fcm_token is required");
     await store.setFcmToken(c.env.DB, c.get("device").id, req.fcm_token);
@@ -600,8 +645,17 @@ export function createApp(deps: Deps): Hono<AppEnv> {
   });
 
   app.delete("/v1/device", device, async (c) => {
-    await store.deleteDevice(c.env.DB, c.get("userId"), c.get("device").id);
+    const d = c.get("device");
+    await unpair(c.env, d.user_id, d.id, d.transport);
     return c.body(null, 204);
+  });
+
+  // The WebSocket transport: the device's Durable Object takes the connection.
+  app.get("/v1/device/stream", device, async (c) => {
+    const d = c.get("device");
+    if (d.transport !== "ws") fail(409, "this device receives through FCM");
+    if (c.req.header("upgrade")?.toLowerCase() !== "websocket") fail(426, "expected a WebSocket upgrade");
+    return deps.stream(c.env, d.id).fetch(c.req.raw);
   });
 
   app.post("/v1/device/test", device, async (c) => {

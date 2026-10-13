@@ -137,9 +137,9 @@ func (c *cli) devices(argv []string) int {
 	if err != nil {
 		return fail(c.stderr, err, c.sendCredName)
 	}
-	w := table(c.stdout, "ID\tNAME\tREACHABLE")
+	w := table(c.stdout, "ID\tNAME\tTRANSPORT\tREACHABLE")
 	for _, d := range devices {
-		fmt.Fprintf(w, "%s\t%s\t%t\n", d.ID, d.Name, d.Reachable)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%t\n", d.ID, d.Name, d.Transport, d.Reachable)
 	}
 	w.Flush()
 	return 0
