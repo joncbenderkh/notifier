@@ -78,6 +78,35 @@ See `README.md` for the user-facing setup and API table.
 - **Delivery:** Firebase Cloud Messaging, **data-only** messages (a
   `notification` block would be rendered by the system without the app
   decrypting it).
+- **WebSocket transport (issue #7):** FCM cannot reach Linux desktops, so
+  `devices.transport` is `fcm` or `ws` (migration 0004). A `ws` device has
+  a SQLite-backed Durable Object (`src/stream.ts`, `DeviceStream`, bound as
+  `DEVICE_STREAM`, keyed `idFromName(device id)`). The object holds the
+  device's socket, through the Hibernation API, and its queue: every
+  message is queued and also sent when the device is connected. The queue
+  holds the 200 newest, each for 24 h, and an alarm purges expired
+  messages. An entry is removed only when the device acks its ID, so
+  delivery is at least once, and the device deduplicates by ID.
+
+  Frames carry envelope v1 unchanged, plus the message ID. `ping` is
+  auto-answered `pong` without waking the object. `webSocketClose`
+  answers a close the client starts, because the runtime did not do so
+  for hibernated sockets, despite `web_socket_auto_reply_to_close`.
+
+  A new connection closes the old one (4000). Unpairing closes the stream
+  *before* deleting the row (a failure answers 503 and keeps the device
+  for a retry): the socket closes with 4001, `deleteAll` runs, and an
+  `unpaired` marker stays in `ctx.storage.kv` so a connection that raced
+  the unpairing gets 404. Delivery to an offline device reports `queued`,
+  which the CLI counts as delivered. `Deps.stream` is injected so
+  `api.test.ts` uses a fake; `test/stream.test.ts` drives the real object.
+
+  **Rollback:** migration 0004 is harmless to the previous Worker, which
+  ignores `transport` (a `ws` device just looks unreachable). But from the
+  first deploy on, wrangler holds a Durable Object migration (`v1`) naming
+  `DeviceStream`, so every later version must keep exporting the class.
+  Removing it takes a `deleted_classes` migration, which destroys every
+  queue.
 - **Firebase client config** is injected at build time from Gradle properties
   `notifier.firebase.{projectId,appId,apiKey,senderId}` or
   `NOTIFIER_FIREBASE_*` env vars into `BuildConfig`, and `NotifierApp`
@@ -161,6 +190,8 @@ See `README.md` for the user-facing setup and API table.
   against D1 with a fake sender.
 - `server/src/{store,seal,token,push,encoding}.ts` — D1 queries, envelope
   encryption, secret generation/hashing, FCM + log senders, byte encodings.
+- `server/src/stream.ts` — `DeviceStream`, the Durable Object behind the
+  WebSocket transport (exported from `index.ts`).
 - `server/src/{pairing,pairPage}.ts` — the `notifier://pair` link and QR, and
   the static `/pair` page.
 - `server/src/index.ts` — the deployed entry point.
