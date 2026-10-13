@@ -54,6 +54,15 @@ const MAX_REQUEST_BYTES = 16 * 1024;
 const MAX_TITLE_BYTES = 256;
 const MAX_BODY_BYTES = 2048;
 const MAX_NAME_BYTES = 64;
+/**
+ * Characters a client could be spoofed or driven by: C0 and C1 controls
+ * and DEL (terminal escapes), and the bidi embeddings, overrides and
+ * isolates (reordering what is shown). Bidi marks and joiners stay
+ * allowed: right-to-left text and emoji sequences need them.
+ */
+const UNSAFE_IN_NAME = /[\p{Cc}\u202A-\u202E\u2066-\u2069]/u;
+/** As in names, but a message may span lines and hold tabs. */
+const UNSAFE_IN_TEXT = /[^\P{Cc}\t\n]|[\u202A-\u202E\u2066-\u2069]/u;
 const ENVELOPE_VERSION = "1";
 const MIN_ADMIN_TOKEN_LENGTH = 32;
 
@@ -125,6 +134,7 @@ function validName(raw: unknown): string {
     fail(400, "name is required and must be at most 64 bytes");
   }
   if (!name.isWellFormed()) fail(400, "name must be valid UTF-8");
+  if (UNSAFE_IN_NAME.test(name)) fail(400, "name must not contain control or bidi override characters");
   return name;
 }
 
@@ -688,6 +698,9 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     if (utf8Length(title) > MAX_TITLE_BYTES) fail(400, "title is too long");
     if (utf8Length(body) > MAX_BODY_BYTES) fail(400, "body is too long");
     if (!title.isWellFormed() || !body.isWellFormed()) fail(400, "title and body must be valid UTF-8");
+    if (UNSAFE_IN_TEXT.test(title) || UNSAFE_IN_TEXT.test(body)) {
+      fail(400, "title and body must not contain control or bidi override characters (newlines and tabs are fine)");
+    }
     const priority =
       req.priority === undefined || req.priority === null || req.priority === "" ? "default" : req.priority;
     if (priority !== "default" && priority !== "high") fail(400, 'priority must be "default" or "high"');

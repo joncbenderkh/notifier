@@ -222,6 +222,17 @@ See `README.md` for the user-facing setup and API table.
   `invite:` prefix so they can never redeem as pairing codes. Secrets are stored only as unsalted SHA-256 digests — fine
   because they are 256-bit random; don't reuse that scheme for anything
   low-entropy.
+- **Unsafe characters (issue #24):** the server answers 400 to a title or
+  body holding a control character other than `\n` and `\t` (C0, DEL, C1;
+  so `\r` too) or a bidi embedding, override or isolate (U+202A–U+202E,
+  U+2066–U+2069), and to a user, device or key name holding any of them once trimmed.
+  Bidi marks and joiners stay allowed (right-to-left text, emoji
+  sequences). The `notify` CLI cleans text first (`clean` in `main.go`:
+  strips ANSI escapes, turns `\r` into newlines, replaces the rest with
+  U+FFFD), so piped logs keep working; it shipped in a release before
+  the server check, which deploys on merge. Clients still filter what they
+  display: older rows, a 24 h stream queue, and other servers can hold
+  such text.
 - **Wire format (envelope v1):** FCM data `{"v":"1","n":<b64 nonce>,"c":<b64
   ciphertext>}`; AES-256-GCM, 12-byte nonce, 128-bit tag, per-device key,
   AAD = device ID. Plaintext is the JSON `Payload` (`server/src/app.ts`,
