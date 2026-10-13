@@ -388,13 +388,15 @@ export async function deleteChannel(db: D1Database, ownerId: string, id: string)
     ...["channel_members", "subscriptions", "channel_invites"].map((table) =>
       db.prepare(`DELETE FROM ${table} WHERE channel_id = ? AND NOT EXISTS (SELECT 1 FROM channels WHERE id = ?)`).bind(id, id),
     ),
-    // Monitoring must not stop silently: heartbeats fall back to default.
-    db
-      .prepare(
-        `UPDATE heartbeats SET channel_id = 'ch_default_' || user_id
-         WHERE channel_id = ? AND NOT EXISTS (SELECT 1 FROM channels WHERE id = ?)`,
-      )
-      .bind(id, id),
+    // Monitoring must not stop silently: heartbeats and hooks fall back to default.
+    ...["heartbeats", "hooks"].map((table) =>
+      db
+        .prepare(
+          `UPDATE ${table} SET channel_id = 'ch_default_' || user_id
+           WHERE channel_id = ? AND NOT EXISTS (SELECT 1 FROM channels WHERE id = ?)`,
+        )
+        .bind(id, id),
+    ),
   ]);
   return deleted?.meta.changes === 1;
 }
@@ -802,4 +804,68 @@ export async function pendingNotices(db: D1Database, now: number, limit: number)
     .bind(now, limit)
     .all<Heartbeat>();
   return results;
+}
+
+// --- inbound webhooks ---
+
+export interface Hook {
+  id: string;
+  user_id: string;
+  channel_id: string;
+  name: string;
+  /** Which parser reads its payloads (hooks.ts FORMATS). */
+  format: string;
+  created_at: number;
+  last_used_at: number | null;
+}
+
+const HOOK_COLUMNS = "k.id, k.user_id, k.channel_id, k.name, k.format, k.created_at, k.last_used_at";
+
+/**
+ * Stores a hook unless the user has one of that name ("exists"), already has
+ * [max] ("full"), or its channel was deleted meanwhile ("gone").
+ */
+export async function createHook(db: D1Database, k: Hook, secretHash: string, max: number): Promise<"created" | "exists" | "full" | "gone"> {
+  const { meta } = await db
+    .prepare(
+      `INSERT INTO hooks (id, user_id, channel_id, name, format, secret_hash, created_at)
+       SELECT ?, ?, ?, ?, ?, ?, ?
+       WHERE (SELECT count(*) FROM hooks WHERE user_id = ?) < ?
+         AND NOT EXISTS (SELECT 1 FROM hooks WHERE user_id = ? AND name = ?)
+         AND EXISTS (SELECT 1 FROM channels WHERE id = ? AND owner_id = ?)`,
+    )
+    .bind(k.id, k.user_id, k.channel_id, k.name, k.format, secretHash, k.created_at, k.user_id, max, k.user_id, k.name, k.channel_id, k.user_id)
+    .run();
+  if (meta.changes === 1) return "created";
+  const named = await db.prepare("SELECT 1 FROM hooks WHERE user_id = ? AND name = ?").bind(k.user_id, k.name).first();
+  if (named) return "exists";
+  const channel = await db.prepare("SELECT 1 FROM channels WHERE id = ?").bind(k.channel_id).first();
+  return channel ? "full" : "gone";
+}
+
+/** The user's hooks with the name of the channel each publishes to. */
+export async function listHooks(db: D1Database, userId: string): Promise<(Hook & { channel_name: string })[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT ${HOOK_COLUMNS}, coalesce(c.name, 'default') AS channel_name FROM hooks k
+       LEFT JOIN channels c ON c.id = k.channel_id
+       WHERE k.user_id = ? ORDER BY k.name`,
+    )
+    .bind(userId)
+    .all<Hook & { channel_name: string }>();
+  return results;
+}
+
+export async function deleteHook(db: D1Database, userId: string, id: string): Promise<boolean> {
+  const { meta } = await db.prepare("DELETE FROM hooks WHERE id = ? AND user_id = ?").bind(id, userId).run();
+  return meta.changes === 1;
+}
+
+/** The hook a webhook URL's secret belongs to; nothing for a disabled user's. */
+export async function hookBySecretHash(db: D1Database, secretHash: string): Promise<Hook | null> {
+  return db.prepare(`SELECT ${HOOK_COLUMNS} FROM hooks k ${activeOwner("k")} WHERE k.secret_hash = ?`).bind(secretHash).first<Hook>();
+}
+
+export async function touchHook(db: D1Database, id: string, now: number): Promise<void> {
+  await db.prepare("UPDATE hooks SET last_used_at = ? WHERE id = ?").bind(now, id).run();
 }

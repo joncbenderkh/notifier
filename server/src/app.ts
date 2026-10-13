@@ -24,6 +24,8 @@ import {
   MIN_GRACE_SECONDS,
   MIN_INTERVAL_SECONDS,
 } from "./heartbeats";
+import { FORMATS, HOOK_SECRET_PREFIX, isFormat, MAX_HOOKS_PER_USER, PayloadError } from "./hooks";
+import type { Message } from "./hooks";
 import { pairPageRoutes } from "./pairPage";
 import { toBase64 } from "./encoding";
 import { joinUri, pairingUri, qrSvg } from "./pairing";
@@ -32,7 +34,7 @@ import { addSubscribers, channelLabel, publisher } from "./publish";
 import type { Target } from "./publish";
 import type { Stream } from "./stream";
 import { newSealKey } from "./seal";
-import { cleanTail, UNSAFE_IN_NAME, UNSAFE_IN_TEXT, utf8Length } from "./text";
+import { cleanTail, MAX_BODY_BYTES, MAX_TITLE_BYTES, UNSAFE_IN_NAME, UNSAFE_IN_TEXT, utf8Length } from "./text";
 import * as store from "./store";
 import type { Channel, Device, User } from "./store";
 import {
@@ -64,8 +66,6 @@ export const MAX_CHANNELS_PER_REQUEST = 20;
 const CHANNEL_NAME = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 const MAX_REQUEST_BYTES = 16 * 1024;
 const MAX_PING_BYTES = 1024 * 1024;
-const MAX_TITLE_BYTES = 256;
-const MAX_BODY_BYTES = 2048;
 const MAX_NAME_BYTES = 64;
 const MIN_ADMIN_TOKEN_LENGTH = 32;
 
@@ -300,7 +300,7 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     return store.deleteDevice(env.DB, userId, deviceId);
   }
 
-  const { deliver, publish } = publisher(deps);
+  const { deliver, publish, publishToChannel } = publisher(deps);
   const alerts = heartbeatAlerts(deps);
 
   /** Whole seconds within [min, max], or [fallback] when absent. */
@@ -312,12 +312,13 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     return raw;
   }
 
-  // A failure report may post a whole log, of which only the tail is kept.
+  // A failure report may post a whole log, of which only the tail is kept,
+  // and a monitoring tool may post many grouped alerts.
   const tooLarge = (c: Context) => c.json({ error: "request too large" }, 413);
   const apiLimit: MiddlewareHandler<AppEnv> = bodyLimit({ maxSize: MAX_REQUEST_BYTES, onError: tooLarge });
   const pingLimit: MiddlewareHandler<AppEnv> = bodyLimit({ maxSize: MAX_PING_BYTES, onError: tooLarge });
   const limit: MiddlewareHandler<AppEnv> = (c, next) =>
-    c.req.path.startsWith("/v1/ping/") ? pingLimit(c, next) : apiLimit(c, next);
+    c.req.path.startsWith("/v1/ping/") || c.req.path.startsWith("/v1/hooks/") ? pingLimit(c, next) : apiLimit(c, next);
   app.use("*", limit);
 
   app.get("/healthz", (c) => c.json({ status: "ok" }));
@@ -761,6 +762,92 @@ export function createApp(deps: Deps): Hono<AppEnv> {
       else await alerts.recovered(c.env, hb, seq, left!, later);
     }
     return c.json({ state: failed ? "failed" : "up" });
+  });
+
+  // --- inbound webhooks ---
+
+  app.post("/v1/hooks", user, async (c) => {
+    const req = await readJson<{ name: string; format: string; channel: string }>(c, ["name", "format", "channel"]);
+    const userId = c.get("userId");
+    const name = validName(req.name);
+    if (!isFormat(req.format)) fail(400, `format must be one of: ${Object.keys(FORMATS).join(", ")}`);
+    const [channel] = await ownedChannels(c.env.DB, userId, channelNames([req.channel ?? "default"]));
+    const hook: store.Hook = {
+      id: newId("hk_"),
+      user_id: userId,
+      channel_id: channel!.id,
+      name,
+      format: req.format,
+      created_at: deps.now(),
+      last_used_at: null,
+    };
+    const secret = newSecret(HOOK_SECRET_PREFIX);
+    const created = await store.createHook(c.env.DB, hook, await sha256Hex(secret), MAX_HOOKS_PER_USER);
+    if (created === "exists") fail(409, `you already have a hook named "${name}"`);
+    if (created === "full") fail(403, `at most ${MAX_HOOKS_PER_USER} hooks per user`);
+    if (created === "gone") fail(404, `you have no channel named "${channel!.name}"`);
+    return c.json(
+      {
+        id: hook.id,
+        name,
+        format: hook.format,
+        channel: channel!.name,
+        url: `${new URL(c.req.url).origin}/v1/hooks/${hook.format}/${secret}`,
+        created_at: iso(hook.created_at),
+      },
+      201,
+    );
+  });
+
+  app.get("/v1/hooks", user, async (c) => {
+    const hooks = await store.listHooks(c.env.DB, c.get("userId"));
+    return c.json(
+      hooks.map((k) => ({
+        id: k.id,
+        name: k.name,
+        format: k.format,
+        channel: k.channel_name,
+        created_at: iso(k.created_at),
+        ...(k.last_used_at === null ? {} : { last_used_at: iso(k.last_used_at) }),
+      })),
+    );
+  });
+
+  app.delete("/v1/hooks/:id", user, async (c) => {
+    if (!(await store.deleteHook(c.env.DB, c.get("userId"), c.req.param("id")))) fail(404, "not found");
+    return c.body(null, 204);
+  });
+
+  // The secret in the path is the credential, as monitoring tools take a URL.
+  // A 503 makes them retry, which may repeat an alert some device already has.
+  app.post("/v1/hooks/:format/:secret", async (c) => {
+    const secret = c.req.param("secret");
+    const hook = secret.startsWith(HOOK_SECRET_PREFIX)
+      ? await store.hookBySecretHash(c.env.DB, await sha256Hex(secret))
+      : null;
+    const parse = hook && hook.format === c.req.param("format") && isFormat(hook.format) ? FORMATS[hook.format] : undefined;
+    if (!hook || !parse) fail(404, "no such hook");
+    await rateLimit(c.env, hook.user_id);
+    let json: unknown;
+    try {
+      json = await c.req.json();
+    } catch {
+      fail(400, "invalid JSON body");
+    }
+    let m: Message;
+    try {
+      m = parse(json);
+    } catch (err) {
+      if (err instanceof PayloadError) fail(400, err.message);
+      throw err;
+    }
+    if (m.title.trim() === "") fail(400, "the alert has no title");
+    const p: Payload = { id: newId("msg_"), title: m.title, priority: m.priority, sent_at: deps.now() };
+    if (m.body !== "") p.body = m.body;
+    const delivered = await publishToChannel(c.env, hook.user_id, hook.channel_id, p);
+    await store.touchHook(c.env.DB, hook.id, deps.now());
+    if (!delivered) fail(503, "no device took the message; try again later");
+    return c.json({ status: "ok", id: p.id });
   });
 
   // --- notifications ---

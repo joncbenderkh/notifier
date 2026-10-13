@@ -17,6 +17,7 @@ import {
 import type { Delivery, Payload } from "../src/app";
 import { fromBase64 } from "../src/encoding";
 import { heartbeatAlerts, MAX_HEARTBEATS_PER_USER } from "../src/heartbeats";
+import { MAX_HOOKS_PER_USER } from "../src/hooks";
 import { UnregisteredError } from "../src/push";
 import type { PushMessage, Sender } from "../src/push";
 import { open } from "../src/seal";
@@ -81,7 +82,7 @@ beforeEach(async () => {
     env.DB.prepare("DELETE FROM pairings"),
     env.DB.prepare("DELETE FROM users"),
     env.DB.prepare("DELETE FROM invites"),
-    ...["channels", "channel_members", "subscriptions", "channel_invites", "api_key_channels", "heartbeats"].map((t) =>
+    ...["channels", "channel_members", "subscriptions", "channel_invites", "api_key_channels", "heartbeats", "hooks"].map((t) =>
       env.DB.prepare(`DELETE FROM ${t}`),
     ),
   ]);
@@ -1223,6 +1224,155 @@ describe("heartbeats", () => {
     now += 3600 + 300;
     await check();
     expect(sender.sent).toHaveLength(0);
+  });
+});
+
+describe("inbound webhooks", () => {
+  interface Created {
+    id: string;
+    format: string;
+    channel: string;
+    url: string;
+  }
+  interface Listed {
+    name: string;
+    format: string;
+    channel: string;
+    last_used_at?: string;
+  }
+
+  const create = (body: object, status = 201) => call<Created>("POST", "/v1/hooks", USER, body, status);
+
+  async function post(url: string, body: unknown, wantStatus = 200, bindings: Env = env): Promise<void> {
+    const res = await app.request(new URL(url).pathname, { method: "POST", body: typeof body === "string" ? body : JSON.stringify(body) }, bindings);
+    expect(res.status, await res.text()).toBe(wantStatus);
+  }
+
+  const firing = {
+    version: "4",
+    status: "firing",
+    groupLabels: { alertname: "DiskFull" },
+    commonLabels: { alertname: "DiskFull", severity: "critical" },
+    alerts: [
+      { status: "firing", labels: { alertname: "DiskFull", severity: "critical", instance: "nas-01" }, annotations: { summary: "Disk almost full" } },
+    ],
+  };
+
+  it("creates, lists and deletes hooks", async () => {
+    const hook = await create({ name: "am", format: "alertmanager" });
+    expect(hook).toMatchObject({ format: "alertmanager", channel: "default" });
+    expect(hook.url).toMatch(/^http:\/\/localhost\/v1\/hooks\/alertmanager\/nw_[a-z2-7]+$/);
+    let list = await call<Listed[]>("GET", "/v1/hooks", USER, undefined, 200);
+    expect(list).toEqual([expect.objectContaining({ name: "am", format: "alertmanager", channel: "default" })]);
+    expect(list[0]).not.toHaveProperty("last_used_at");
+
+    await post(hook.url, firing);
+    list = await call<Listed[]>("GET", "/v1/hooks", USER, undefined, 200);
+    expect(list[0]!.last_used_at).toBeDefined();
+
+    // Others cannot see or delete it; API keys cannot manage hooks.
+    const bob = await signup("bob");
+    expect(await call("GET", "/v1/hooks", bob, undefined, 200)).toEqual([]);
+    await call("DELETE", `/v1/hooks/${hook.id}`, bob, undefined, 404);
+    await call("GET", "/v1/hooks", await apiKey(), undefined, 401);
+    await call("DELETE", `/v1/hooks/${hook.id}`, USER, undefined, 204);
+    await post(hook.url, firing, 404);
+  });
+
+  it("validates and caps hooks", async () => {
+    await create({ name: "x", format: "nagios" }, 400);
+    await create({ name: "x", format: "toString" }, 400);
+    await create({ name: "x" }, 400);
+    await create({ name: "x", format: "generic", channel: "nope" }, 404);
+    await create({ name: "x\u001b", format: "generic" }, 400);
+    await create({ name: "x", format: "generic", extra: 1 }, 400);
+    await create({ name: "x", format: "generic" });
+    await create({ name: "x", format: "grafana" }, 409);
+    for (let i = 1; i < MAX_HOOKS_PER_USER; i++) await create({ name: `hook${i}`, format: "generic" });
+    await create({ name: "one-too-many", format: "generic" }, 403);
+    await post("http://localhost/v1/hooks/generic/nw_NOTASECRET", { title: "x" }, 404);
+    await post("http://localhost/v1/hooks/generic/nh_NOTASECRET", { title: "x" }, 404);
+  });
+
+  it("publishes an Alertmanager alert to the hook's channel", async () => {
+    const phone = await pair("phone", "fcm-phone");
+    const { id } = await call<{ id: string }>("POST", "/v1/channels", USER, { name: "alerts" }, 201);
+    const hook = await create({ name: "am", format: "alertmanager", channel: "alerts" });
+    await call("PUT", `/v1/devices/${phone.device_id}/channels`, USER, { channel_ids: [`ch_default_${await userId()}`, id] }, 200);
+
+    await post(hook.url, firing);
+    expect(await payloadFor(phone, 0)).toMatchObject({
+      title: "[FIRING:1] DiskFull",
+      body: "Disk almost full (nas-01)",
+      priority: "high",
+      channel: "alerts",
+    });
+    expect(sender.sent[0]!.high).toBe(true);
+
+    await post(hook.url, { ...firing, status: "resolved", alerts: [{ ...firing.alerts[0], status: "resolved" }] });
+    expect(await payloadFor(phone, 1)).toMatchObject({ title: "[RESOLVED] DiskFull", priority: "default" });
+  });
+
+  it("checks the format in the path and the payload", async () => {
+    await pair("phone", "fcm-phone");
+    const hook = await create({ name: "g", format: "generic" });
+    await post(hook.url.replace("/generic/", "/grafana/"), { title: "x" }, 404);
+    await post(hook.url, "not json", 400);
+    await post(hook.url, { body: "no title" }, 400);
+    await post(hook.url, { title: "x", priority: "urgent" }, 400);
+    await post(hook.url, { title: "\u001b[2J" }, 400);
+    expect(sender.sent).toHaveLength(0);
+    await post(hook.url, { title: "Deploy done", body: "v1.2.3", unknown: "ignored" });
+    expect(sender.sent).toHaveLength(1);
+  });
+
+  it("asks the tool to retry when no device took the alert", async () => {
+    const reg = await pair("phone", "fcm-phone");
+    const hook = await create({ name: "am", format: "alertmanager" });
+    const failing = { send: () => Promise.reject(new Error("FCM down")) };
+    app = createApp({ sender: () => failing, stream: (_, id) => streams.for(id), now: () => now });
+    await post(hook.url, firing, 503);
+    // Nobody listening is not worth a retry.
+    await call("DELETE", `/v1/devices/${reg.device_id}`, USER, undefined, 204);
+    await post(hook.url, firing, 200);
+  });
+
+  it("rate-limits per user and ignores disabled users", async () => {
+    await pair("phone", "fcm-phone");
+    const hook = await create({ name: "am", format: "alertmanager" });
+    const keys: string[] = [];
+    const limited = {
+      ...env,
+      NOTIFY_LIMITER: {
+        limit: ({ key }: { key: string }) => {
+          keys.push(key);
+          return Promise.resolve({ success: false });
+        },
+      },
+    } as Env;
+    await post(hook.url, firing, 429, limited);
+    expect(keys).toEqual([await userId()]);
+    await call("POST", `/v1/users/${await userId()}/disable`, ADMIN, undefined, 204);
+    await post(hook.url, firing, 404);
+    expect(sender.sent).toHaveLength(0);
+  });
+
+  it("moves to the default channel when its channel is deleted", async () => {
+    const phone = await pair("phone", "fcm-phone");
+    const { id } = await call<{ id: string }>("POST", "/v1/channels", USER, { name: "alerts" }, 201);
+    const hook = await create({ name: "am", format: "alertmanager", channel: "alerts" });
+    await call("DELETE", `/v1/channels/${id}`, USER, undefined, 204);
+    expect(await call<Listed[]>("GET", "/v1/hooks", USER, undefined, 200)).toEqual([expect.objectContaining({ channel: "default" })]);
+    await post(hook.url, firing);
+    expect(await payloadFor(phone, 0)).toMatchObject({ title: "[FIRING:1] DiskFull", channel: "default" });
+  });
+
+  it("accepts payloads up to 1 MiB", async () => {
+    await pair("phone", "fcm-phone");
+    const hook = await create({ name: "am", format: "alertmanager" });
+    const many = { ...firing, alerts: Array.from({ length: 2000 }, (_, i) => ({ ...firing.alerts[0], labels: { ...firing.alerts[0]!.labels, instance: `host-${i}` } })) };
+    await post(hook.url, many);
+    await post(hook.url, { ...firing, padding: "x".repeat(1024 * 1024) }, 413);
   });
 });
 

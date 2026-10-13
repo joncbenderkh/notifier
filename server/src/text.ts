@@ -3,6 +3,9 @@
 // What notification text and names may hold. Senders choose it, and it is
 // shown on phones, desktops and terminals.
 
+export const MAX_TITLE_BYTES = 256;
+export const MAX_BODY_BYTES = 2048;
+
 export const utf8Length = (s: string) => new TextEncoder().encode(s).length;
 
 /**

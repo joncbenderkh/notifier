@@ -21,6 +21,7 @@ beforeEach(async () => {
     "channel_invites",
     "api_key_channels",
     "heartbeats",
+    "hooks",
     "d1_migrations",
   ];
   await env.DB.batch(tables.map((t) => env.DB.prepare(`DROP TABLE IF EXISTS ${t}`)));
