@@ -11,6 +11,7 @@ plugins {
 fun firebaseConfig(name: String): String =
     providers.gradleProperty("notifier.firebase.$name")
         .orElse(providers.environmentVariable("NOTIFIER_FIREBASE_${name.uppercase()}"))
+        .map(String::trim)
         .getOrElse("")
 
 android {
