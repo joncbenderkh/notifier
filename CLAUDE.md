@@ -203,8 +203,30 @@ See `README.md` for the user-facing setup and API table.
   `android/.../push/SealedMessageTest.kt` pins both sides — change the format
   only by bumping `v` and updating both.
 - **Phone-side secret storage:** `PairingStore` encrypts the pairing JSON with
-  an AES-GCM Android Keystore key; backups and device transfer are disabled
-  for it (a restored copy could not be decrypted anyway).
+  an AES-GCM Android Keystore key (`KeystoreCipher`); backups and device
+  transfer are disabled for it (a restored copy could not be decrypted
+  anyway).
+- **Notification history (issue #16):** each device keeps what it
+  received; the server stores no content. On Android, `History` (pure JVM)
+  holds the entries, newest first, deduplicated by message ID, at most 500
+  and none older than 30 days. `HistoryStore` is a process-wide singleton,
+  since `PushService` and the UI both write. It encrypts the history under
+  its own Keystore key (`notifier-history`) into `files/history.bin`
+  (`AtomicFile`), which is excluded from backups. Every failure surfaces
+  as an `IOException`. Unreadable data is moved aside
+  (`history.unreadable.bin`) and a new history starts.
+
+  `PushService` records before showing, so messages arrive in the history
+  even without the notification permission, and it catches any failure,
+  so the history can never cost a notification. Recording checks, under
+  the store's lock, that the pairing that received the message is still
+  current. Unpairing clears the pairing before the history, so a message
+  in flight during an unpair cannot reach the next pairing's history.
+  Opening the history prunes it, and each screen keeps its saved state
+  through `rememberSaveableStateHolder`. Tapping a notification opens
+  the history (`EXTRA_OPEN_HISTORY`; the `PendingIntent` uses
+  `FLAG_UPDATE_CURRENT`, because Android matches cached intents ignoring
+  extras). Unpairing clears the history.
 - **Application id / package:** `com.joncbenderkh.notifier`.
 - **Schema migrations:** `server/migrations/NNNN_*.sql`, applied by
   `wrangler d1 migrations apply`. Append only; never edit a shipped one, and
@@ -238,11 +260,12 @@ See `README.md` for the user-facing setup and API table.
   `notifyd.service` (systemd user unit). The tests use `httptest`
   WebSocket servers and a fake `Desktop`.
 - `android/app/src/main/java/com/joncbenderkh/notifier/`
-  - `data/` — `PairingStore`, `ServerClient` (blocking; callers pick the
-    thread), `NotifierLink` (pure JVM, unit-tested).
+  - `data/` — `PairingStore` and `HistoryStore` (both over
+    `KeystoreCipher`), `ServerClient` (blocking; callers pick the thread),
+    `NotifierLink` and `History` (pure JVM, unit-tested).
   - `push/` — `PushService` (FCM), `SealedMessage` and `ChannelRoute` (pure
     JVM, unit-tested), `Notifications` (Android channels and groups).
-  - `ui/` — `MainViewModel`, `NotifierScreen`, theme.
+  - `ui/` — `MainViewModel`, `NotifierScreen`, `HistoryScreen`, theme.
 
 ## Commands
 
