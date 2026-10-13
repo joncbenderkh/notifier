@@ -188,6 +188,18 @@ curl -X POST $S/v1/notifications -H "$T" -d '{"title": "disk full", "channels": 
   typing the code. Each channel other than `default` gets its own group in
   Android's notification settings, so it can be muted or given a sound.
 
+### History
+
+The app keeps the notifications it received, so one dismissed by accident
+can still be read. Tap **History** on the paired screen, or tap any
+notification. Entries are newest first, with their channel and time. Tap
+one to show the whole body or delete it, or use **Clear all**.
+
+The history exists only on that phone. It is encrypted with an Android
+Keystore key, excluded from backups, and limited to the last 500
+notifications within 30 days. Unpairing clears it. The server never had a
+copy: it relays sealed messages and keeps no content.
+
 ## `notify` CLI
 
 ```

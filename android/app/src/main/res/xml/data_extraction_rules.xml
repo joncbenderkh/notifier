@@ -1,10 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- The pairing is bound to this device's Keystore; never back it up or transfer it. -->
+<!-- The pairing and the history (in files/, with AtomicFile's temporaries)
+     are bound to this device's Keystore; never back them up or transfer
+     them. -->
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="sharedpref" path="." />
+        <exclude domain="file" path="." />
     </cloud-backup>
     <device-transfer>
         <exclude domain="sharedpref" path="." />
+        <exclude domain="file" path="." />
     </device-transfer>
 </data-extraction-rules>

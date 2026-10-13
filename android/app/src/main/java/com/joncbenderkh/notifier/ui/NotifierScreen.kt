@@ -37,6 +37,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -69,45 +70,70 @@ fun NotifierScreen(viewModel: MainViewModel = viewModel()) {
         }
     }
 
-    Scaffold(
-        topBar = { TopAppBar(title = { Text("Notifier") }) },
-        snackbarHost = { SnackbarHost(snackbar) },
-    ) { padding ->
-        Column(
-            modifier = Modifier
-                .padding(padding)
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp),
-        ) {
-            if (state.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
-            NotificationPermissionCard()
-            val pairing = state.pairing
-            if (pairing == null) {
-                PairingForm(
-                    defaultName = viewModel.defaultDeviceName,
-                    enabled = !state.busy,
-                    prefill = state.prefill,
-                    onPrefillConsumed = viewModel::consumePrefill,
-                    onScanned = viewModel::openLink,
-                    onScanFailed = viewModel::showMessage,
-                    onPair = viewModel::pair,
-                )
-            } else {
-                PairedPanel(pairing, enabled = !state.busy, onTest = viewModel::sendTest, onUnpair = viewModel::unpair)
-                ChannelsCard(
-                    channels = state.channels,
-                    enabled = !state.busy,
-                    onToggle = viewModel::setSubscribed,
-                    onRefresh = viewModel::refreshChannels,
-                )
-                JoinCard(
-                    enabled = !state.busy,
-                    onJoin = viewModel::join,
-                    onScanned = viewModel::openLink,
-                    onScanFailed = viewModel::showMessage,
-                )
+    val history by viewModel.history.collectAsStateWithLifecycle()
+    // Keeps each screen's saved state (scroll, typed text) while the other shows.
+    val screens = rememberSaveableStateHolder()
+    if (state.showHistory) {
+        screens.SaveableStateProvider("history") {
+            HistoryScreen(
+                entries = history,
+                snackbar = snackbar,
+                onBack = viewModel::closeHistory,
+                onDelete = viewModel::deleteHistory,
+                onClear = viewModel::clearHistory,
+            )
+        }
+        return
+    }
+
+    screens.SaveableStateProvider("main") {
+        Scaffold(
+            topBar = { TopAppBar(title = { Text("Notifier") }) },
+            snackbarHost = { SnackbarHost(snackbar) },
+        ) { padding ->
+            Column(
+                modifier = Modifier
+                    .padding(padding)
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
+            ) {
+                if (state.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+                NotificationPermissionCard()
+                val pairing = state.pairing
+                if (pairing == null) {
+                    PairingForm(
+                        defaultName = viewModel.defaultDeviceName,
+                        enabled = !state.busy,
+                        prefill = state.prefill,
+                        onPrefillConsumed = viewModel::consumePrefill,
+                        onScanned = viewModel::openLink,
+                        onScanFailed = viewModel::showMessage,
+                        onPair = viewModel::pair,
+                    )
+                } else {
+                    PairedPanel(
+                        pairing,
+                        enabled = !state.busy,
+                        historyCount = history.size,
+                        onHistory = viewModel::openHistory,
+                        onTest = viewModel::sendTest,
+                        onUnpair = viewModel::unpair,
+                    )
+                    ChannelsCard(
+                        channels = state.channels,
+                        enabled = !state.busy,
+                        onToggle = viewModel::setSubscribed,
+                        onRefresh = viewModel::refreshChannels,
+                    )
+                    JoinCard(
+                        enabled = !state.busy,
+                        onJoin = viewModel::join,
+                        onScanned = viewModel::openLink,
+                        onScanFailed = viewModel::showMessage,
+                    )
+                }
             }
         }
     }
@@ -250,7 +276,14 @@ private fun PairingForm(
 }
 
 @Composable
-private fun PairedPanel(pairing: Pairing, enabled: Boolean, onTest: () -> Unit, onUnpair: () -> Unit) {
+private fun PairedPanel(
+    pairing: Pairing,
+    enabled: Boolean,
+    historyCount: Int,
+    onHistory: () -> Unit,
+    onTest: () -> Unit,
+    onUnpair: () -> Unit,
+) {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text("Paired", style = MaterialTheme.typography.titleLarge)
@@ -259,7 +292,10 @@ private fun PairedPanel(pairing: Pairing, enabled: Boolean, onTest: () -> Unit, 
             Text("Device ID: ${pairing.deviceId}", style = MaterialTheme.typography.bodySmall)
         }
     }
-    Button(onClick = onTest, enabled = enabled, modifier = Modifier.fillMaxWidth()) {
+    Button(onClick = onHistory, modifier = Modifier.fillMaxWidth()) {
+        Text("History ($historyCount)")
+    }
+    OutlinedButton(onClick = onTest, enabled = enabled, modifier = Modifier.fillMaxWidth()) {
         Text("Send test notification")
     }
     OutlinedButton(onClick = onUnpair, enabled = enabled, modifier = Modifier.fillMaxWidth()) {

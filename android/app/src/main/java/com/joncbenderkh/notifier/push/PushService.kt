@@ -4,6 +4,7 @@ package com.joncbenderkh.notifier.push
 import android.util.Log
 import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
+import com.joncbenderkh.notifier.data.HistoryStore
 import com.joncbenderkh.notifier.data.PairingStore
 import com.joncbenderkh.notifier.data.ServerClient
 import java.io.IOException
@@ -29,6 +30,14 @@ class PushService : FirebaseMessagingService() {
         } catch (e: Exception) {
             Log.w(TAG, "dropping message that failed to open", e)
             return
+        }
+        // Recorded even when notifications are not allowed: it was received.
+        // The history is a convenience copy; no failure of it may cost the notification.
+        try {
+            val store = PairingStore(this)
+            HistoryStore.get(this).record(payload) { store.load()?.deviceId == pairing.deviceId }
+        } catch (e: Exception) {
+            Log.w(TAG, "could not record the message in the history", e)
         }
         Notifications.show(this, payload)
     }
