@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/godbus/dbus/v5"
 )
@@ -157,14 +158,17 @@ func newFakeAPI(t *testing.T) *fakeAPI {
 
 func newTestApp(t *testing.T) (*app, *bytes.Buffer, *bytes.Buffer) {
 	var stdout, stderr bytes.Buffer
+	dir := t.TempDir()
 	return &app{
-		stdout:    &stdout,
-		stderr:    &stderr,
-		statePath: filepath.Join(t.TempDir(), "notifyd.json"),
-		http:      &http.Client{CheckRedirect: refuseRedirect},
-		desktop:   func(context.Context) (Desktop, error) { return newFakeDesktop(), nil },
-		hostname:  func() (string, error) { return "workstation", nil },
-		signals:   func() (context.Context, context.CancelFunc) { return context.WithCancel(context.Background()) },
+		stdout:      &stdout,
+		stderr:      &stderr,
+		statePath:   filepath.Join(dir, "notifyd.json"),
+		historyPath: filepath.Join(dir, "state", "notifyd-history.jsonl"),
+		now:         func() time.Time { return time.Unix(testNow, 0) },
+		http:        &http.Client{CheckRedirect: refuseRedirect},
+		desktop:     func(context.Context) (Desktop, error) { return newFakeDesktop(), nil },
+		hostname:    func() (string, error) { return "workstation", nil },
+		signals:     func() (context.Context, context.CancelFunc) { return context.WithCancel(context.Background()) },
 	}, &stdout, &stderr
 }
 

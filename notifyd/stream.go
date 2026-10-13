@@ -45,6 +45,7 @@ type streamer struct {
 	http    *http.Client
 	logf    func(format string, args ...any)
 	seen    *recentIDs
+	history *history // nil: keep none
 
 	pingInterval time.Duration
 	readTimeout  time.Duration
@@ -188,6 +189,12 @@ func (s *streamer) handle(ctx context.Context, conn *websocket.Conn, data []byte
 		case err != nil:
 			s.logf("dropping message %s: %v", f.ID, err)
 		default:
+			// Before showing, so a message the desktop refuses is still kept.
+			if s.history != nil {
+				if err := s.history.record(p); err != nil {
+					s.logf("could not record message %s in the history: %v", f.ID, err)
+				}
+			}
 			if err := s.desktop.Notify(ctx, p); errors.Is(err, errRejected) {
 				// Retrying cannot help, and would hold up the messages queued behind it.
 				s.logf("dropping message %s: %v", f.ID, err)

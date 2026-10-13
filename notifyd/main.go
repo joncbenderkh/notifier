@@ -20,6 +20,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
+	"unicode/utf16"
 )
 
 // version is set by release builds with -ldflags "-X main.version=...".
@@ -39,17 +41,23 @@ const usage = `Usage:
   notifyd pair -server URL [-name NAME] [-force] CODE
   notifyd [run]
   notifyd test
+  notifyd history [-n COUNT] [-json]
+  notifyd history clear
   notifyd unpair
   notifyd version
 
 Pair with the notifier://pair link (or the code) from ` + "`notify pair`" + `, then run
 notifyd, usually as a systemd user service. The pairing is kept in
-$XDG_CONFIG_HOME/notifier/notifyd.json (override with NOTIFYD_STATE).
+$XDG_CONFIG_HOME/notifier/notifyd.json (override with NOTIFYD_STATE), and
+what it received in $XDG_STATE_HOME/notifier/notifyd-history.jsonl (override
+with NOTIFYD_HISTORY).
 `
 
 type app struct {
 	stdout, stderr io.Writer
 	statePath      string
+	historyPath    string
+	now            func() time.Time
 	http           *http.Client
 	desktop        func(context.Context) (Desktop, error)
 	hostname       func() (string, error)
@@ -84,6 +92,17 @@ func (a *app) run(args []string) int {
 		}
 		a.statePath = p
 	}
+	if a.historyPath == "" {
+		p, err := historyPath()
+		if err != nil {
+			fmt.Fprintln(a.stderr, "notifyd:", err)
+			return exitError
+		}
+		a.historyPath = p
+	}
+	if a.now == nil {
+		a.now = time.Now
+	}
 	cmd := "run"
 	if len(args) > 0 {
 		cmd, args = args[0], args[1:]
@@ -95,6 +114,8 @@ func (a *app) run(args []string) int {
 		return a.listen(args)
 	case "test":
 		return a.test(args)
+	case "history":
+		return a.history(args)
 	case "unpair":
 		return a.unpair(args)
 	case "version":
@@ -187,8 +208,20 @@ func (a *app) pair(args []string) int {
 		return a.fail(fmt.Errorf("pairing with %s failed: %w", srv, err))
 	}
 	st := State{URL: srv, DeviceID: reg.DeviceID, DeviceToken: reg.DeviceToken, SealKey: reg.SealKey, Name: deviceName}
-	if err := saveState(a.statePath, st); err != nil {
-		return a.fail(fmt.Errorf("paired as %s but could not save it: %w", reg.DeviceID, err))
+	// One step under the history lock: a running daemon of the old pairing
+	// checks that pairing under it before recording anything more.
+	err = withHistoryLock(a.historyPath, func() error {
+		if err := saveState(a.statePath, st); err != nil {
+			return fmt.Errorf("paired as %s but could not save it: %w", reg.DeviceID, err)
+		}
+		// The new pairing may be another account: its history starts empty.
+		if err := clearHistory(a.historyPath); err != nil {
+			a.logf("could not clear the previous history: %v", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return a.fail(err)
 	}
 	// Only now that the new pairing is saved: a bad code must not cost the old one.
 	if hadOld {
@@ -219,7 +252,13 @@ func (a *app) listen(args []string) int {
 	if err != nil {
 		return a.fail(fmt.Errorf("cannot reach the desktop's notification service: %w", err))
 	}
-	err = newStreamer(st, desktop, a.http, a.logf).run(ctx)
+	s := newStreamer(st, desktop, a.http, a.logf)
+	s.history = newHistory(a.historyPath, a.now)
+	s.history.current = func() bool {
+		saved, err := loadState(a.statePath)
+		return err == nil && saved.DeviceID == st.DeviceID
+	}
+	err = s.run(ctx)
 	switch {
 	case errors.Is(err, errUnpaired):
 		a.logf("%v (notifyd pair -force LINK)", err)
@@ -276,7 +315,15 @@ func (a *app) unpair(args []string) int {
 	if err := a.call(http.MethodDelete, st.URL+"/v1/device", st.DeviceToken, nil, nil); err != nil && !isUnauthorized(err) {
 		return a.fail(err)
 	}
-	if err := os.Remove(a.statePath); err != nil {
+	// The device is gone from the server now; a history that cannot be
+	// cleared must not leave a pairing that can no longer be removed.
+	err = withHistoryLock(a.historyPath, func() error {
+		if err := clearHistory(a.historyPath); err != nil {
+			a.logf("could not clear the history (notifyd history clear): %v", err)
+		}
+		return os.Remove(a.statePath)
+	})
+	if err != nil {
 		return a.fail(err)
 	}
 	fmt.Fprintln(a.stdout, "Unpaired.")
@@ -341,4 +388,116 @@ func (a *app) call(method, url, token string, body, out any) error {
 		return nil
 	}
 	return json.Unmarshal(raw, out)
+}
+
+func (a *app) history(args []string) int {
+	if len(args) > 0 && args[0] == "clear" {
+		if !a.noArgs("history clear", args[1:]) {
+			return exitUsage
+		}
+		if err := withHistoryLock(a.historyPath, func() error { return clearHistory(a.historyPath) }); err != nil {
+			return a.fail(err)
+		}
+		fmt.Fprintln(a.stdout, "History cleared.")
+		return 0
+	}
+	fs := flag.NewFlagSet("history", flag.ContinueOnError)
+	fs.SetOutput(a.stderr)
+	n := fs.Int("n", 20, "show the `count` newest messages; 0 shows all")
+	asJSON := fs.Bool("json", false, "print the entries as a JSON array, newest first")
+	fs.Usage = func() { fmt.Fprint(a.stderr, usage) }
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	if fs.NArg() != 0 || *n < 0 {
+		fs.Usage()
+		return exitUsage
+	}
+	entries, err := readHistory(a.historyPath, a.now())
+	if err != nil {
+		return a.fail(err)
+	}
+	if *n > 0 && len(entries) > *n {
+		entries = entries[:*n]
+	}
+	if *asJSON {
+		if entries == nil {
+			entries = []historyEntry{}
+		}
+		raw, err := json.MarshalIndent(entries, "", "  ")
+		if err != nil {
+			return a.fail(err)
+		}
+		fmt.Fprintf(a.stdout, "%s\n", escapeInvisible(raw))
+		return 0
+	}
+	if len(entries) == 0 {
+		fmt.Fprintln(a.stdout, "Nothing received yet.")
+		return 0
+	}
+	for i, e := range entries {
+		if i > 0 {
+			fmt.Fprintln(a.stdout)
+		}
+		fmt.Fprint(a.stdout, formatEntry(e))
+	}
+	return 0
+}
+
+// formatEntry renders one entry for a terminal: a heading line, then the
+// body indented. Senders control the text, so control characters (terminal
+// escapes among them) are replaced.
+func formatEntry(e historyEntry) string {
+	const layout = "2006-01-02 15:04"
+	var b strings.Builder
+	b.WriteString(time.Unix(e.ReceivedAt, 0).Format(layout))
+	if e.Channel != "" && !strings.HasPrefix(e.ChannelID, "ch_default_") {
+		b.WriteString("  [" + printable(e.Channel, false) + "]")
+	}
+	b.WriteString("  " + printable(e.Title, false))
+	if e.Priority == "high" {
+		b.WriteString("  (high)")
+	}
+	// Queued or delayed on the way: say when it was sent.
+	if e.ReceivedAt-e.SentAt > 60 {
+		b.WriteString("  (sent " + time.Unix(e.SentAt, 0).Format(layout) + ")")
+	}
+	b.WriteString("\n")
+	if e.Body != "" {
+		for line := range strings.SplitSeq(printable(e.Body, true), "\n") {
+			b.WriteString("    " + line + "\n")
+		}
+	}
+	return b.String()
+}
+
+// printable replaces control and format characters (terminal escapes, bidi
+// overrides, zero-width characters) with U+FFFD, keeping tabs, and newlines
+// only when multiline.
+func printable(s string, multiline bool) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\t' || multiline && r == '\n' || !invisible(r) {
+			return r
+		}
+		return '\uFFFD'
+	}, s)
+}
+
+func invisible(r rune) bool { return unicode.IsControl(r) || unicode.Is(unicode.Cf, r) }
+
+// escapeInvisible rewrites, as \uXXXX escapes, what encoding/json leaves
+// raw but a terminal may act on: DEL, C1 controls, and format characters.
+// Encoded JSON has no raw C0 controls left to worry about.
+func escapeInvisible(raw []byte) []byte {
+	var b bytes.Buffer
+	for _, r := range string(raw) {
+		if r < 0x7f || !invisible(r) {
+			b.WriteRune(r)
+			continue
+		}
+		for _, unit := range utf16.Encode([]rune{r}) {
+			fmt.Fprintf(&b, "\\u%04x", unit)
+		}
+	}
+	return b.Bytes()
 }

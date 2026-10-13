@@ -74,14 +74,20 @@ func loadState(path string) (State, error) {
 	return st, nil
 }
 
-// saveState writes st to path, readable only by its owner. It replaces the
-// file atomically and durably, so a crash never leaves half a pairing behind,
-// and writes through a symlink rather than replacing it.
+// saveState writes st to path, readable only by its owner, atomically and
+// durably, so a crash never leaves half a pairing behind.
 func saveState(path string, st State) error {
 	raw, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
 		return err
 	}
+	return writeFileAtomic(path, append(raw, '\n'), ".notifyd-*.json")
+}
+
+// writeFileAtomic replaces path with data, readable only by its owner: a
+// temporary file (named by pattern) is synced, then renamed over it. A
+// symlink is written through rather than replaced.
+func writeFileAtomic(path string, data []byte, pattern string) error {
 	if target, err := filepath.EvalSymlinks(path); err == nil {
 		path = target
 	}
@@ -89,12 +95,12 @@ func saveState(path string, st State) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	f, err := os.CreateTemp(dir, ".notifyd-*.json") // created 0600
+	f, err := os.CreateTemp(dir, pattern) // created 0600
 	if err != nil {
 		return err
 	}
 	defer os.Remove(f.Name())
-	if _, err := f.Write(append(raw, '\n')); err != nil {
+	if _, err := f.Write(data); err != nil {
 		f.Close()
 		return err
 	}
