@@ -28,11 +28,22 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 import java.io.IOException
+import java.util.concurrent.atomic.AtomicLong
+
+/** A message for the user; the ID tells two with the same text apart. */
+data class Notice(val id: Long, val text: String)
+
+private val noticeIds = AtomicLong()
+
+/** Queues [text] for the user, if any. */
+private fun UiState.say(text: String?) =
+    if (text == null) this else copy(messages = messages + Notice(noticeIds.incrementAndGet(), text))
 
 data class UiState(
     val pairing: Pairing? = null,
     val busy: Boolean = false,
-    val message: String? = null,
+    /** Messages for the user, oldest first; each shows once, then is removed. */
+    val messages: List<Notice> = emptyList(),
     /** A scanned or opened pairing link waiting to fill the form. */
     val prefill: NotifierLink.Pair? = null,
     /** The channels this device could subscribe to; null until loaded. */
@@ -79,17 +90,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _state.update { it.copy(showHistory = false) }
     }
 
-    fun deleteHistory(id: String) = editHistory { historyStore.delete(id) }
+    fun deleteHistory(id: String) = editHistory("Notification deleted.") { historyStore.delete(id) }
 
-    fun clearHistory() = editHistory { historyStore.clear() }
+    fun clearHistory() = editHistory("History cleared.") { historyStore.clear() }
 
-    private fun editHistory(block: () -> Unit) {
+    private fun editHistory(done: String? = null, block: () -> Unit) {
         viewModelScope.launch {
             try {
                 withContext(Dispatchers.IO) { block() }
+                _state.update { it.say(done) }
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
-                _state.update { it.copy(message = "Could not update the history: ${e.message}") }
+                _state.update { it.say("Could not update the history: ${e.message}") }
             }
         }
     }
@@ -107,7 +119,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         viewModelScope.launch {
-            _state.update { it.copy(busy = true, message = null, pairError = null) }
+            _state.update { it.copy(busy = true, pairError = null) }
             val pairing = try {
                 val fcmToken = FirebaseMessaging.getInstance().token.await()
                 val name = deviceName.trim().ifEmpty { defaultDeviceName }
@@ -119,8 +131,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 _state.update { it.copy(busy = false, pairError = pairingError(e)) }
                 return@launch
             }
-            _state.update { it.copy(busy = false, pairing = pairing, message = "Paired.", askNotifications = true) }
-            run(null) { loadChannels(pairing) }
+            _state.update { it.copy(pairing = pairing, askNotifications = true) }
+            // Loaded here rather than through run(), which would clear "Paired." before it shows.
+            val loaded = try {
+                loadChannels(pairing)
+                null
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                e
+            }
+            _state.update {
+                it.copy(busy = false).say(if (loaded == null) "Paired." else "Paired, but the channels did not load: ${loaded.message}")
+            }
         }
     }
 
@@ -155,15 +178,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _state.update {
             val pairing = it.pairing
             when (link) {
-                null -> it.copy(message = "That is not a Notifier code.")
+                null -> it.say("That is not a Notifier code.")
                 is NotifierLink.Pair ->
-                    if (pairing != null) it.copy(message = "Already paired. Unpair first to pair with another server.")
+                    if (pairing != null) it.say("Already paired. Unpair first to pair with another server.")
                     else it.copy(prefill = link, pairError = null)
                 is NotifierLink.Join -> when {
-                    pairing == null -> it.copy(message = "Pair this phone first, then open the invite again.")
+                    pairing == null -> it.say("Pair this phone first, then open the invite again.")
                     // Pairings saved before origins were normalized may be spelled differently.
                     link.serverUrl != (NotifierLink.origin(pairing.serverUrl, allowHttp = true) ?: pairing.serverUrl) ->
-                        it.copy(message = "That invite is for another server (${link.serverUrl}).")
+                        it.say("That invite is for another server (${link.serverUrl}).")
                     else -> it.copy(pendingJoin = link)
                 }
             }
@@ -233,7 +256,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun showMessage(message: String) {
-        _state.update { it.copy(message = message) }
+        _state.update { it.say(message) }
     }
 
     fun sendTest() {
@@ -244,7 +267,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun unpair() {
         val pairing = _state.value.pairing ?: return
         viewModelScope.launch {
-            _state.update { it.copy(busy = true, message = null) }
+            _state.update { it.copy(busy = true) }
             val message = try {
                 withContext(Dispatchers.IO) { client.unpair(pairing) }
                 "Unpaired."
@@ -257,12 +280,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             store.clear()
             // The next pairing may be another account: its history starts empty.
             withContext(Dispatchers.IO) { historyStore.clear() }
-            _state.update { UiState(message = message) }
+            _state.update { UiState(messages = it.messages).say(message) }
         }
     }
 
-    fun dismissMessage() {
-        _state.update { it.copy(message = null) }
+    /** The snackbar for [id] has been shown. */
+    fun messageShown(id: Long) {
+        _state.update { state -> state.copy(messages = state.messages.filterNot { it.id == id }) }
     }
 
     private fun syncFcmToken(pairing: Pairing) {
@@ -283,7 +307,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun runWithMessage(block: suspend () -> String?) {
         viewModelScope.launch {
-            _state.update { it.copy(busy = true, message = null) }
+            _state.update { it.copy(busy = true) }
             val message = try {
                 block()
             } catch (e: ServerException) {
@@ -293,8 +317,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             } catch (e: Exception) {
                 "Failed: ${e.message}"
             }
-            // No message keeps one set meanwhile, such as a link opened at launch.
-            _state.update { it.copy(busy = false, message = message ?: it.message) }
+            _state.update { it.copy(busy = false).say(message) }
         }
     }
 }
