@@ -1,0 +1,46 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Opened by the notifier block: the notifyd history in a zenity window.
+# Double-click a row to read the whole message; Cancel closes the window.
+NOTIFYD=${NOTIFYD:-$(command -v notifyd || echo "$HOME/go/bin/notifyd")}
+# Where the notifier block reads which messages have been listed.
+SEEN=${SEEN:-${XDG_STATE_HOME:-$HOME/.local/state}/notifier/bar-seen}
+TITLE="notifier history"
+# Senders choose this text: control and format characters (terminal
+# escapes, bidi overrides) are removed before it is shown.
+UNSAFE='[\p{Cc}\p{Cf}]'
+
+while :; do
+	json=$("$NOTIFYD" history -json -n 0) || { zenity --error --title "$TITLE" --text "notifyd history failed."; exit 1; }
+	if [ "$(jq length <<<"$json")" -eq 0 ]; then
+		zenity --info --title "$TITLE" --text "Nothing received yet."
+		exit 0
+	fi
+	id=$(jq -r --arg re "$UNSAFE" '.[] |
+		.id,
+		(.received_at | strflocaltime("%Y-%m-%d %H:%M")),
+		(if .channel and ((.channel_id // "") | startswith("ch_default_") | not) then .channel | gsub($re; "") else "" end),
+		((.title | gsub($re; "")) + (if .priority == "high" then "  (high)" else "" end)),
+		((.body // "") | split("\n") | map(gsub($re; "")) | join("  ⏎  ") | .[0:120])' <<<"$json" |
+		zenity --list --title "$TITLE" --width 1000 --height 600 \
+			--text "Newest first. Double-click a message to read all of it." \
+			--column ID --column Received --column Channel --column Title --column Message \
+			--hide-column 1 --print-column 1 2>/dev/null)
+	status=$?
+	# Shown and closed (OK 0, Cancel 1): what it listed has been seen.
+	if [ $status -le 1 ]; then
+		mkdir -p "$(dirname "$SEEN")" && jq -r '.[].id' <<<"$json" >"$SEEN.tmp" && mv "$SEEN.tmp" "$SEEN"
+	fi
+	[ $status -eq 0 ] && [ -n "$id" ] || exit 0
+	jq -r --arg re "$UNSAFE" --arg id "$id" '.[] | select(.id == $id) |
+		(.title | gsub($re; "")),
+		"",
+		"Received " + (.received_at | strflocaltime("%Y-%m-%d %H:%M:%S")) +
+			", sent " + (.sent_at | strflocaltime("%Y-%m-%d %H:%M:%S")) +
+			(if .channel and ((.channel_id // "") | startswith("ch_default_") | not) then ", channel " + (.channel | gsub($re; "")) else "" end) +
+			(if .priority == "high" then ", high priority" else "" end),
+		"",
+		((.body // "") | split("\n") | map(gsub($re; "")) | join("\n"))' <<<"$json" |
+		zenity --text-info --title "$TITLE" --width 800 --height 500 2>/dev/null
+done

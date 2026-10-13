@@ -277,7 +277,10 @@ See `README.md` for the user-facing setup and API table.
   writes), `history.go` (the history file), `link.go`
   (`notifier://pair` parsing), `seal.go` (envelope v1 open, pinned by the
   shared vector), `stream.go` (connection loop), `desktop.go` (D-Bus),
-  `notifyd.service` (systemd user unit). The tests use `httptest`
+  `notifyd.service` (systemd user unit), `contrib/i3blocks/` (a status
+  bar block and its zenity history viewer, plain shell over `notifyd
+  history -json`; the viewer strips control and format characters, since
+  senders choose the text). The tests use `httptest`
   WebSocket servers and a fake `Desktop`.
 - `android/app/src/main/java/com/joncbenderkh/notifier/`
   - `data/` — `PairingStore` and `HistoryStore` (both over

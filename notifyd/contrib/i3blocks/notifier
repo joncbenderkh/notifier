@@ -1,0 +1,37 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# i3blocks block for notifyd, notifier's desktop daemon:
+#   NTF N    messages not yet listed in the history window (show-history)
+#   NTF off  (red) the notifyd user service is not running
+# Left click: open the history in a window, which marks what it lists seen.
+# Middle click: restart the service.
+# Needs jq, and zenity for the history window (show-history, beside this).
+
+NOTIFYD=${NOTIFYD:-$(command -v notifyd || echo "$HOME/go/bin/notifyd")}
+# The message IDs the history window has listed, one per line.
+SEEN=${XDG_STATE_HOME:-$HOME/.local/state}/notifier/bar-seen
+
+case $BLOCK_BUTTON in
+1)
+	NOTIFYD=$NOTIFYD SEEN=$SEEN setsid -f "$(dirname "$0")/show-history" >/dev/null 2>&1
+	;;
+2)
+	systemctl --user restart notifyd
+	;;
+esac
+
+if ! systemctl --user is-active --quiet notifyd; then
+	echo "NTF off"
+	echo "NTF off"
+	echo "#FF5555"
+	exit 0
+fi
+
+unread=$("$NOTIFYD" history -json -n 0 2>/dev/null |
+	jq --arg seen "$(cat "$SEEN" 2>/dev/null)" \
+		'($seen | split("\n")) as $s | [.[] | select(.id | IN($s[]) | not)] | length' 2>/dev/null)
+echo "NTF ${unread:-?}"
+echo "NTF ${unread:-?}"
+[ "${unread:-0}" -gt 0 ] 2>/dev/null && echo "#FFCC66"
+exit 0
