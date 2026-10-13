@@ -96,7 +96,7 @@ func loadState(path string) (State, error) {
 		return st, fmt.Errorf("state file %s: unexpected data after the JSON object", path)
 	}
 	if st.URL == "" || st.DeviceID == "" || st.DeviceToken == "" || st.SealKey == "" {
-		return st, fmt.Errorf("state file %s is incomplete; pair again with: notifyd pair -force LINK", path)
+		return st, fmt.Errorf("state file %s is incomplete; pair again with: notifyd pair --force LINK", path)
 	}
 	return st, nil
 }

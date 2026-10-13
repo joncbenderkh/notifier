@@ -232,7 +232,7 @@ func (a *app) listen() int {
 	err = s.run(ctx)
 	switch {
 	case errors.Is(err, errUnpaired):
-		a.logf("%v (notifyd pair -force LINK)", err)
+		a.logf("%v (notifyd pair --force LINK)", err)
 		return exitUnpaired
 	case errors.Is(err, errReplaced):
 		a.logf("%v; stopping", err)

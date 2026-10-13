@@ -4,7 +4,7 @@ Send authenticated, end-to-end encrypted push notifications to your Android
 phone with one command or one HTTP call.
 
 ```sh
-notify -to pixel -high "Backup finished" "2.4 GB in 3m12s"
+notify send --to pixel --high "Backup finished" "2.4 GB in 3m12s"
 ```
 
 ```sh
@@ -103,7 +103,7 @@ curl -X POST https://notifier.joncbender.workers.dev/v1/users -d '{"invite": "0Z
 ```
 
 Or, with the CLI, which saves the token to its config file:
-`notify -url https://notifier.joncbender.workers.dev signup 0Z5H-QCEA-3JX4 alice`.
+`notify --url https://notifier.joncbender.workers.dev signup 0Z5H-QCEA-3JX4 alice`.
 
 Users can invite others too (`POST /v1/invites` with their own token; at most
 ten each, used or not). `GET /v1/users` shows who invited whom; disabling a
@@ -154,7 +154,7 @@ curl -X POST https://notifier.joncbender.workers.dev/v1/keys \
 
 export NOTIFIER_URL=https://notifier.joncbender.workers.dev NOTIFIER_API_KEY=nk_...
 notify devices
-notify -to pixel "Hello"
+notify send --to pixel "Hello"
 ```
 
 ### 6. Channels
@@ -196,7 +196,7 @@ interval plus a grace period, the server sends one high-priority alert to
 the heartbeat's channel, and the next ping announces the recovery:
 
 ```sh
-notify heartbeat create -every 1d -grace 30m backup   # prints the ping URL, once
+notify heartbeat create --every 1d --grace 30m backup   # prints the ping URL, once
 # crontab:
 0 3 * * *  backup.sh && curl -fsS -m 10 --retry 3 https://…/v1/ping/nh_… >/dev/null
 ```
@@ -262,12 +262,12 @@ copy: it relays sealed messages and keeps no content.
 ## `notify` CLI
 
 ```
-notify [flags] TITLE [BODY | -]       send
-notify devices                        list your paired phones
+notify send [flags] TITLE [BODY | -]  send
+notify devices                        list your paired devices
 notify pair                           print a pairing QR code
-notify signup [-force] INVITE NAME    create a user; saves the token to the config file
+notify signup [--force] INVITE NAME   create a user; saves the token to the config file
 notify invite                         mint an invite for someone else
-notify config init [-force]           write the config file from -url/-token/-key
+notify config init [--force]          write the config file from --url/--token/--key
 notify keys                           list API keys
 notify key create [-c CHANNEL]... NAME   print a new API key, optionally scoped
 notify key delete NAME|ID
@@ -275,21 +275,29 @@ notify channels                       list channels you own or joined
 notify channel create|delete|invite|members|leave NAME
 notify channel join CODE
 notify channel remove NAME MEMBER
+notify heartbeats | heartbeat create|delete ...   see Heartbeats
+notify hooks | hook create|delete ...             see Webhooks
+notify completion bash|zsh|fish|powershell        shell completion script
 notify version
 
-  -to PHONE   device name (case-insensitive) or ID; repeatable or
-              comma-separated (a name containing a comma needs its ID)
-  -c CHANNEL  one of your own channels; repeatable or comma-separated.
-              Without -to or -c: the config file's, else the default
-              channel (every paired phone)
-  -high       high priority (heads-up, may wake the phone)
-  -url URL    server; must be https except for localhost or a loopback IP,
-              and redirects are refused
-  -key KEY    API key, for sending and `devices`
-  -token TOK  user token, for everything (sending included)
-  -timeout    request timeout (default 30s), counted from when the request
-              starts, not while waiting for stdin
+send flags:
+  --to DEVICE      device name (case-insensitive) or ID; repeatable or
+                   comma-separated (a name containing a comma needs its ID)
+  -c, --channel C  one of your own channels; repeatable or comma-separated.
+                   Without --to or -c: the config file's, else the default
+                   channel (every paired device)
+  --high           high priority (heads-up, may wake the phone)
+
+Flags for every command:
+  --url URL        server; must be https except for localhost or a loopback
+                   IP, and redirects are refused
+  --key KEY        API key, for sending and `devices`
+  --token TOK      user token, for everything (sending included)
+  --timeout D      request timeout (default 30s), counted from when the
+                   request starts, not while waiting for stdin
 ```
+
+Every command has `--help` (`notify pair -h`, `notify hook create --help`).
 
 Settings come from flags, then the environment (`NOTIFIER_URL`,
 `NOTIFIER_API_KEY`, `NOTIFIER_TOKEN`), then the config file
@@ -321,24 +329,23 @@ the same file.
 A new user's whole setup, with an invite from the operator or another user:
 
 ```sh
-notify -url https://notifier.joncbender.workers.dev signup 0Z5H-QCEA-3JX4 alice
+notify --url https://notifier.joncbender.workers.dev signup 0Z5H-QCEA-3JX4 alice
 notify pair                                # scan with the phone
 notify channel create homelab
 notify key create -c homelab homelab-cron  # an API key that may only post there
-notify -c homelab "disk full"
+notify send -c homelab "disk full"
 ```
 
-Flags must come before TITLE or the subcommand; everything from TITLE on is
-message text, so a body taken from a variable can never act as a flag. A
-subcommand word counts only in a command's shape: `devices`, `pair`,
-`invite`, `keys`, `channels`, `heartbeats`, `hooks` and `version` alone, and
-`signup`, `config`, `key`, `channel`, `heartbeat` and `hook` with arguments; so `notify channel` sends a message,
-while `notify channel "$BODY"` is refused rather than guessed. Put `--`
-before a title that starts with `-` or is meant as a message in one of
-those shapes.
+Only `notify send` sends; a first word is always a command, and an unknown
+one is an error. The flags of `send` come before TITLE: everything from
+TITLE on is message text, so a body taken from a variable can never act as
+a flag. Put `--` before a title that starts with `-`
+(`notify send -- "$TITLE" "$BODY"` is safe for any title). Long flags take
+two dashes since 0.4.0 (`--high`, not `-high`); an old spelling is refused
+with a hint.
 
 A `BODY` of `-` reads standard input, so a long job can report when it
-finishes: `make test 2>&1 | tail -5 | notify "Tests" -`. Only the last 8 KiB
+finishes: `make test 2>&1 | tail -5 | notify send "Tests" -`. Only the last 8 KiB
 of a piped stream is held in memory. Terminal escapes (colours) are
 removed, carriage returns become newlines, invalid UTF-8 and other
 characters the server refuses are replaced, and text over
@@ -374,11 +381,11 @@ machine is asleep or offline are queued for up to a day.
 ```sh
 go install github.com/joncbenderkh/notifier/notifyd@latest
 notify pair                       # prints the QR code and a notifier://pair link
-notifyd pair 'notifier://pair?server=...&code=...'   # or: notifyd pair -server URL CODE
+notifyd pair 'notifier://pair?server=...&code=...'   # or: notifyd pair --server URL CODE
 install -Dm644 notifyd/notifyd.service ~/.config/systemd/user/notifyd.service
 systemctl --user enable --now notifyd
 notifyd test                      # sends this desktop a test notification
-notifyd history                   # what it received, newest first (-n COUNT, -json)
+notifyd history                   # what it received, newest first (-n COUNT, --json)
 ```
 
 The unit runs `~/go/bin/notifyd`, where `go install` puts it; with a
@@ -438,7 +445,7 @@ only prints its usage.
 
 `notifyd` stops, and systemd does not restart it, in three cases:
 - the device was unpaired on the server (exit status 4); pair it again
-  with `notifyd pair -force LINK`;
+  with `notifyd pair --force LINK`;
 - another `notifyd` connected as the same device (exit status 5);
 - it is not paired at all (exit status 4).
 
