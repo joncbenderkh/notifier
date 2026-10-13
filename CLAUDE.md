@@ -233,6 +233,42 @@ See `README.md` for the user-facing setup and API table.
   the server check, which deploys on merge. Clients still filter what they
   display: older rows, a 24 h stream queue, and other servers can hold
   such text.
+- **Heartbeats (issue #29):** dead-man's switches in `heartbeats`
+  (migration 0005), checked by a cron trigger every minute
+  (`wrangler.jsonc` `triggers`, `scheduled` in `index.ts`). A heartbeat is
+  `up`, `down` or `failed`. The check alerts `up` and `failed` ones past
+  `due_at` (last ping, or creation, plus interval and grace), so a job
+  that reported a failure and then stopped is still caught. `markDown` is
+  a conditional UPDATE, so overlapping runs alert once, and `down` is not
+  checked, so there are no repeats; an alert that reached no device is
+  undone (`unmarkDown`) and retried a minute later, queued behind
+  heartbeats that went overdue earlier so failing ones cannot crowd them
+  out; a channel deleted mid-check falls back to `default`. A ping
+  (`/v1/ping/<nh_ secret>`; the secret is the credential, hashed like the
+  others, and appears in Workers request logs, which only the operator
+  reads) moves `due_at`. `recordPing` reads the state and changes it in
+  one batch (a transaction), so of two pings only one announces the
+  recovery, with the right duration. `/fail` is recorded first, then
+  alerts every time. A recovery or failure notice is queued in
+  `pending_notice` (a newer one replaces it) and sent at once under a
+  lease (`notice_due_at`), or, past the user's send limit, left for the
+  cron trigger; whatever reaches no device the cron retries, oldest first,
+  claiming each with a conditional UPDATE so overlapping runs send it
+  once. A missed check-in drops a pending recovery notice but keeps a
+  failure's, and `unmarkDown` restores what it dropped. HEAD requests to
+  ping URLs (link checkers) record nothing; its body (up to 1 MiB,
+  past the 16 KiB API limit) is cleaned server-side (`cleanTail` in
+  `text.ts`), since curl cannot clean it. Pings are limited per heartbeat
+  (`NOTIFY_LIMITER`, `ping:<id>`). The INSERT checks the channel still
+  exists, so a concurrent channel deletion cannot strand a heartbeat. Alerts go through `publish.ts` like any
+  send, to the heartbeat's channel; deleting that channel moves its
+  heartbeats to `default` so monitoring never stops silently. Disabled
+  users' heartbeats neither ping nor alert. Rollback leaves data
+  intact (the previous Worker ignores the table), but redeploying it does
+  not remove the cron trigger: wrangler changes schedules only when
+  `triggers.crons` is set. Deploy `"triggers": {"crons": []}` with it, or
+  remove the trigger in the dashboard, or the schedule keeps invoking a
+  Worker with no `scheduled` handler every minute.
 - **Wire format (envelope v1):** FCM data `{"v":"1","n":<b64 nonce>,"c":<b64
   ciphertext>}`; AES-256-GCM, 12-byte nonce, 128-bit tag, per-device key,
   AAD = device ID. Plaintext is the JSON `Payload` (`server/src/app.ts`,
@@ -284,7 +320,12 @@ See `README.md` for the user-facing setup and API table.
   WebSocket transport (exported from `index.ts`).
 - `server/src/{pairing,pairPage}.ts` — the `notifier://pair` link and QR, and
   the static `/pair` page.
-- `server/src/index.ts` — the deployed entry point.
+- `server/src/publish.ts` — sealing and fan-out to devices, shared by
+  `POST /v1/notifications` and heartbeat alerts.
+- `server/src/heartbeats.ts` — heartbeat alerts and the cron check;
+  `server/src/text.ts` — what text and names may hold, and `cleanTail`.
+- `server/src/index.ts` — the deployed entry point (`fetch` and the
+  `scheduled` cron handler).
 - `notify/` — `main.go` (flags, settings, sending, exit codes),
   `commands.go` (subcommands), `config.go` (config file), `client.go` (API
   client, name → ID resolution), `pair.go` (terminal QR). `main_test.go` and
