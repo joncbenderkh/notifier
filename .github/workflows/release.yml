@@ -40,8 +40,41 @@ jobs:
           files: notify/dist/*
           generate_release_notes: true
 
+  notifyd:
+    name: Build notifyd binaries
+    # The notify job creates the release; uploading in parallel races it.
+    needs: notify
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: notifyd
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: notifyd/go.mod
+          cache-dependency-path: notifyd/go.sum
+
+      # Linux only: it talks to the desktop over D-Bus.
+      - name: Build binaries
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath \
+              -ldflags "-s -w -X main.version=$version" \
+              -o "dist/notifyd-linux-$arch" .
+          done
+          cp notifyd.service dist/
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: notifyd/dist/*
+
   android-unsigned:
     name: Build unsigned Android release artifacts
+    needs: notify
     runs-on: ubuntu-latest
     defaults:
       run:
