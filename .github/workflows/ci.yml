@@ -51,10 +51,17 @@ jobs:
 
   notifyd:
     runs-on: ubuntu-latest
+    # The history window (cmd/notifyd-history) binds libadwaita 1.9, newer
+    # than Ubuntu ships.
+    container: fedora:44
     defaults:
       run:
         working-directory: notifyd
     steps:
+      - name: Install build dependencies
+        working-directory: /
+        run: dnf install -y --setopt=install_weak_deps=False gcc git tar libadwaita-devel
+
       - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v7
