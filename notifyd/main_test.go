@@ -208,7 +208,7 @@ func TestForcedPairUnpairsTheOldDevice(t *testing.T) {
 	a, _, stderr := newTestApp(t)
 	saveState(a.statePath, State{URL: api.URL, DeviceID: "dev_old", DeviceToken: "nd_old", SealKey: testKey, Name: "old"})
 
-	if code := a.run([]string{"pair", "-force", "-server", api.URL, "-name", "desk", "CODE"}); code != 0 {
+	if code := a.run([]string{"pair", "--force", "--server", api.URL, "--name", "desk", "CODE"}); code != 0 {
 		t.Fatalf("exit %d: %s", code, stderr)
 	}
 	if len(api.requests) != 2 || api.bodies[0]["name"] != "desk" || api.requests[1] != "DELETE /v1/device Bearer nd_old" {
@@ -226,7 +226,7 @@ func TestForcedPairWithABadCodeKeepsTheOldPairing(t *testing.T) {
 	a, _, _ := newTestApp(t)
 	old := State{URL: api.URL, DeviceID: "dev_old", DeviceToken: "nd_old", SealKey: testKey, Name: "old"}
 	saveState(a.statePath, old)
-	if code := a.run([]string{"pair", "-force", "-server", api.URL, "BAD"}); code != exitError {
+	if code := a.run([]string{"pair", "--force", "--server", api.URL, "BAD"}); code != exitError {
 		t.Fatalf("exit %d", code)
 	}
 	if len(api.requests) != 1 || !strings.HasPrefix(api.requests[0], "POST") {
@@ -242,7 +242,7 @@ func TestPairReportsTheServersRefusal(t *testing.T) {
 	api.status["POST /v1/devices"] = http.StatusForbidden
 	api.answer["POST /v1/devices"] = `{"error":"pairing code is invalid, expired, or already used"}`
 	a, _, stderr := newTestApp(t)
-	if code := a.run([]string{"pair", "-server", api.URL, "CODE"}); code != exitError || !strings.Contains(stderr.String(), "already used") {
+	if code := a.run([]string{"pair", "--server", api.URL, "CODE"}); code != exitError || !strings.Contains(stderr.String(), "already used") {
 		t.Fatalf("exit %d: %s", code, stderr)
 	}
 	if _, err := os.Stat(a.statePath); err == nil {
@@ -254,8 +254,8 @@ func TestPairUsageErrors(t *testing.T) {
 	for _, args := range [][]string{
 		{"pair"},
 		{"pair", "CODE"},
-		{"pair", "-server", "http://notifier.example", "CODE"},
-		{"pair", "-server", "https://x.example", "notifier://pair?server=https://x.example&code=C"},
+		{"pair", "--server", "http://notifier.example", "CODE"},
+		{"pair", "--server", "https://x.example", "notifier://pair?server=https://x.example&code=C"},
 		{"pair", "notifier://join?server=https://x.example&code=C"},
 		{"run", "extra"},
 		{"bogus"},
@@ -351,5 +351,27 @@ func TestBareInvocationPrintsUsage(t *testing.T) {
 	a := &app{stdout: new(bytes.Buffer), stderr: new(bytes.Buffer)}
 	if code := a.run(nil); code != exitUsage || !strings.Contains(a.stderr.(*bytes.Buffer).String(), "Usage:") {
 		t.Fatalf("exit %d: %s", code, a.stderr)
+	}
+}
+
+func TestHelpUnknownCommandsAndOldFlags(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		code int
+		out  string
+	}{
+		{[]string{"-h"}, 0, "Available Commands"},
+		{[]string{"help", "pair"}, 0, "--server"},
+		{[]string{"pair", "--help"}, 0, "--force"},
+		{[]string{"listen"}, exitUsage, `unknown command "listen"`},
+		{[]string{"history", "-json"}, exitUsage, "--json"},
+		{[]string{"completion", "bash"}, 0, "bash completion"},
+	} {
+		a := &app{stdout: new(bytes.Buffer), stderr: new(bytes.Buffer), statePath: "/nonexistent/s", historyPath: "/nonexistent/h"}
+		code := a.run(tc.args)
+		out := a.stdout.(*bytes.Buffer).String() + a.stderr.(*bytes.Buffer).String()
+		if code != tc.code || !strings.Contains(out, tc.out) {
+			t.Errorf("%q: exit %d, output %.300q", tc.args, code, out)
+		}
 	}
 }

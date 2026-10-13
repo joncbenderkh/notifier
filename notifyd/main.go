@@ -11,7 +11,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -35,23 +34,6 @@ const (
 	// Another notifyd is connected as this device.
 	exitReplaced = 5
 )
-
-const usage = `Usage:
-  notifyd pair [-name NAME] [-force] LINK
-  notifyd pair -server URL [-name NAME] [-force] CODE
-  notifyd run
-  notifyd test
-  notifyd history [-n COUNT] [-json]
-  notifyd history clear
-  notifyd unpair
-  notifyd version
-
-Pair with the notifier://pair link (or the code) from ` + "`notify pair`" + `, then
-` + "`notifyd run`" + `, usually as a systemd user service. The pairing is kept in
-$XDG_CONFIG_HOME/notifier/notifyd.json (override with NOTIFYD_STATE), and
-what it received in $XDG_STATE_HOME/notifier/notifyd-history.jsonl (override
-with NOTIFYD_HISTORY).
-`
 
 type app struct {
 	stdout, stderr io.Writer
@@ -83,12 +65,34 @@ func refuseRedirect(*http.Request, []*http.Request) error {
 	return errors.New("the server answered with a redirect; check its URL")
 }
 
+// run executes the command line and returns the exit code.
 func (a *app) run(args []string) int {
-	if len(args) == 0 {
-		// Not run: a second daemon would take over from the service's.
-		fmt.Fprint(a.stderr, usage)
-		return exitUsage
+	root := a.newRoot()
+	if cmd, rest, err := root.Find(args); err == nil {
+		if f := oldStyleFlag(cmd, rest); f != "" {
+			fmt.Fprintf(a.stderr, "notifyd: unknown flag -%s; long flags take two dashes since 0.4.0: --%s\n", f, f)
+			return exitUsage
+		}
 	}
+	root.SetArgs(args)
+	root.SetOut(a.stdout)
+	root.SetErr(a.stderr)
+	cmd, err := root.ExecuteC()
+	var code exitCode
+	switch {
+	case err == nil:
+		return 0
+	case errors.As(err, &code):
+		return int(code)
+	}
+	// Cobra's own: an unknown command or flag, or a wrong argument count.
+	fmt.Fprintln(a.stderr, "notifyd:", err)
+	fmt.Fprintf(a.stderr, "Run '%s --help' for usage.\n", cmd.CommandPath())
+	return exitUsage
+}
+
+// paths resolves the state and history files, unless set (by tests).
+func (a *app) paths() int {
 	if a.statePath == "" {
 		p, err := statePath()
 		if err != nil {
@@ -108,26 +112,7 @@ func (a *app) run(args []string) int {
 	if a.now == nil {
 		a.now = time.Now
 	}
-	switch cmd, args := args[0], args[1:]; cmd {
-	case "pair":
-		return a.pair(args)
-	case "run":
-		return a.listen(args)
-	case "test":
-		return a.test(args)
-	case "history":
-		return a.history(args)
-	case "unpair":
-		return a.unpair(args)
-	case "version":
-		fmt.Fprintln(a.stdout, "notifyd", version)
-		return 0
-	case "help", "-h", "-help", "--help":
-		fmt.Fprint(a.stdout, usage)
-		return 0
-	}
-	fmt.Fprint(a.stderr, usage)
-	return exitUsage
+	return 0
 }
 
 func (a *app) logf(format string, args ...any) {
@@ -139,44 +124,27 @@ func (a *app) fail(err error) int {
 	return exitError
 }
 
-// noArgs rejects arguments for commands that take none.
-func (a *app) noArgs(cmd string, args []string) bool {
-	if len(args) == 0 {
-		return true
-	}
-	fmt.Fprintf(a.stderr, "notifyd: %s takes no arguments\n", cmd)
-	return false
+// pairOptions are the flags of `notifyd pair`.
+type pairOptions struct {
+	server, name string
+	force        bool
 }
 
-func (a *app) pair(args []string) int {
-	fs := flag.NewFlagSet("pair", flag.ContinueOnError)
-	fs.SetOutput(a.stderr)
-	server := fs.String("server", "", "server URL, when pairing with a bare `code`")
-	name := fs.String("name", "", "device `name` (default: this machine's hostname)")
-	force := fs.Bool("force", false, "replace an existing pairing, unpairing it first")
-	fs.Usage = func() { fmt.Fprint(a.stderr, usage) }
-	if err := fs.Parse(args); err != nil {
-		return exitUsage
-	}
-	if fs.NArg() != 1 {
-		fs.Usage()
-		return exitUsage
-	}
-
+func (a *app) pair(arg string, o pairOptions) int {
 	var srv, code string
 	var err error
-	if arg := fs.Arg(0); strings.Contains(arg, "://") {
-		if *server != "" {
-			fmt.Fprintln(a.stderr, "notifyd: -server is only for a bare code; the link names its server")
+	if strings.Contains(arg, "://") {
+		if o.server != "" {
+			fmt.Fprintln(a.stderr, "notifyd: --server is only for a bare code; the link names its server")
 			return exitUsage
 		}
 		srv, code, err = parsePairLink(arg)
 	} else {
-		if *server == "" {
-			fmt.Fprintln(a.stderr, "notifyd: give the notifier://pair link, or -server with the code")
+		if o.server == "" {
+			fmt.Fprintln(a.stderr, "notifyd: give the notifier://pair link, or --server with the code")
 			return exitUsage
 		}
-		srv, err = origin(*server)
+		srv, err = origin(o.server)
 		code = arg
 	}
 	if err != nil {
@@ -187,16 +155,16 @@ func (a *app) pair(args []string) int {
 	old, err := loadState(a.statePath)
 	hadOld := err == nil
 	switch {
-	case hadOld && !*force:
-		return a.fail(fmt.Errorf("already paired as %q with %s; run `notifyd unpair` first, or pass -force", old.Name, old.URL))
-	case !hadOld && !errors.Is(err, errNotPaired) && !*force:
+	case hadOld && !o.force:
+		return a.fail(fmt.Errorf("already paired as %q with %s; run `notifyd unpair` first, or pass --force", old.Name, old.URL))
+	case !hadOld && !errors.Is(err, errNotPaired) && !o.force:
 		return a.fail(err)
 	}
 
-	deviceName := *name
+	deviceName := o.name
 	if deviceName == "" {
 		if deviceName, err = a.hostname(); err != nil || deviceName == "" {
-			return a.fail(errors.New("cannot read this machine's hostname; pass -name"))
+			return a.fail(errors.New("cannot read this machine's hostname; pass --name"))
 		}
 	}
 	var reg struct {
@@ -234,10 +202,7 @@ func (a *app) pair(args []string) int {
 	return 0
 }
 
-func (a *app) listen(args []string) int {
-	if !a.noArgs("run", args) {
-		return exitUsage
-	}
+func (a *app) listen() int {
 	st, err := loadState(a.statePath)
 	if errors.Is(err, errNotPaired) {
 		// Nothing to run until it is paired: don't let systemd retry.
@@ -278,10 +243,7 @@ func (a *app) listen(args []string) int {
 	return 0
 }
 
-func (a *app) test(args []string) int {
-	if !a.noArgs("test", args) {
-		return exitUsage
-	}
+func (a *app) test() int {
 	st, err := loadState(a.statePath)
 	if err != nil {
 		return a.fail(err)
@@ -309,10 +271,7 @@ func (a *app) test(args []string) int {
 	return 0
 }
 
-func (a *app) unpair(args []string) int {
-	if !a.noArgs("unpair", args) {
-		return exitUsage
-	}
+func (a *app) unpair() int {
 	st, err := loadState(a.statePath)
 	if err != nil {
 		return a.fail(err)
@@ -396,37 +355,28 @@ func (a *app) call(method, url, token string, body, out any) error {
 	return json.Unmarshal(raw, out)
 }
 
-func (a *app) history(args []string) int {
-	if len(args) > 0 && args[0] == "clear" {
-		if !a.noArgs("history clear", args[1:]) {
-			return exitUsage
-		}
-		if err := withHistoryLock(a.historyPath, func() error { return clearHistory(a.historyPath) }); err != nil {
-			return a.fail(err)
-		}
-		fmt.Fprintln(a.stdout, "History cleared.")
-		return 0
+func (a *app) historyClear() int {
+	if err := withHistoryLock(a.historyPath, func() error { return clearHistory(a.historyPath) }); err != nil {
+		return a.fail(err)
 	}
-	fs := flag.NewFlagSet("history", flag.ContinueOnError)
-	fs.SetOutput(a.stderr)
-	n := fs.Int("n", 20, "show the `count` newest messages; 0 shows all")
-	asJSON := fs.Bool("json", false, "print the entries as a JSON array, newest first")
-	fs.Usage = func() { fmt.Fprint(a.stderr, usage) }
-	if err := fs.Parse(args); err != nil {
-		return exitUsage
-	}
-	if fs.NArg() != 0 || *n < 0 {
-		fs.Usage()
+	fmt.Fprintln(a.stdout, "History cleared.")
+	return 0
+}
+
+// history prints the [n] newest entries (all for 0).
+func (a *app) history(n int, asJSON bool) int {
+	if n < 0 {
+		fmt.Fprintln(a.stderr, "notifyd: -n must be 0 or more")
 		return exitUsage
 	}
 	entries, err := readHistory(a.historyPath, a.now())
 	if err != nil {
 		return a.fail(err)
 	}
-	if *n > 0 && len(entries) > *n {
-		entries = entries[:*n]
+	if n > 0 && len(entries) > n {
+		entries = entries[:n]
 	}
-	if *asJSON {
+	if asJSON {
 		if entries == nil {
 			entries = []historyEntry{}
 		}
