@@ -63,8 +63,8 @@ See `README.md` for the user-facing setup and API table.
   static and secret-free under a strict CSP (no inline script or style);
   the user pastes their token, which never leaves page memory. The
   app scans with Google's code scanner (`play-services-code-scanner`; no
-  camera permission) and also handles the link as a deep link. Either way
-  it only pre-fills the form — never pair without the user tapping Pair, or
+  camera permission), handles the link as a deep link, and takes it pasted
+  (issue #41). Each way it only pre-fills the form — never pair without the user tapping Pair, or
   a hostile QR code could silently point the phone at another server. A
   join link likewise asks before joining, and only for the paired server.
 - **Android channels:** each Notifier channel except the user's `default`

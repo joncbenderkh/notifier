@@ -7,13 +7,17 @@ import android.os.Build
 import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
@@ -21,6 +25,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -43,16 +48,23 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.google.mlkit.common.MlKitException
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
 import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
+import com.joncbenderkh.notifier.BuildConfig
+import com.joncbenderkh.notifier.R
 import com.joncbenderkh.notifier.data.DeviceChannel
 import com.joncbenderkh.notifier.data.NotifierLink
 import com.joncbenderkh.notifier.data.Pairing
@@ -69,6 +81,11 @@ fun NotifierScreen(viewModel: MainViewModel = viewModel()) {
             snackbar.showSnackbar(it)
             viewModel.dismissMessage()
         }
+    }
+
+    val permission = rememberNotificationPermission()
+    LaunchedEffect(state.askNotifications, permission.granted) {
+        if (state.askNotifications && permission.granted) viewModel.notificationsAsked()
     }
 
     val history by viewModel.history.collectAsStateWithLifecycle()
@@ -101,19 +118,21 @@ fun NotifierScreen(viewModel: MainViewModel = viewModel()) {
                 verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
                 if (state.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
-                NotificationPermissionCard()
                 val pairing = state.pairing
                 if (pairing == null) {
                     PairingForm(
                         defaultName = viewModel.defaultDeviceName,
-                        enabled = !state.busy,
+                        busy = state.busy,
+                        error = state.pairError,
                         prefill = state.prefill,
                         onPrefillConsumed = viewModel::consumePrefill,
                         onScanned = viewModel::openLink,
                         onScanFailed = viewModel::showMessage,
+                        onReset = viewModel::clearPairError,
                         onPair = viewModel::pair,
                     )
                 } else {
+                    if (!permission.granted) NotificationPermissionCard(permission.request)
                     PairedPanel(
                         pairing,
                         enabled = !state.busy,
@@ -137,6 +156,26 @@ fun NotifierScreen(viewModel: MainViewModel = viewModel()) {
                 }
             }
         }
+    }
+
+    if (state.askNotifications && !permission.granted) {
+        AlertDialog(
+            onDismissRequest = viewModel::notificationsAsked,
+            title = { Text("Allow notifications?") },
+            text = {
+                Text(
+                    "Notifier needs Android's notification permission to show incoming alerts. " +
+                        "Messages are still received and saved to history if you choose not to allow it."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    viewModel.notificationsAsked()
+                    permission.request()
+                }) { Text("Continue") }
+            },
+            dismissButton = { TextButton(onClick = viewModel::notificationsAsked) { Text("Not now") } },
+        )
     }
 
     state.pendingJoin?.let { link ->
@@ -183,24 +222,34 @@ private fun rememberQrScanner(onScanned: (String) -> Unit, onScanFailed: (String
     }
 }
 
+/** Whether notifications may be shown, and a way to ask Android for it. */
+private class NotificationPermission(val granted: Boolean, val request: () -> Unit)
+
 @Composable
-private fun NotificationPermissionCard() {
-    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+private fun rememberNotificationPermission(): NotificationPermission {
     val context = LocalContext.current
-    var granted by remember {
-        mutableStateOf(
-            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) ==
-                PackageManager.PERMISSION_GRANTED
-        )
+    fun check() = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+        ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) ==
+        PackageManager.PERMISSION_GRANTED
+    var granted by remember { mutableStateOf(check()) }
+    // The user may change it in system settings while the app is in the background.
+    LifecycleResumeEffect(Unit) {
+        granted = check()
+        onPauseOrDispose {}
     }
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted = it }
-    if (granted) return
+    return NotificationPermission(granted) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) launcher.launch(Manifest.permission.POST_NOTIFICATIONS)
+    }
+}
 
+@Composable
+private fun NotificationPermissionCard(onAllow: () -> Unit) {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("Notifications are off", style = MaterialTheme.typography.titleMedium)
             Text("Messages will arrive but cannot be shown until notifications are allowed.")
-            Button(onClick = { launcher.launch(Manifest.permission.POST_NOTIFICATIONS) }) {
+            Button(onClick = onAllow) {
                 Text("Allow notifications")
             }
         }
@@ -210,70 +259,182 @@ private fun NotificationPermissionCard() {
 @Composable
 private fun PairingForm(
     defaultName: String,
-    enabled: Boolean,
+    busy: Boolean,
+    error: String?,
     prefill: NotifierLink.Pair?,
     onPrefillConsumed: () -> Unit,
     onScanned: (String) -> Unit,
     onScanFailed: (String) -> Unit,
+    onReset: () -> Unit,
     onPair: (String, String, String) -> Unit,
 ) {
     var serverUrl by rememberSaveable { mutableStateOf("https://") }
     var code by rememberSaveable { mutableStateOf("") }
     var name by rememberSaveable { mutableStateOf(defaultName) }
+    // The form shows once a QR code or link filled it in, or on request.
+    var filled by rememberSaveable { mutableStateOf(false) }
+    var manual by rememberSaveable { mutableStateOf(false) }
+    var pasting by rememberSaveable { mutableStateOf(false) }
+
+    fun fill(link: NotifierLink.Pair) {
+        serverUrl = link.serverUrl
+        code = link.code
+        filled = true
+    }
 
     LaunchedEffect(prefill) {
         if (prefill != null) {
-            serverUrl = prefill.serverUrl
-            code = prefill.code
+            fill(prefill)
             onPrefillConsumed()
         }
     }
 
     val scan = rememberQrScanner(onScanned, onScanFailed)
 
-    Text("Pair with a server", style = MaterialTheme.typography.titleLarge)
-    Text(
-        "Open the server's /pair page or run `notify pair`, then scan the QR code " +
-            "(or enter the code by hand) within ten minutes."
-    )
-    Button(
-        onClick = scan,
-        enabled = enabled,
-        modifier = Modifier.fillMaxWidth(),
+    Box(
+        Modifier
+            .padding(top = 8.dp)
+            .size(64.dp)
+            .background(MaterialTheme.colorScheme.secondaryContainer, RoundedCornerShape(20.dp)),
+        contentAlignment = Alignment.Center,
     ) {
-        Text("Scan QR code")
+        Icon(
+            painterResource(R.drawable.ic_lock),
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSecondaryContainer,
+            modifier = Modifier.size(30.dp),
+        )
     }
-    OutlinedTextField(
-        value = serverUrl,
-        onValueChange = { serverUrl = it },
-        label = { Text("Server URL") },
-        singleLine = true,
-        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
-        modifier = Modifier.fillMaxWidth(),
-    )
-    OutlinedTextField(
-        value = code,
-        onValueChange = { code = it },
-        label = { Text("Pairing code") },
-        placeholder = { Text("XXXX-XXXX") },
-        singleLine = true,
-        keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Characters),
-        modifier = Modifier.fillMaxWidth(),
-    )
-    OutlinedTextField(
-        value = name,
-        onValueChange = { name = it },
-        label = { Text("Device name") },
-        singleLine = true,
-        modifier = Modifier.fillMaxWidth(),
-    )
-    Button(
-        onClick = { onPair(serverUrl, code, name) },
-        enabled = enabled && code.isNotBlank(),
-        modifier = Modifier.fillMaxWidth(),
-    ) {
-        Text("Pair")
+    Text("Your server. Your notifications.", style = MaterialTheme.typography.headlineSmall)
+    Text("Pair this phone with your notifier server. Messages stay encrypted until this phone decrypts them.")
+
+    if (!filled && !manual) {
+        Button(onClick = scan, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
+            Text("Scan QR code")
+        }
+        OutlinedButton(onClick = { pasting = true }, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
+            Text("Paste link")
+        }
+        TextButton(onClick = { manual = true }, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
+            Text("Enter details by hand")
+        }
+        Text(
+            "Get a code from your server's /pair page or `notify pair`. Codes last ten minutes.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    } else {
+        if (filled) Text("Details filled in. Review them, then pair.", style = MaterialTheme.typography.titleSmall)
+        OutlinedTextField(
+            value = serverUrl,
+            onValueChange = { serverUrl = it },
+            label = { Text("Server URL") },
+            singleLine = true,
+            enabled = !busy,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = code,
+            onValueChange = { code = it },
+            label = { Text("Pairing code") },
+            placeholder = { Text("XXXX-XXXX") },
+            singleLine = true,
+            enabled = !busy,
+            isError = error != null,
+            keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Characters),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = name,
+            onValueChange = { name = it },
+            label = { Text("Device name") },
+            singleLine = true,
+            enabled = !busy,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        if (error != null) {
+            Text(
+                error,
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+            )
+        }
+        Button(
+            onClick = { onPair(serverUrl, code, name) },
+            enabled = !busy && code.isNotBlank(),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(if (busy) "Pairing…" else "Pair")
+        }
+        TextButton(
+            onClick = {
+                serverUrl = "https://"
+                code = ""
+                filled = false
+                manual = false
+                onReset()
+            },
+            enabled = !busy,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("Use another QR code or link")
+        }
     }
+
+    if (pasting) {
+        PasteLinkDialog(
+            onDismiss = { pasting = false },
+            onLink = {
+                pasting = false
+                onReset()
+                fill(it)
+            },
+        )
+    }
+}
+
+/** Takes a pasted `notifier://pair` link; it only fills the form. */
+@Composable
+private fun PasteLinkDialog(onDismiss: () -> Unit, onLink: (NotifierLink.Pair) -> Unit) {
+    var text by rememberSaveable { mutableStateOf("") }
+    var error by rememberSaveable { mutableStateOf<String?>(null) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Paste pairing link") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Paste the notifier://pair link from your server.")
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = {
+                        text = it
+                        error = null
+                    },
+                    label = { Text("Pairing link") },
+                    singleLine = true,
+                    isError = error != null,
+                    supportingText = error?.let { { Text(it) } },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    when (val link = NotifierLink.parse(text.trim(), allowHttp = BuildConfig.DEBUG)) {
+                        is NotifierLink.Pair -> onLink(link)
+                        is NotifierLink.Join -> error = "That is a channel invite. Pair first, then open it."
+                        null -> error = "Enter a notifier://pair link."
+                    }
+                },
+                enabled = text.isNotBlank(),
+            ) { Text("Fill details") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }
 
 @Composable
