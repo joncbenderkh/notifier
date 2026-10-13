@@ -42,6 +42,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -61,6 +62,7 @@ import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -513,20 +515,25 @@ private fun PairedHeader(pairing: Pairing) {
         Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
     ) {
-        Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Column(Modifier.padding(20.dp)) {
             Text(
-                "Paired with $host",
-                style = MaterialTheme.typography.bodyMedium,
+                "Paired with",
+                style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            Text(pairing.deviceName, style = MaterialTheme.typography.titleLarge)
+            Text(host, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
+            Text(
+                pairing.deviceName,
+                style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.padding(top = 12.dp),
+            )
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
-                modifier = Modifier.padding(top = 8.dp),
+                modifier = Modifier.padding(top = 12.dp),
             ) {
-                Icon(painterResource(R.drawable.ic_lock), contentDescription = null, modifier = Modifier.size(16.dp))
-                Text("End-to-end encrypted", style = MaterialTheme.typography.labelLarge)
+                Icon(painterResource(R.drawable.ic_lock), contentDescription = null, modifier = Modifier.size(14.dp))
+                Text("End-to-end encrypted", style = MaterialTheme.typography.labelMedium)
             }
         }
     }
@@ -539,7 +546,7 @@ private fun ChannelList(
     onToggle: (String, Boolean) -> Unit,
 ) {
     Column {
-        Text("Channels", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(bottom = 4.dp))
+        Text("Channels", style = MaterialTheme.typography.labelLarge, modifier = Modifier.padding(bottom = 4.dp))
         if (channels == null) {
             Text("Not loaded yet.", color = MaterialTheme.colorScheme.onSurfaceVariant)
             return
@@ -551,8 +558,13 @@ private fun ChannelList(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.padding(vertical = 12.dp),
             ) {
-                Column(Modifier.weight(1f).padding(end = 16.dp)) {
-                    Text(channel.name, style = MaterialTheme.typography.bodyLarge, fontFamily = FontFamily.Monospace)
+                Column(Modifier.weight(1f).padding(end = 16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(
+                        channel.name,
+                        style = MaterialTheme.typography.titleSmall,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                    )
                     Text(
                         if (isDefault) "Always subscribed"
                         else "Gets its own notification settings once a message arrives",
@@ -564,6 +576,11 @@ private fun ChannelList(
                     checked = channel.subscribed || isDefault,
                     onCheckedChange = { onToggle(channel.id, it) },
                     enabled = enabled && !isDefault,
+                    // Always on, so it must still read as on.
+                    colors = SwitchDefaults.colors(
+                        disabledCheckedTrackColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.45f),
+                        disabledCheckedThumbColor = MaterialTheme.colorScheme.surface,
+                    ),
                 )
             }
             if (index < channels.lastIndex) HorizontalDivider()
