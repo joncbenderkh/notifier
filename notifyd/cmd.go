@@ -62,7 +62,10 @@ func (a *app) newRoot() *cobra.Command {
 	})
 	history.Flags().IntVarP(&count, "count", "n", 20, "show the `count` newest messages; 0 shows all")
 	history.Flags().BoolVar(&asJSON, "json", false, "print the entries as a JSON array, newest first")
-	history.AddCommand(leaf("clear", "Forget the messages received", cobra.NoArgs, none(a.historyClear)))
+	history.AddCommand(
+		leaf("clear", "Forget the messages received", cobra.NoArgs, none(a.historyClear)),
+		leaf("delete ID...", "Forget the messages with these IDs", cobra.MinimumNArgs(1), a.historyDelete),
+	)
 
 	root.AddCommand(
 		pair,
