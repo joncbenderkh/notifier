@@ -391,3 +391,79 @@ func TestSaveConfigWritesThroughSymlinks(t *testing.T) {
 		t.Fatalf("config %+v, %v", cfg, err)
 	}
 }
+
+func TestHeartbeatCommands(t *testing.T) {
+	due := time.Now().Add(time.Hour)
+	f := newFakeAPI(t, map[string]any{
+		"POST /v1/heartbeats": Heartbeat{ID: "hb_1", Name: "backup", PingURL: "https://n.example/v1/ping/nh_x"},
+		"GET /v1/heartbeats": []Heartbeat{
+			{ID: "hb_1", Name: "backup", Channel: "default", Interval: 86400, State: "up", DueAt: &due},
+			{ID: "hb_2", Name: "sync", Channel: "ops", Interval: 5400, State: "down", LastPingAt: &due},
+		},
+		"DELETE /v1/heartbeats/hb_2": nil,
+	})
+
+	code, stdout, stderr := f.run("-token", testToken, "heartbeat", "create", "-every", "1d12h", "-grace", "10m", "-c", "ops", "backup")
+	if code != 0 || strings.TrimSpace(stdout) != "https://n.example/v1/ping/nh_x" || !strings.Contains(stderr, "curl -fsS") {
+		t.Fatalf("exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+	if got := f.got[0].Body; got["name"] != "backup" || got["interval"] != float64(129600) || got["grace"] != float64(600) || got["channel"] != "ops" {
+		t.Fatalf("got %+v", got)
+	}
+
+	code, stdout, _ = f.run("-token", testToken, "heartbeats")
+	if code != 0 || !strings.Contains(stdout, "backup") || !strings.Contains(stdout, "1d") || !strings.Contains(stdout, "1h30m") {
+		t.Fatalf("exit %d, stdout %q", code, stdout)
+	}
+
+	if code, stdout, stderr = f.run("-token", testToken, "heartbeat", "delete", "sync"); code != 0 || !strings.Contains(stdout, "hb_2") {
+		t.Fatalf("exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+	if code, _, _ = f.run("-token", testToken, "heartbeat", "create", "-every", "soon", "x"); code != exitUsage {
+		t.Fatalf("bad -every: exit %d", code)
+	}
+	if code, _, _ = f.run("-token", testToken, "heartbeat", "delete", "nosuch"); code != exitError {
+		t.Fatalf("no match: exit %d", code)
+	}
+	// "heartbeats" with a body is a message; "heartbeat" with one is a command.
+	sent := len(f.got)
+	f.run("-token", testToken, "heartbeats", "body")
+	if len(f.got) != sent+1 || f.got[sent].Route != "POST /v1/notifications" || f.got[sent].Body["title"] != "heartbeats" {
+		t.Fatalf("heartbeats BODY sent %+v", f.got[sent:])
+	}
+	if code, _, _ = f.run("-token", testToken, "heartbeat", "body"); code != exitUsage {
+		t.Fatalf("heartbeat BODY: exit %d", code)
+	}
+}
+
+func TestHeartbeatDeletePrefersAnExactID(t *testing.T) {
+	f := newFakeAPI(t, map[string]any{
+		"GET /v1/heartbeats":         []Heartbeat{{ID: "hb_1", Name: "a"}, {ID: "hb_2", Name: "hb_1"}, {ID: "hb_3", Name: "dup"}, {ID: "hb_4", Name: "dup"}},
+		"DELETE /v1/heartbeats/hb_1": nil,
+	})
+	if code, stdout, stderr := f.run("-token", testToken, "heartbeat", "delete", "hb_1"); code != 0 || !strings.Contains(stdout, "hb_1") {
+		t.Fatalf("exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+	if code, _, stderr := f.run("-token", testToken, "heartbeat", "delete", "dup"); code != exitError || !strings.Contains(stderr, "2 heartbeats match") {
+		t.Fatalf("ambiguous: exit %d, stderr %q", code, stderr)
+	}
+}
+
+func TestParseEvery(t *testing.T) {
+	good := map[string]time.Duration{"30m": 30 * time.Minute, "6h": 6 * time.Hour, "1d": 24 * time.Hour, "2d6h30m": 54*time.Hour + 30*time.Minute, "90s": 90 * time.Second}
+	for in, want := range good {
+		if got, err := parseEvery(in); err != nil || got != want {
+			t.Errorf("parseEvery(%q) = %v, %v", in, got, err)
+		}
+	}
+	for _, in := range []string{"", "0s", "-1h", "1.5s", "d", "xd", "1d-2d", "soon", "-1d30h", "1d-1h", "+1h", "99999d"} {
+		if _, err := parseEvery(in); err == nil {
+			t.Errorf("parseEvery(%q) accepted", in)
+		}
+	}
+	for d, want := range map[time.Duration]string{24 * time.Hour: "1d", 90 * time.Minute: "1h30m", 6 * time.Hour: "6h", 36 * time.Hour: "1d12h", 45 * time.Second: "45s", time.Hour + time.Second: "1h1s"} {
+		if got := formatEvery(d); got != want {
+			t.Errorf("formatEvery(%v) = %q, want %q", d, got, want)
+		}
+	}
+}

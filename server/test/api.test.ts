@@ -16,6 +16,7 @@ import {
 } from "../src/app";
 import type { Delivery, Payload } from "../src/app";
 import { fromBase64 } from "../src/encoding";
+import { heartbeatAlerts, MAX_HEARTBEATS_PER_USER } from "../src/heartbeats";
 import { UnregisteredError } from "../src/push";
 import type { PushMessage, Sender } from "../src/push";
 import { open } from "../src/seal";
@@ -80,7 +81,7 @@ beforeEach(async () => {
     env.DB.prepare("DELETE FROM pairings"),
     env.DB.prepare("DELETE FROM users"),
     env.DB.prepare("DELETE FROM invites"),
-    ...["channels", "channel_members", "subscriptions", "channel_invites", "api_key_channels"].map((t) =>
+    ...["channels", "channel_members", "subscriptions", "channel_invites", "api_key_channels", "heartbeats"].map((t) =>
       env.DB.prepare(`DELETE FROM ${t}`),
     ),
   ]);
@@ -832,3 +833,264 @@ describe("channels", () => {
     await call("POST", "/v1/notifications", USER, { title: "x", channels: ["../etc"] }, 400);
   });
 });
+
+describe("heartbeats", () => {
+  interface Created {
+    id: string;
+    ping_url: string;
+  }
+  interface Listed {
+    name: string;
+    channel: string;
+    state: string;
+    last_ping_at?: string;
+    due_at: string;
+  }
+
+  const create = (body: object, status = 201) => call<Created>("POST", "/v1/heartbeats", USER, body, status);
+  const check = () => heartbeatAlerts({ sender: () => sender, stream: (_, id) => streams.for(id), now: () => now }).check(env);
+
+  async function ping(url: string, suffix = "", body?: string, wantStatus = 200): Promise<void> {
+    const res = await app.request(new URL(url).pathname + suffix, { method: body === undefined ? "GET" : "POST", body }, env);
+    expect(res.status, await res.text()).toBe(wantStatus);
+  }
+
+  it("creates, lists and deletes heartbeats", async () => {
+    const hb = await create({ name: "backup", interval: 86400 });
+    expect(hb.ping_url).toMatch(/^http:\/\/localhost\/v1\/ping\/nh_[a-z2-7]+$/);
+    let list = await call<Listed[]>("GET", "/v1/heartbeats", USER, undefined, 200);
+    expect(list).toEqual([
+      expect.objectContaining({ name: "backup", channel: "default", state: "up", interval: 86400, grace: 300 }),
+    ]);
+    expect(list[0]).not.toHaveProperty("last_ping_at");
+
+    now += 60;
+    await ping(hb.ping_url);
+    list = await call<Listed[]>("GET", "/v1/heartbeats", USER, undefined, 200);
+    expect(list[0]!.last_ping_at).toBeDefined();
+    expect(Date.parse(list[0]!.due_at) / 1000).toBe(now + 86400 + 300);
+
+    // Others cannot see or delete it; API keys cannot manage heartbeats.
+    const bob = await signup("bob");
+    expect(await call("GET", "/v1/heartbeats", bob, undefined, 200)).toEqual([]);
+    await call("DELETE", `/v1/heartbeats/${hb.id}`, bob, undefined, 404);
+    await call("GET", "/v1/heartbeats", await apiKey(), undefined, 401);
+    await call("DELETE", `/v1/heartbeats/${hb.id}`, USER, undefined, 204);
+    await ping(hb.ping_url, "", undefined, 404);
+  });
+
+  it("validates and caps heartbeats", async () => {
+    await create({ name: "x", interval: 59 }, 400);
+    await create({ name: "x", interval: 60.5 }, 400);
+    await create({ name: "x", interval: 3600, grace: 86401 }, 400);
+    await create({ name: "x", interval: 3600, channel: "nope" }, 404);
+    await create({ name: "x\u001b", interval: 3600 }, 400);
+    await create({ name: "x", interval: 3600, extra: 1 }, 400);
+    await create({ name: "x", interval: 3600 });
+    await create({ name: "x", interval: 3600 }, 409);
+    for (let i = 1; i < MAX_HEARTBEATS_PER_USER; i++) await create({ name: `job${i}`, interval: 3600 });
+    await create({ name: "one-too-many", interval: 3600 }, 403);
+    await ping("http://localhost/v1/ping/nh_NOTASECRET", "", undefined, 404);
+    await ping("http://localhost/v1/ping/nk_NOTASECRET", "", undefined, 404);
+  });
+
+  it("alerts a missed check-in once, then announces the recovery", async () => {
+    const phone = await pair("phone", "fcm-phone");
+    const hb = await create({ name: "backup", interval: 3600, grace: 60 });
+    await ping(hb.ping_url);
+
+    now += 3600 + 59;
+    await check();
+    expect(sender.sent).toHaveLength(0);
+
+    now += 1;
+    await check();
+    await check(); // an overlapping run alerts nothing more
+    expect(sender.sent).toHaveLength(1);
+    expect(await payloadFor(phone, 0)).toMatchObject({
+      title: "backup: missed check-in",
+      body: "Last check-in 1 h 1 min ago; expected every 1 h.",
+      priority: "high",
+      channel: "default",
+    });
+    expect(sender.sent[0]!.high).toBe(true);
+
+    now += 7200;
+    await ping(hb.ping_url);
+    await ping(hb.ping_url);
+    expect(sender.sent).toHaveLength(2);
+    expect(await payloadFor(phone, 1)).toMatchObject({
+      title: "backup: checked in again",
+      body: "Down for 2 h.",
+      priority: "default",
+    });
+  });
+
+  it("alerts a heartbeat that never checked in", async () => {
+    const phone = await pair("phone", "fcm-phone");
+    await create({ name: "renew", interval: 86400 });
+    now += 86400 + 300;
+    await check();
+    expect(await payloadFor(phone, 0)).toMatchObject({
+      title: "renew: missed check-in",
+      body: "No check-in since it was created 1 d ago; expected every 1 d.",
+    });
+  });
+
+  it("reports failures with the posted log, cleaned", async () => {
+    const phone = await pair("phone", "fcm-phone");
+    const hb = await create({ name: "build", interval: 3600 });
+    await ping(hb.ping_url, "/fail", "\u001b[31mFAIL\u001b[0m step 3\r\nexit\u0000 1\n");
+    await ping(hb.ping_url, "/fail");
+    expect(await payloadFor(phone, 0)).toMatchObject({ title: "build: failed", body: "FAIL step 3\nexit\uFFFD 1", priority: "high" });
+    expect(await payloadFor(phone, 1)).toMatchObject({ body: "The job reported a failure." });
+    let list = await call<Listed[]>("GET", "/v1/heartbeats", USER, undefined, 200);
+    expect(list[0]!.state).toBe("failed");
+
+    now += 600;
+    await ping(hb.ping_url);
+    expect(await payloadFor(phone, 2)).toMatchObject({ title: "build: checked in again", body: "Failed for 10 min." });
+    list = await call<Listed[]>("GET", "/v1/heartbeats", USER, undefined, 200);
+    expect(list[0]!.state).toBe("up");
+  });
+
+  it("still alerts a failed heartbeat whose job stops running", async () => {
+    const phone = await pair("phone", "fcm-phone");
+    const hb = await create({ name: "build", interval: 3600 });
+    await ping(hb.ping_url, "/fail");
+    now += 3600 + 300;
+    await check();
+    expect(await payloadFor(phone, 1)).toMatchObject({ title: "build: missed check-in" });
+  });
+
+  it("retries a missed-check-in alert that reached no device", async () => {
+    const phone = await pair("phone", "fcm-phone");
+    await create({ name: "backup", interval: 3600 });
+    now += 3600 + 300;
+    const failing: Sender = { send: () => Promise.reject(new Error("FCM down")) };
+    await heartbeatAlerts({ sender: () => failing, stream: (_, id) => streams.for(id), now: () => now }).check(env);
+    let list = await call<Listed[]>("GET", "/v1/heartbeats", USER, undefined, 200);
+    expect(list[0]!.state).toBe("up");
+    // Retried behind heartbeats that went overdue earlier.
+    expect(Date.parse(list[0]!.due_at) / 1000).toBe(now + 60);
+
+    now += 60;
+    await check();
+    expect(await payloadFor(phone, 0)).toMatchObject({ title: "backup: missed check-in" });
+    list = await call<Listed[]>("GET", "/v1/heartbeats", USER, undefined, 200);
+    expect(list[0]!.state).toBe("down");
+  });
+
+  it("retries a recovery notice that reached no device", async () => {
+    const phone = await pair("phone", "fcm-phone");
+    const hb = await create({ name: "backup", interval: 3600 });
+    now += 3600 + 300;
+    await check();
+    const failing: Sender = { send: () => Promise.reject(new Error("FCM down")) };
+    const downApp = createApp({ sender: () => failing, stream: (_, id) => streams.for(id), now: () => now });
+    now += 600;
+    const res = await downApp.request(new URL(hb.ping_url).pathname, {}, env);
+    expect(res.status).toBe(200);
+    expect(sender.sent).toHaveLength(1); // only the missed check-in so far
+
+    now += 60;
+    await check();
+    expect(await payloadFor(phone, 1)).toMatchObject({ title: "backup: checked in again", body: "Down for 10 min." });
+    await check();
+    expect(sender.sent).toHaveLength(2); // delivered once, then cleared
+  });
+
+  it("never delivers a notice a newer one replaced", async () => {
+    const phone = await pair("phone", "fcm-phone");
+    const hb = await create({ name: "backup", interval: 3600 });
+    now += 3600 + 300;
+    await check();
+    const failing: Sender = { send: () => Promise.reject(new Error("FCM down")) };
+    const downApp = createApp({ sender: () => failing, stream: (_, id) => streams.for(id), now: () => now });
+    await downApp.request(new URL(hb.ping_url).pathname, {}, env); // recovery kept pending
+    await ping(hb.ping_url, "/fail"); // delivered, replacing it
+    now += 600;
+    await check();
+    await Promise.all([check(), check()]); // overlapping runs
+    expect(await Promise.all(sender.sent.map((_, i) => payloadFor(phone, i).then((p) => p.title)))).toEqual([
+      "backup: missed check-in",
+      "backup: failed",
+    ]);
+  });
+
+  it("ignores HEAD requests to ping URLs", async () => {
+    const phone = await pair("phone", "fcm-phone");
+    const hb = await create({ name: "build", interval: 3600 });
+    for (const suffix of ["", "/fail"]) {
+      const res = await app.request(new URL(hb.ping_url).pathname + suffix, { method: "HEAD" }, env);
+      expect(res.status).toBe(200);
+    }
+    expect(sender.sent).toHaveLength(0);
+    const list = await call<Listed[]>("GET", "/v1/heartbeats", USER, undefined, 200);
+    expect(list[0]).toMatchObject({ state: "up" });
+    expect(list[0]).not.toHaveProperty("last_ping_at");
+    void phone;
+  });
+
+  it("keeps a pending failure notice when the missed alert fails too", async () => {
+    const phone = await pair("phone", "fcm-phone");
+    const hb = await create({ name: "build", interval: 3600 });
+    const failing: Sender = { send: () => Promise.reject(new Error("FCM down")) };
+    const deps = { sender: () => failing, stream: (_: Env, id: string) => streams.for(id), now: () => now };
+    await createApp(deps).request(new URL(hb.ping_url).pathname + "/fail", { method: "POST", body: "the log" }, env);
+    now += 3600 + 300;
+    await heartbeatAlerts(deps).check(env); // missed alert fails and is undone
+    now += 60;
+    await check();
+    const titles = await Promise.all(sender.sent.map((_, i) => payloadFor(phone, i).then((p) => [p.title, p.body])));
+    expect(titles).toContainEqual(["build: failed", "the log"]);
+    expect(titles).toContainEqual(["build: missed check-in", expect.any(String)]);
+  });
+
+  it("accepts a failure log larger than an API request", async () => {
+    const phone = await pair("phone", "fcm-phone");
+    const hb = await create({ name: "build", interval: 3600 });
+    await ping(hb.ping_url, "/fail", "log line\n".repeat(10_000) + "the error\n");
+    expect((await payloadFor(phone, 0)).body).toMatch(/^….*the error$/s);
+  });
+
+  it("keeps the tail of a long failure log", async () => {
+    const phone = await pair("phone", "fcm-phone");
+    const hb = await create({ name: "build", interval: 3600 });
+    await ping(hb.ping_url, "/fail", "x".repeat(5000) + "\nthe error");
+    const body = (await payloadFor(phone, 0)).body!;
+    expect(body.startsWith("…")).toBe(true);
+    expect(body.endsWith("the error")).toBe(true);
+    expect(new TextEncoder().encode(body).length).toBeLessThanOrEqual(2048);
+  });
+
+  it("alerts the channel's subscribers, and default once the channel is deleted", async () => {
+    const phone = await pair("phone", "fcm-phone");
+    const ops = await channel("ops");
+    await call("PUT", "/v1/device/channels", phone.device_token, { channel_ids: [`ch_default_${await userId()}`] }, 200);
+    const hb = await create({ name: "backup", interval: 3600, channel: "ops" });
+    now += 3600 + 300;
+    await check();
+    expect(sender.sent).toHaveLength(0); // the phone does not subscribe to ops
+
+    await call("DELETE", `/v1/channels/${ops}`, USER, undefined, 204);
+    const list = await call<Listed[]>("GET", "/v1/heartbeats", USER, undefined, 200);
+    expect(list[0]!.channel).toBe("default");
+    await ping(hb.ping_url);
+    expect(await payloadFor(phone, 0)).toMatchObject({ title: "backup: checked in again", channel: "default" });
+  });
+
+  it("ignores a disabled user's heartbeats", async () => {
+    await pair("phone", "fcm-phone");
+    const hb = await create({ name: "backup", interval: 3600 });
+    await call("POST", `/v1/users/${await userId()}/disable`, ADMIN, undefined, 204);
+    await ping(hb.ping_url, "", undefined, 404);
+    now += 3600 + 300;
+    await check();
+    expect(sender.sent).toHaveLength(0);
+  });
+});
+
+async function userId(): Promise<string> {
+  return (await call<{ id: string }>("GET", "/v1/user", USER, undefined, 200)).id;
+}

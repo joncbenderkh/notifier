@@ -188,6 +188,32 @@ curl -X POST $S/v1/notifications -H "$T" -d '{"title": "disk full", "channels": 
   typing the code. Each channel other than `default` gets its own group in
   Android's notification settings, so it can be muted or given a sound.
 
+### Heartbeats
+
+A heartbeat catches the job that silently stops running. The job pings a
+secret URL after each successful run; when no ping arrives within the
+interval plus a grace period, the server sends one high-priority alert to
+the heartbeat's channel, and the next ping announces the recovery:
+
+```sh
+notify heartbeat create -every 1d -grace 30m backup   # prints the ping URL, once
+# crontab:
+0 3 * * *  backup.sh && curl -fsS -m 10 --retry 3 https://…/v1/ping/nh_… >/dev/null
+```
+
+A job can also report a failure straight away: `…/fail` alerts at once,
+and a POSTed body (`backup.sh 2>&1 | tail -20 | curl -fsS --data-binary @-
+…/fail`, up to 1 MiB) becomes the message, cleaned and cut to its last
+2048 bytes. A heartbeat that never checks in alerts too, one interval plus
+grace after it was created, and so does one that reported a failure and
+then stopped running. `notify heartbeats` lists them with their state;
+`notify heartbeat delete NAME` removes one. Deleting a channel moves its
+heartbeats to `default`.
+
+The URL is the credential, so treat it like an API key. The server checks
+every minute; intervals run from 1 minute to 30 days, grace from 1 minute
+to a day (default 5 minutes), and each user has up to 20 heartbeats.
+
 ### History
 
 The app keeps the notifications it received, so one dismissed by accident
@@ -272,8 +298,8 @@ notify -c homelab "disk full"
 Flags must come before TITLE or the subcommand; everything from TITLE on is
 message text, so a body taken from a variable can never act as a flag. A
 subcommand word counts only in a command's shape: `devices`, `pair`,
-`invite`, `keys`, `channels` and `version` alone, and `signup`, `config`,
-`key` and `channel` with arguments; so `notify channel` sends a message,
+`invite`, `keys`, `channels`, `heartbeats` and `version` alone, and
+`signup`, `config`, `key`, `channel` and `heartbeat` with arguments; so `notify channel` sends a message,
 while `notify channel "$BODY"` is refused rather than guessed. Put `--`
 before a title that starts with `-` or is meant as a message in one of
 those shapes.
@@ -426,6 +452,11 @@ another user's device or key IDs answer 404.
 | `GET /v1/device/channels`         | Device               | Channels its owner can subscribe to, with `subscribed` |
 | `PUT /v1/device/channels`         | Device               | `{"channel_ids"}` (must include `default`) |
 | `POST /v1/device/memberships`     | Device               | `{"invite"}`: its owner joins, and the device subscribes |
+| `POST /v1/heartbeats`             | User                 | `{"name", "interval", "grace"?, "channel"?}` (seconds; grace defaults to 300, channel to `default`). Returns `ping_url`, once. At most 20 per user |
+| `GET /v1/heartbeats`              | User                 | With `state` (`up`, `down`, `failed`), `last_ping_at`, `due_at` |
+| `DELETE /v1/heartbeats/{id}`      | User                 | |
+| `GET`/`POST /v1/ping/{secret}`    | The URL              | A check-in; announces a recovery from `down` or `failed` |
+| `GET`/`POST /v1/ping/{secret}/fail` | The URL            | Reports a failure at once; a POSTed body becomes the message |
 | `GET /healthz`                    | —                    | |
 
 Limits: title 256 bytes, body 2048 bytes. Titles and bodies may not

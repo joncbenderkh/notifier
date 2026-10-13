@@ -14,13 +14,25 @@ import { Hono } from "hono";
 import type { Context, MiddlewareHandler } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { HTTPException } from "hono/http-exception";
+import {
+  DEFAULT_GRACE_SECONDS,
+  HEARTBEAT_SECRET_PREFIX,
+  heartbeatAlerts,
+  MAX_GRACE_SECONDS,
+  MAX_HEARTBEATS_PER_USER,
+  MAX_INTERVAL_SECONDS,
+  MIN_GRACE_SECONDS,
+  MIN_INTERVAL_SECONDS,
+} from "./heartbeats";
 import { pairPageRoutes } from "./pairPage";
-import { fromBase64, toBase64 } from "./encoding";
+import { toBase64 } from "./encoding";
 import { joinUri, pairingUri, qrSvg } from "./pairing";
-import { UnregisteredError } from "./push";
 import type { Sender } from "./push";
+import { addSubscribers, channelLabel, publisher } from "./publish";
+import type { Target } from "./publish";
 import type { Stream } from "./stream";
-import { newSealKey, seal } from "./seal";
+import { newSealKey } from "./seal";
+import { cleanTail, UNSAFE_IN_NAME, UNSAFE_IN_TEXT, utf8Length } from "./text";
 import * as store from "./store";
 import type { Channel, Device, User } from "./store";
 import {
@@ -38,7 +50,7 @@ import {
 
 export const PAIRING_TTL_SECONDS = 10 * 60;
 export const INVITE_TTL_SECONDS = 7 * 24 * 60 * 60;
-export const MESSAGE_TTL_SECONDS = 24 * 60 * 60;
+export { MESSAGE_TTL_SECONDS } from "./publish";
 export const MAX_DEVICES_PER_USER = 20;
 export const MAX_API_KEYS_PER_USER = 20;
 export const MAX_INVITES_PER_USER = 10;
@@ -51,19 +63,10 @@ export const MAX_PENDING_INVITES_PER_CHANNEL = 10;
 export const MAX_CHANNELS_PER_REQUEST = 20;
 const CHANNEL_NAME = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 const MAX_REQUEST_BYTES = 16 * 1024;
+const MAX_PING_BYTES = 1024 * 1024;
 const MAX_TITLE_BYTES = 256;
 const MAX_BODY_BYTES = 2048;
 const MAX_NAME_BYTES = 64;
-/**
- * Characters a client could be spoofed or driven by: C0 and C1 controls
- * and DEL (terminal escapes), and the bidi embeddings, overrides and
- * isolates (reordering what is shown). Bidi marks and joiners stay
- * allowed: right-to-left text and emoji sequences need them.
- */
-const UNSAFE_IN_NAME = /[\p{Cc}\u202A-\u202E\u2066-\u2069]/u;
-/** As in names, but a message may span lines and hold tabs. */
-const UNSAFE_IN_TEXT = /[^\P{Cc}\t\n]|[\u202A-\u202E\u2066-\u2069]/u;
-const ENVELOPE_VERSION = "1";
 const MIN_ADMIN_TOKEN_LENGTH = 32;
 
 export interface Deps {
@@ -107,7 +110,6 @@ export interface Delivery {
   error?: string;
 }
 
-const utf8Length = (s: string) => new TextEncoder().encode(s).length;
 const iso = (seconds: number) => new Date(seconds * 1000).toISOString().replace(".000Z", "Z");
 
 function fail(status: 400 | 401 | 403 | 404 | 409 | 426 | 429 | 503, message: string): never {
@@ -173,9 +175,6 @@ async function apiKeyFromToken(c: Context<AppEnv>, now: number): Promise<store.A
   if (!secret.startsWith(API_KEY_PREFIX)) return null;
   return store.apiKeyByHash(c.env.DB, await sha256Hex(secret), now);
 }
-
-/** How a member sees a channel: bare when they own it, "owner/name" otherwise. */
-const channelLabel = (ch: Channel, viewer: string) => (ch.owner_id === viewer ? ch.name : `${ch.owner_name}/${ch.name}`);
 
 function stringList(raw: unknown, field: string): string[] {
   if (raw === undefined || raw === null) return [];
@@ -301,36 +300,25 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     return store.deleteDevice(env.DB, userId, deviceId);
   }
 
-  async function deliver(env: Env, d: Device, p: Payload): Promise<Delivery> {
-    if (d.transport === "fcm" && d.fcm_token === "") return { device_id: d.id, status: "unreachable" };
-    try {
-      const envelope = await seal(fromBase64(d.seal_key), d.id, new TextEncoder().encode(JSON.stringify(p)));
-      const data = { v: ENVELOPE_VERSION, n: toBase64(envelope.nonce), c: toBase64(envelope.ciphertext) };
-      if (d.transport === "ws") {
-        const status = await deps.stream(env, d.id).deliver({
-          id: p.id,
-          frame: JSON.stringify({ type: "message", id: p.id, ...data }),
-          expiresAt: deps.now() + MESSAGE_TTL_SECONDS,
-        });
-        return { device_id: d.id, status };
-      }
-      await deps.sender(env).send({ token: d.fcm_token, high: p.priority === "high", ttlSeconds: MESSAGE_TTL_SECONDS, data });
-      return { device_id: d.id, status: "sent" };
-    } catch (err) {
-      if (err instanceof UnregisteredError) {
-        console.warn("push token unregistered; clearing", d.id);
-        // Other devices may already have been sent to; never turn this into a 500.
-        await store.setFcmToken(env.DB, d.id, "").catch((dbErr: unknown) => {
-          console.error("clear push token failed", d.id, dbErr);
-        });
-        return { device_id: d.id, status: "unreachable" };
-      }
-      console.error("push send failed", d.id, err);
-      return { device_id: d.id, status: "failed", error: "push transport error" };
+  const { deliver, publish } = publisher(deps);
+  const alerts = heartbeatAlerts(deps);
+
+  /** Whole seconds within [min, max], or [fallback] when absent. */
+  function seconds(raw: unknown, field: string, min: number, max: number, fallback?: number): number {
+    if ((raw === undefined || raw === null) && fallback !== undefined) return fallback;
+    if (typeof raw !== "number" || !Number.isInteger(raw) || raw < min || raw > max) {
+      fail(400, `${field} must be whole seconds from ${min} to ${max}`);
     }
+    return raw;
   }
 
-  app.use("*", bodyLimit({ maxSize: MAX_REQUEST_BYTES, onError: (c) => c.json({ error: "request too large" }, 413) }));
+  // A failure report may post a whole log, of which only the tail is kept.
+  const tooLarge = (c: Context) => c.json({ error: "request too large" }, 413);
+  const apiLimit: MiddlewareHandler<AppEnv> = bodyLimit({ maxSize: MAX_REQUEST_BYTES, onError: tooLarge });
+  const pingLimit: MiddlewareHandler<AppEnv> = bodyLimit({ maxSize: MAX_PING_BYTES, onError: tooLarge });
+  const limit: MiddlewareHandler<AppEnv> = (c, next) =>
+    c.req.path.startsWith("/v1/ping/") ? pingLimit(c, next) : apiLimit(c, next);
+  app.use("*", limit);
 
   app.get("/healthz", (c) => c.json({ status: "ok" }));
   pairPageRoutes(app);
@@ -680,6 +668,101 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     return c.json({ id: p.id, deliveries: [await deliver(c.env, c.get("device"), p)] });
   });
 
+  // --- heartbeats ---
+
+  app.post("/v1/heartbeats", user, async (c) => {
+    const req = await readJson<{ name: string; interval: number; grace: number; channel: string }>(c, [
+      "name",
+      "interval",
+      "grace",
+      "channel",
+    ]);
+    const userId = c.get("userId");
+    const name = validName(req.name);
+    const interval = seconds(req.interval, "interval", MIN_INTERVAL_SECONDS, MAX_INTERVAL_SECONDS);
+    const grace = seconds(req.grace, "grace", MIN_GRACE_SECONDS, MAX_GRACE_SECONDS, DEFAULT_GRACE_SECONDS);
+    const [channel] = await ownedChannels(c.env.DB, userId, channelNames([req.channel ?? "default"]));
+    const now = deps.now();
+    const hb: store.Heartbeat = {
+      id: newId("hb_"),
+      user_id: userId,
+      channel_id: channel!.id,
+      name,
+      interval_s: interval,
+      grace_s: grace,
+      created_at: now,
+      last_ping_at: null,
+      due_at: now + interval + grace,
+      state: "up",
+      changed_at: now,
+      pending_notice: null,
+      notice_due_at: null,
+    };
+    const secret = newSecret(HEARTBEAT_SECRET_PREFIX);
+    const created = await store.createHeartbeat(c.env.DB, hb, await sha256Hex(secret), MAX_HEARTBEATS_PER_USER);
+    if (created === "exists") fail(409, `you already have a heartbeat named "${name}"`);
+    if (created === "full") fail(403, `at most ${MAX_HEARTBEATS_PER_USER} heartbeats per user`);
+    if (created === "gone") fail(404, `you have no channel named "${channel!.name}"`);
+    return c.json(
+      {
+        id: hb.id,
+        name,
+        channel: channel!.name,
+        interval,
+        grace,
+        ping_url: `${new URL(c.req.url).origin}/v1/ping/${secret}`,
+        created_at: iso(now),
+      },
+      201,
+    );
+  });
+
+  app.get("/v1/heartbeats", user, async (c) => {
+    const heartbeats = await store.listHeartbeats(c.env.DB, c.get("userId"));
+    return c.json(
+      heartbeats.map((hb) => ({
+        id: hb.id,
+        name: hb.name,
+        channel: hb.channel_name,
+        interval: hb.interval_s,
+        grace: hb.grace_s,
+        state: hb.state,
+        ...(hb.last_ping_at === null ? {} : { last_ping_at: iso(hb.last_ping_at) }),
+        due_at: iso(hb.due_at),
+        created_at: iso(hb.created_at),
+      })),
+    );
+  });
+
+  app.delete("/v1/heartbeats/:id", user, async (c) => {
+    if (!(await store.deleteHeartbeat(c.env.DB, c.get("userId"), c.req.param("id")))) fail(404, "not found");
+    return c.body(null, 204);
+  });
+
+  // The secret in the path is the credential, so cron jobs need only curl.
+  app.on(["GET", "POST"], ["/v1/ping/:secret", "/v1/ping/:secret/fail"], async (c) => {
+    const secret = c.req.param("secret");
+    const hb = secret.startsWith(HEARTBEAT_SECRET_PREFIX)
+      ? await store.heartbeatBySecretHash(c.env.DB, await sha256Hex(secret))
+      : null;
+    if (!hb) fail(404, "no such heartbeat");
+    // Link checkers and unfurlers send HEAD; only a real request counts.
+    if (c.req.method === "HEAD") return c.body(null, 200);
+    if (!(await c.env.NOTIFY_LIMITER.limit({ key: `ping:${hb.id}` })).success) fail(429, "too many pings; try again in a minute");
+    const failed = c.req.path.endsWith("/fail");
+    const details = failed && c.req.method === "POST" ? cleanTail(await c.req.text(), MAX_BODY_BYTES) : "";
+    const left = await store.recordPing(c.env.DB, hb.id, deps.now(), failed);
+    // Every reported failure is news; a plain ping only when it ends a
+    // failure or outage. Past the user's send limit, the notice waits for
+    // the cron trigger (one a minute per heartbeat) instead of going out now.
+    if (failed || left) {
+      const later = !(await c.env.NOTIFY_LIMITER.limit({ key: hb.user_id })).success;
+      if (failed) await alerts.failed(c.env, hb, details, later);
+      else await alerts.recovered(c.env, hb, left!, later);
+    }
+    return c.json({ state: failed ? "failed" : "up" });
+  });
+
   // --- notifications ---
 
   app.post("/v1/notifications", userOrApiKey, async (c) => {
@@ -715,12 +798,8 @@ export function createApp(deps: Deps): Hono<AppEnv> {
 
     // Each device gets the message once, labelled with the first requested
     // channel it subscribes to; devices named directly carry no channel.
-    const targets = new Map<string, { device: Device; channel?: Channel }>();
-    for (const ch of channels) {
-      for (const d of await store.subscribers(c.env.DB, ch.id)) {
-        if (!targets.has(d.id)) targets.set(d.id, { device: d, channel: ch });
-      }
-    }
+    const targets = new Map<string, Target>();
+    await addSubscribers(c.env.DB, channels, targets);
     if (ids.length > 0) {
       const own = await store.listDevices(c.env.DB, userId);
       const unknown = ids.find((id) => !own.some((d) => d.id === id));
@@ -733,25 +812,7 @@ export function createApp(deps: Deps): Hono<AppEnv> {
 
     const base: Payload = { id: newId("msg_"), title, priority, sent_at: deps.now() };
     if (body !== "") base.body = body;
-    // A failed warm-up (including a missing or invalid FCM_SERVICE_ACCOUNT)
-    // is not fatal: each send retries and reports per device.
-    try {
-      await deps.sender(c.env).prepare?.();
-    } catch (err) {
-      console.error("push prepare failed", err);
-    }
-    const all = await Promise.all(
-      [...targets.values()].map(async ({ device: d, channel: ch }) => ({
-        own: d.user_id === userId,
-        delivery: await deliver(c.env, d, ch ? { ...base, channel: channelLabel(ch, d.user_id), channel_id: ch.id } : base),
-      })),
-    );
-    // Other members' device IDs are theirs to know; the sender gets counts.
-    const deliveries = all.filter((x) => x.own).map((x) => x.delivery);
-    const members: Partial<Record<Delivery["status"], number>> = {};
-    for (const { own, delivery } of all) {
-      if (!own) members[delivery.status] = (members[delivery.status] ?? 0) + 1;
-    }
+    const { deliveries, members } = await publish(c.env, userId, targets.values(), base);
     return c.json({ id: base.id, deliveries, ...(Object.keys(members).length > 0 ? { members } : {}) });
   });
 

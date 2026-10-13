@@ -14,6 +14,8 @@
   //   ADMIN_TOKEN          the operator's token (user management), at least
   //                        32 characters: `openssl rand -hex 32`
   //   FCM_SERVICE_ACCOUNT  the Firebase service-account JSON, verbatim
+  // Every minute: alert heartbeats whose check-in is overdue (src/heartbeats.ts).
+  "triggers": { "crons": ["* * * * *"] },
   // Per-user cap on POST /v1/notifications. Counted per Cloudflare location,
   // so it is a guard against runaway scripts, not an exact quota.
   "ratelimits": [
