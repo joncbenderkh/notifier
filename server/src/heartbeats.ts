@@ -40,6 +40,8 @@ export function duration(seconds: number): string {
 
 /** A recovery or failure notice, kept as JSON in pending_notice until delivered. */
 interface Notice {
+  /** Unique, so two notices with the same text are still told apart. */
+  id: string;
   /** A missed check-in supersedes a pending recovery, but not a failure's details. */
   kind: "recovered" | "failed";
   title: string;
@@ -97,12 +99,14 @@ export function heartbeatAlerts(deps: Deps) {
   }
 
   /**
-   * Queues a notice, replacing any older one. Unless [later], it is leased
-   * and tried at once; whatever reaches no device the cron trigger retries.
+   * Queues a notice for the ping numbered [seq], replacing any older one,
+   * unless a later ping has announced something or changed the state since. Unless [later], it is leased and tried at
+   * once; whatever reaches no device the cron trigger retries.
    */
-  async function keepOrSend(env: Env, hb: Heartbeat, notice: Notice, later: boolean): Promise<void> {
-    const raw = JSON.stringify(notice);
-    await store.setPendingNotice(env.DB, hb.id, raw, deps.now() + (later ? 0 : LEASE_SECONDS));
+  async function keepOrSend(env: Env, hb: Heartbeat, seq: number, notice: Omit<Notice, "id">, later: boolean): Promise<void> {
+    const raw = JSON.stringify({ id: newId("ntc_"), ...notice });
+    const state = notice.kind === "recovered" ? "up" : "failed";
+    if (!(await store.setPendingNotice(env.DB, hb.id, state, seq, raw, deps.now() + (later ? 0 : LEASE_SECONDS)))) return;
     if (!later) await attempt(env, hb, raw);
   }
 
@@ -117,19 +121,19 @@ export function heartbeatAlerts(deps: Deps) {
     },
 
     /**
-     * [left] is the state the ping ended, and when it began. [later] keeps
-     * the notice for the cron trigger without trying now.
+     * [left] is the state the ping numbered [seq] ended, and when it began.
+     * [later] keeps the notice for the cron trigger without trying now.
      */
-    recovered(env: Env, hb: Heartbeat, left: Pick<Heartbeat, "state" | "changed_at">, later = false) {
+    recovered(env: Env, hb: Heartbeat, seq: number, left: Pick<Heartbeat, "state" | "changed_at">, later = false) {
       const how = left.state === "failed" ? "Failed" : "Down";
       const body = `${how} for ${duration(deps.now() - left.changed_at)}.`;
-      return keepOrSend(env, hb, { kind: "recovered", title: `${hb.name}: checked in again`, body, priority: "default" }, later);
+      return keepOrSend(env, hb, seq, { kind: "recovered", title: `${hb.name}: checked in again`, body, priority: "default" }, later);
     },
 
-    /** [later] keeps the notice for the cron trigger without trying now. */
-    failed(env: Env, hb: Heartbeat, details: string, later = false) {
-      const notice: Notice = { kind: "failed", title: `${hb.name}: failed`, body: details || "The job reported a failure.", priority: "high" };
-      return keepOrSend(env, hb, notice, later);
+    /** For the ping numbered [seq]; [later] keeps the notice for the cron trigger without trying now. */
+    failed(env: Env, hb: Heartbeat, seq: number, details: string, later = false) {
+      const notice: Omit<Notice, "id"> = { kind: "failed", title: `${hb.name}: failed`, body: details || "The job reported a failure.", priority: "high" };
+      return keepOrSend(env, hb, seq, notice, later);
     },
 
     /**
@@ -145,7 +149,8 @@ export function heartbeatAlerts(deps: Deps) {
         return [];
       });
       for (const hb of due) {
-        if (!(await store.markDown(env.DB, hb.id, now).catch(() => false))) continue;
+        const dropped = await store.markDown(env.DB, hb.id, now).catch(() => null);
+        if (!dropped) continue;
         let delivered = false;
         try {
           delivered = await this.missed(env, hb);
@@ -153,7 +158,7 @@ export function heartbeatAlerts(deps: Deps) {
           console.error("heartbeat alert failed", hb.id, err);
         }
         if (!delivered) {
-          await store.unmarkDown(env.DB, hb, now, now + RETRY_SECONDS).catch((err: unknown) => console.error("heartbeat retry not scheduled", hb.id, err));
+          await store.unmarkDown(env.DB, hb, dropped, now, now + RETRY_SECONDS).catch((err: unknown) => console.error("heartbeat retry not scheduled", hb.id, err));
         }
       }
       const pending = await store.pendingNotices(env.DB, now, CHECK_BATCH).catch((err: unknown) => {

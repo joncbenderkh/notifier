@@ -250,12 +250,18 @@ See `README.md` for the user-facing setup and API table.
   one batch (a transaction), so of two pings only one announces the
   recovery, with the right duration. `/fail` is recorded first, then
   alerts every time. A recovery or failure notice is queued in
-  `pending_notice` (a newer one replaces it) and sent at once under a
+  `pending_notice` (a newer one replaces it; each carries a unique ID, so
+  identical texts stay distinct; it is queued only while the heartbeat is
+  still in the state it announces and no later ping announced anything,
+  counted by `ping_seq` (migration 0006, additive), so a request that
+  stalled cannot replace a newer ping's notice) and sent at once under a
   lease (`notice_due_at`), or, past the user's send limit, left for the
   cron trigger; whatever reaches no device the cron retries, oldest first,
   claiming each with a conditional UPDATE so overlapping runs send it
   once. A missed check-in drops a pending recovery notice but keeps a
-  failure's, and `unmarkDown` restores what it dropped. HEAD requests to
+  failure's, and `unmarkDown` restores only the recovery notice it
+  dropped (read in the same batch), never a failure notice that may
+  have been delivered meanwhile. HEAD requests to
   ping URLs (link checkers) record nothing; its body (up to 1 MiB,
   past the 16 KiB API limit) is cleaned server-side (`cleanTail` in
   `text.ts`), since curl cannot clean it. Pings are limited per heartbeat
