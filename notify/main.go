@@ -85,6 +85,9 @@ const usage = `Usage:
   notify channel create|delete|invite|members|leave NAME
   notify channel join CODE
   notify channel remove NAME MEMBER
+  notify heartbeats
+  notify heartbeat create [-every 1d] [-grace 5m] [-c CHANNEL] NAME
+  notify heartbeat delete NAME|ID
   notify version
 
 Flags must come before TITLE or the subcommand.
@@ -99,7 +102,8 @@ Flags:
 // with a usage error instead of acting.
 var subcommands = map[string]bool{
 	"version": false, "invite": false, "devices": false, "pair": false, "keys": false, "channels": false,
-	"config": true, "signup": true, "key": true, "channel": true,
+	"heartbeats": false,
+	"config":     true, "signup": true, "key": true, "channel": true, "heartbeat": true,
 }
 
 // isSubcommand reports whether rest starts a command rather than a message.
@@ -207,6 +211,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, transport htt
 		return c.channels(rest)
 	case "channel":
 		return c.channel(rest)
+	case "heartbeats":
+		return c.heartbeats(rest)
+	case "heartbeat":
+		return c.heartbeat(rest)
 	}
 
 	if len(rest) < 1 || len(rest) > 2 {

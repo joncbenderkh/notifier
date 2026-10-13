@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -436,4 +437,164 @@ func table(w io.Writer, header string) *tabwriter.Writer {
 	t := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(t, header)
 	return t
+}
+
+func (c *cli) heartbeats(argv []string) int {
+	if _, ok := c.subFlags("heartbeats", "", argv, 0, 0, nil); !ok {
+		return exitUsage
+	}
+	client, ok := c.userClient()
+	if !ok {
+		return exitUsage
+	}
+	ctx, cancel := c.context()
+	defer cancel()
+	hbs, err := client.Heartbeats(ctx)
+	if err != nil {
+		return fail(c.stderr, err, "user token")
+	}
+	w := table(c.stdout, "ID\tNAME\tSTATE\tCHANNEL\tEVERY\tLAST CHECK-IN\tDUE")
+	for _, hb := range hbs {
+		last, due := "never", "-"
+		if hb.LastPingAt != nil {
+			last = hb.LastPingAt.Local().Format(time.DateTime)
+		}
+		// A down heartbeat has alerted; up and failed ones alert at their due time.
+		if hb.DueAt != nil && hb.State != "down" {
+			due = hb.DueAt.Local().Format(time.DateTime)
+		}
+		every := formatEvery(time.Duration(hb.Interval) * time.Second)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", hb.ID, hb.Name, hb.State, hb.Channel, every, last, due)
+	}
+	w.Flush()
+	return 0
+}
+
+func (c *cli) heartbeat(argv []string) int {
+	action := ""
+	if len(argv) > 0 {
+		action, argv = argv[0], argv[1:]
+	}
+	switch action {
+	case "create":
+		every, grace, channel := "1d", "", ""
+		args, ok := c.subFlags("heartbeat create", "[-every 1d] [-grace 5m] [-c CHANNEL] NAME", argv, 1, 1, func(fs *flag.FlagSet) {
+			fs.StringVar(&every, "every", every, "expected time between check-ins (`duration`: 30m, 6h, 1d)")
+			fs.StringVar(&grace, "grace", grace, "extra time allowed before alerting (`duration`; default 5m)")
+			fs.StringVar(&channel, "c", channel, "alert this `channel`, which you own (default: default)")
+		})
+		if !ok {
+			return exitUsage
+		}
+		interval, err := parseEvery(every)
+		if err != nil {
+			fmt.Fprintln(c.stderr, "notify: -every:", err)
+			return exitUsage
+		}
+		var graceD time.Duration
+		if grace != "" {
+			if graceD, err = parseEvery(grace); err != nil {
+				fmt.Fprintln(c.stderr, "notify: -grace:", err)
+				return exitUsage
+			}
+		}
+		client, ok := c.userClient()
+		if !ok {
+			return exitUsage
+		}
+		ctx, cancel := c.context()
+		defer cancel()
+		hb, err := client.CreateHeartbeat(ctx, args[0], interval, graceD, channel)
+		if err != nil {
+			return fail(c.stderr, err, "user token")
+		}
+		fmt.Fprintf(c.stdout, "%s\n", hb.PingURL)
+		fmt.Fprintf(c.stderr, "Created heartbeat %s (%s); its URL is shown only this once.\n"+
+			"Ping it after each successful run, e.g. in a crontab:\n"+
+			"  0 3 * * *  backup.sh && curl -fsS -m 10 --retry 3 %s >/dev/null\n"+
+			"Report a failure with %s/fail (a POSTed body becomes the message).\n",
+			hb.Name, hb.ID, hb.PingURL, hb.PingURL)
+		return 0
+	case "delete":
+		args, ok := c.subFlags("heartbeat delete", "NAME|ID", argv, 1, 1, nil)
+		if !ok {
+			return exitUsage
+		}
+		client, ok := c.userClient()
+		if !ok {
+			return exitUsage
+		}
+		ctx, cancel := c.context()
+		defer cancel()
+		hbs, err := client.Heartbeats(ctx)
+		if err != nil {
+			return fail(c.stderr, err, "user token")
+		}
+		// An exact ID wins, even over a heartbeat named like it.
+		var matches []Heartbeat
+		for _, hb := range hbs {
+			if hb.ID == args[0] {
+				matches = []Heartbeat{hb}
+				break
+			}
+			if hb.Name == args[0] {
+				matches = append(matches, hb)
+			}
+		}
+		if len(matches) != 1 {
+			fmt.Fprintf(c.stderr, "notify: %d heartbeats match %q; use an ID from `notify heartbeats`\n", len(matches), args[0])
+			return exitError
+		}
+		if err := client.DeleteHeartbeat(ctx, matches[0].ID); err != nil {
+			return fail(c.stderr, err, "user token")
+		}
+		fmt.Fprintln(c.stdout, "Deleted heartbeat", matches[0].ID)
+		return 0
+	}
+	fmt.Fprintln(c.stderr, "Usage: notify heartbeat create [-every 1d] [-grace 5m] [-c CHANNEL] NAME\n       notify heartbeat delete NAME|ID")
+	return exitUsage
+}
+
+// parseEvery reads a duration in whole seconds, as time.ParseDuration does
+// plus days ("1d", "1d12h").
+func parseEvery(s string) (time.Duration, error) {
+	if strings.ContainsAny(s, "+-") {
+		return 0, fmt.Errorf("invalid duration %q", s)
+	}
+	var days time.Duration
+	if i := strings.Index(s, "d"); i > 0 {
+		n, err := strconv.Atoi(s[:i])
+		if err != nil || n > 36500 {
+			return 0, fmt.Errorf("invalid duration %q", s)
+		}
+		days, s = time.Duration(n)*24*time.Hour, s[i+1:]
+	}
+	var rest time.Duration
+	if s != "" {
+		var err error
+		if rest, err = time.ParseDuration(s); err != nil {
+			return 0, fmt.Errorf("invalid duration %q", s)
+		}
+	}
+	d := days + rest
+	if d <= 0 || d%time.Second != 0 {
+		return 0, fmt.Errorf("must be a positive whole number of seconds, like 30m, 6h or 1d")
+	}
+	return d, nil
+}
+
+// formatEvery prints a heartbeat interval as parseEvery reads it, with
+// only the units it needs: "1d", "1h30m", "1h0m1s" becomes "1h1s".
+func formatEvery(d time.Duration) string {
+	var b strings.Builder
+	for _, u := range []struct {
+		size time.Duration
+		name string
+	}{{24 * time.Hour, "d"}, {time.Hour, "h"}, {time.Minute, "m"}, {time.Second, "s"}} {
+		if n := d / u.size; n > 0 {
+			fmt.Fprintf(&b, "%d%s", n, u.name)
+			d -= n * u.size
+		}
+	}
+	return b.String()
 }

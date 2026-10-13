@@ -274,3 +274,39 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any) error
 	}
 	return nil
 }
+
+// Heartbeat is a dead-man's switch: the server alerts its channel when no
+// ping arrives within Interval plus Grace (seconds).
+type Heartbeat struct {
+	ID         string     `json:"id"`
+	Name       string     `json:"name"`
+	Channel    string     `json:"channel"`
+	Interval   int        `json:"interval"`
+	Grace      int        `json:"grace"`
+	State      string     `json:"state"`
+	PingURL    string     `json:"ping_url,omitempty"`
+	LastPingAt *time.Time `json:"last_ping_at,omitempty"`
+	DueAt      *time.Time `json:"due_at,omitempty"`
+}
+
+func (c *Client) Heartbeats(ctx context.Context) ([]Heartbeat, error) {
+	var hbs []Heartbeat
+	return hbs, c.do(ctx, http.MethodGet, "/v1/heartbeats", nil, &hbs)
+}
+
+// CreateHeartbeat creates a heartbeat on [channel], or default when empty;
+// a zero grace takes the server's default.
+func (c *Client) CreateHeartbeat(ctx context.Context, name string, interval, grace time.Duration, channel string) (Heartbeat, error) {
+	in := struct {
+		Name     string `json:"name"`
+		Interval int    `json:"interval"`
+		Grace    int    `json:"grace,omitempty"`
+		Channel  string `json:"channel,omitempty"`
+	}{name, int(interval.Seconds()), int(grace.Seconds()), channel}
+	var hb Heartbeat
+	return hb, c.do(ctx, http.MethodPost, "/v1/heartbeats", in, &hb)
+}
+
+func (c *Client) DeleteHeartbeat(ctx context.Context, id string) error {
+	return c.do(ctx, http.MethodDelete, "/v1/heartbeats/"+url.PathEscape(id), nil, nil)
+}
