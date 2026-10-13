@@ -1,29 +1,27 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// Command notify sends a notification to paired phones through a notifier
-// server, and manages the account behind them.
+// Command notify sends notifications to paired phones and desktops through
+// a notifier server, and manages the account behind them.
 //
-//	notify [-to PHONE]... [-c CHANNEL]... [-high] TITLE [BODY | -]
+//	notify send [--to DEVICE]... [-c CHANNEL]... [--high] TITLE [BODY | -]
 //	notify signup INVITE NAME
-//	notify channels
 //	notify pair
+//	notify channels
 //
-// PHONE is a device name (case-insensitive) or ID, CHANNEL one of the user's
-// own channels; without either the notification goes to the default
-// channel, which every paired phone subscribes to. A BODY of "-" is read
-// from standard input. Flags must come before TITLE: everything from TITLE
-// on is message text, so a body from a variable can never act as a flag
-// (such as -url). Use "--" before a title that starts with "-" or is a
-// subcommand name. The server and credentials come from flags, then
-// NOTIFIER_URL, NOTIFIER_API_KEY and NOTIFIER_TOKEN, then the config file
-// (see configPath). Sending uses an API key if one is set, else the user
-// token; everything else needs the user token. Run with -h for the full list.
+// DEVICE is a device name (case-insensitive) or ID, CHANNEL one of the
+// user's own channels; without either the notification goes to the default
+// channel, which every paired device subscribes to. A BODY of "-" is read
+// from standard input. Flags of send come before TITLE: everything from
+// TITLE on is message text, so a body from a variable can never act as a
+// flag. The server and credentials come from flags, then NOTIFIER_URL,
+// NOTIFIER_API_KEY and NOTIFIER_TOKEN, then the config file (see
+// configPath). Sending uses an API key if one is set, else the user token;
+// everything else needs the user token. Run with --help for the commands.
 package main
 
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -35,6 +33,9 @@ import (
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 // version is overridden by release builds via -ldflags.
@@ -54,68 +55,8 @@ const (
 	truncated      = "…"
 )
 
-type multiFlag []string
-
-func (m *multiFlag) String() string { return strings.Join(*m, ",") }
-
-func (m *multiFlag) Set(v string) error {
-	for _, part := range strings.Split(v, ",") {
-		if part = strings.TrimSpace(part); part != "" {
-			*m = append(*m, part)
-		}
-	}
-	return nil
-}
-
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr, nil))
-}
-
-const usage = `Usage:
-  notify [flags] TITLE [BODY | -]
-  notify devices
-  notify pair
-  notify signup [-force] INVITE NAME
-  notify invite
-  notify config init [-force]
-  notify keys
-  notify key create [-c CHANNEL]... NAME
-  notify key delete NAME|ID
-  notify channels
-  notify channel create|delete|invite|members|leave NAME
-  notify channel join CODE
-  notify channel remove NAME MEMBER
-  notify heartbeats
-  notify heartbeat create [-every 1d] [-grace 5m] [-c CHANNEL] NAME
-  notify heartbeat delete NAME|ID
-  notify hooks
-  notify hook create [-c CHANNEL] FORMAT NAME
-  notify hook delete NAME|ID
-  notify version
-
-Flags must come before TITLE or the subcommand.
-
-Flags:
-`
-
-// subcommands are the words that start a command instead of a title,
-// unless they come after "--". Those that take no arguments (false) count
-// only alone, so `notify "$TITLE"` stays a message for any other title; the
-// others need arguments, so `notify "$TITLE" "$BODY"` with such a title fails
-// with a usage error instead of acting.
-var subcommands = map[string]bool{
-	"version": false, "invite": false, "devices": false, "pair": false, "keys": false, "channels": false,
-	"heartbeats": false, "hooks": false,
-	"config": true, "signup": true, "key": true, "channel": true, "heartbeat": true, "hook": true,
-}
-
-// isSubcommand reports whether rest starts a command rather than a message.
-func isSubcommand(rest []string) bool {
-	if len(rest) == 0 {
-		return false
-	}
-	takesArgs, ok := subcommands[rest[0]]
-	return ok && (len(rest) == 1) != takesArgs
 }
 
 // cli holds what every command needs: resolved settings and the outputs.
@@ -136,54 +77,105 @@ type cli struct {
 	givenToken, givenKey string
 }
 
-// run executes the command; transport is nil outside tests.
+// run executes the command line and returns the exit code; transport is
+// nil outside tests.
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer, transport http.RoundTripper) int {
-	fs := flag.NewFlagSet("notify", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	var to, channels multiFlag
-	fs.Var(&to, "to", "phone `name or ID` to notify; repeatable or comma-separated")
-	fs.Var(&channels, "c", "own `channel` to publish to; repeatable or comma-separated (default: the config file's, else default)")
-	high := fs.Bool("high", false, "send as high priority (heads-up, may wake the phone)")
-	urlFlag := fs.String("url", "", "notifier server `URL` (default $NOTIFIER_URL, then the config file)")
-	keyFlag := fs.String("key", "", "API `key` for sending (default $NOTIFIER_API_KEY, then the config file)")
-	tokenFlag := fs.String("token", "", "user `token` (default $NOTIFIER_TOKEN, then the config file)")
-	timeout := fs.Duration("timeout", 30*time.Second, "request timeout, counted from when the request starts")
-	fs.Usage = func() {
-		fmt.Fprint(stderr, usage)
-		fs.PrintDefaults()
+	c := &cli{stdin: stdin, stdout: stdout, stderr: stderr, transport: transport}
+	root := newRoot(c)
+	if cmd, rest, err := root.Find(args); err == nil {
+		if f := oldStyleFlag(cmd, rest); f != "" {
+			fmt.Fprintf(stderr, "notify: unknown flag -%s; long flags take two dashes since 0.4.0: --%s\n", f, f)
+			return exitUsage
+		}
 	}
-
-	if err := fs.Parse(args); err != nil {
-		return exitUsage
-	}
-	rest := fs.Args()
-	cmd := ""
-	if !endedByDoubleDash(fs, args, rest) && isSubcommand(rest) {
-		cmd, rest = rest[0], rest[1:]
-	}
-	if cmd == "version" {
-		fmt.Fprintln(stdout, version)
+	root.SetArgs(args)
+	root.SetIn(stdin)
+	root.SetOut(stdout)
+	root.SetErr(stderr)
+	cmd, err := root.ExecuteC()
+	var code exitCode
+	switch {
+	case err == nil:
 		return 0
+	case errors.As(err, &code):
+		return int(code)
 	}
+	// Cobra's own: an unknown command or flag, or a wrong argument count.
+	fmt.Fprintln(stderr, "notify:", err)
+	fmt.Fprintf(stderr, "Run '%s --help' for usage.\n", cmd.CommandPath())
+	return exitUsage
+}
 
-	c := &cli{stdin: stdin, stdout: stdout, stderr: stderr, transport: transport, timeout: *timeout}
+// oldStyleFlag returns the name of the first argument, among [args] left
+// for [cmd], written as a single-dash long flag (-high) that [cmd] knows as
+// --high. It is checked before parsing, since pflag could read some of
+// them as a shorthand with a value (-channel=x as -c hannel=x). It stops
+// at "--", and at the first argument of a command whose flags end there.
+func oldStyleFlag(cmd *cobra.Command, args []string) string {
+	cmd.InitDefaultHelpFlag() // so -help is caught too
+	lookup := func(name string) *pflag.Flag {
+		if f := cmd.Flags().Lookup(name); f != nil {
+			return f
+		}
+		return cmd.InheritedFlags().Lookup(name)
+	}
+	short := func(name string) *pflag.Flag {
+		if f := cmd.Flags().ShorthandLookup(name); f != nil {
+			return f
+		}
+		return cmd.InheritedFlags().ShorthandLookup(name)
+	}
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--":
+			return ""
+		case strings.HasPrefix(a, "--"):
+			name, _, hasValue := strings.Cut(a[2:], "=")
+			if f := lookup(name); f != nil && !hasValue && f.NoOptDefVal == "" {
+				i++ // its value
+			}
+		case len(a) == 2 && a[0] == '-':
+			if f := short(a[1:]); f != nil && f.NoOptDefVal == "" {
+				i++
+			}
+		case len(a) > 2 && a[0] == '-':
+			if name, _, _ := strings.Cut(a[1:], "="); lookup(name) != nil {
+				return name
+			}
+		default:
+			if cmd.Annotations[flagsEndAtArgs] != "" {
+				return ""
+			}
+		}
+	}
+	return ""
+}
+
+// flagsEndAtArgs marks a command whose flags end at its first argument.
+const flagsEndAtArgs = "flags-end-at-args"
+
+// resolve settles the server and credentials once the flags are parsed:
+// flags, then the environment, then the config file, which [loadFile]
+// skips (`config init` replaces it, so it must work on one it cannot read).
+func (c *cli) resolve(f settingsFlags, loadFile bool) int {
 	var err error
-	// `config init` replaces the file, so it must work on one it cannot read.
-	if c.configPath, err = configPath(); err == nil && cmd != "config" {
+	if c.configPath, err = configPath(); err == nil && loadFile {
 		c.config, err = loadConfig(c.configPath)
 	}
 	if err != nil {
-		fmt.Fprintln(stderr, "notify:", err)
+		fmt.Fprintln(c.stderr, "notify:", err)
 		return exitUsage
 	}
 	cfg := c.config
-	c.url = first(*urlFlag, os.Getenv("NOTIFIER_URL"), cfg.URL)
-	envToken := first(os.Getenv("NOTIFIER_TOKEN"), legacyToken(stderr))
-	c.givenToken = first(*tokenFlag, envToken)
-	c.givenKey = first(*keyFlag, os.Getenv("NOTIFIER_API_KEY"))
+	c.timeout = f.timeout
+	c.url = first(f.url, os.Getenv("NOTIFIER_URL"), cfg.URL)
+	envToken := first(os.Getenv("NOTIFIER_TOKEN"), legacyToken(c.stderr))
+	c.givenToken = first(f.token, envToken)
+	c.givenKey = first(f.key, os.Getenv("NOTIFIER_API_KEY"))
 	c.token = first(c.givenToken, cfg.Token)
 	for _, level := range [][2]string{
-		{*keyFlag, *tokenFlag}, {os.Getenv("NOTIFIER_API_KEY"), envToken}, {cfg.APIKey, cfg.Token},
+		{f.key, f.token}, {os.Getenv("NOTIFIER_API_KEY"), envToken}, {cfg.APIKey, cfg.Token},
 	} {
 		if level[0] != "" {
 			c.sendCred, c.sendCredName = level[0], "API key"
@@ -194,50 +186,20 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, transport htt
 			break
 		}
 	}
+	return 0
+}
 
-	switch cmd {
-	case "config":
-		return c.configCmd(rest)
-	case "signup":
-		return c.signup(rest)
-	case "invite":
-		return c.invite(rest)
-	case "devices":
-		return c.devices(rest)
-	case "pair":
-		return c.pair(rest)
-	case "keys":
-		return c.keys(rest)
-	case "key":
-		return c.key(rest)
-	case "channels":
-		return c.channels(rest)
-	case "channel":
-		return c.channel(rest)
-	case "heartbeats":
-		return c.heartbeats(rest)
-	case "heartbeat":
-		return c.heartbeat(rest)
-	case "hooks":
-		return c.hooks(rest)
-	case "hook":
-		return c.hook(rest)
-	}
-
-	if len(rest) < 1 || len(rest) > 2 {
-		fs.Usage()
-		return exitUsage
-	}
+// sendCmd sends [args] (TITLE [BODY | -]); [high] is nil unless --high was
+// given, so the config file's priority applies otherwise.
+func (c *cli) sendCmd(args, to, channels []string, high *bool) int {
 	if len(to) == 0 && len(channels) == 0 {
-		to, channels = cfg.To, cfg.Channels
+		to, channels = c.config.To, c.config.Channels
 	}
-	n := Notification{Title: fitTitle(rest[0]), Channels: channels}
-	highSet := false
-	fs.Visit(func(f *flag.Flag) { highSet = highSet || f.Name == "high" })
-	if *high || !highSet && cfg.Priority == "high" {
+	n := Notification{Title: fitTitle(args[0]), Channels: channels}
+	if high != nil && *high || high == nil && c.config.Priority == "high" {
 		n.Priority = "high"
 	}
-	return c.send(n, to, rest[1:])
+	return c.send(n, to, args[1:])
 }
 
 // legacyToken is NOTIFIER_ADMIN_TOKEN, which `notify pair` read before users
@@ -272,7 +234,7 @@ func first(values ...string) string {
 // empty setHint means the request needs no credential.
 func (c *cli) client(cred, setHint string) (*Client, bool) {
 	if c.url == "" || cred == "" && setHint != "" {
-		msg := "notify: set NOTIFIER_URL (or pass -url)"
+		msg := "notify: set NOTIFIER_URL (or pass --url)"
 		if setHint != "" {
 			msg += " and " + setHint
 		}
@@ -290,12 +252,12 @@ func (c *cli) client(cred, setHint string) (*Client, bool) {
 	}, true
 }
 
-const tokenHint = "NOTIFIER_TOKEN (or pass -token, or run `notify signup`)"
+const tokenHint = "NOTIFIER_TOKEN (or pass --token, or run `notify signup`)"
 
 func (c *cli) userClient() (*Client, bool) { return c.client(c.token, tokenHint) }
 
 func (c *cli) sendClient() (*Client, bool) {
-	return c.client(c.sendCred, "NOTIFIER_API_KEY or NOTIFIER_TOKEN (or pass -key or -token)")
+	return c.client(c.sendCred, "NOTIFIER_API_KEY or NOTIFIER_TOKEN (or pass --key or --token)")
 }
 
 func (c *cli) context() (context.Context, context.CancelFunc) {
@@ -390,28 +352,6 @@ func countsLine(counts map[string]int) string {
 		}
 	}
 	return strings.Join(parts, ", ")
-}
-
-// endedByDoubleDash reports whether flag parsing stopped at a "--"
-// terminator, as opposed to "--" being the value of a flag such as -to.
-func endedByDoubleDash(fs *flag.FlagSet, args, rest []string) bool {
-	consumed := len(args) - len(rest)
-	if consumed == 0 || args[consumed-1] != "--" {
-		return false
-	}
-	if consumed < 2 {
-		return true
-	}
-	prev := strings.TrimLeft(args[consumed-2], "-")
-	if strings.Contains(prev, "=") || !strings.HasPrefix(args[consumed-2], "-") {
-		return true
-	}
-	f := fs.Lookup(prev)
-	if f == nil {
-		return true
-	}
-	boolFlag, ok := f.Value.(interface{ IsBoolFlag() bool })
-	return ok && boolFlag.IsBoolFlag()
 }
 
 // refuseRedirect stops the client from following redirects: Go would resend

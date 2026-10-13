@@ -4,7 +4,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -14,45 +13,13 @@ import (
 	"time"
 )
 
-// subFlags parses a subcommand's own flags, which come before its arguments,
-// and checks the argument count.
-func (c *cli) subFlags(name, args string, argv []string, minArgs, maxArgs int, define func(*flag.FlagSet)) ([]string, bool) {
-	fs := flag.NewFlagSet("notify "+name, flag.ContinueOnError)
-	fs.SetOutput(c.stderr)
-	fs.Usage = func() {
-		fmt.Fprintf(c.stderr, "Usage: notify %s %s\n", name, args)
-		fs.PrintDefaults()
-	}
-	if define != nil {
-		define(fs)
-	}
-	if fs.Parse(argv) != nil {
-		return nil, false
-	}
-	if fs.NArg() < minArgs || fs.NArg() > maxArgs {
-		fs.Usage()
-		return nil, false
-	}
-	return fs.Args(), true
-}
-
-func (c *cli) configCmd(argv []string) int {
-	if len(argv) == 0 || argv[0] != "init" {
-		fmt.Fprintln(c.stderr, "Usage: notify [-url URL] [-token TOKEN] [-key KEY] config init [-force]")
-		return exitUsage
-	}
-	var force *bool
-	if _, ok := c.subFlags("config init", "[-force]", argv[1:], 0, 0, func(fs *flag.FlagSet) {
-		force = fs.Bool("force", false, "replace an existing config file")
-	}); !ok {
-		return exitUsage
-	}
-	if _, err := os.Stat(c.configPath); err == nil && !*force {
-		fmt.Fprintf(c.stderr, "notify: %s already exists (pass -force to replace it)\n", c.configPath)
+func (c *cli) configInit(force bool) int {
+	if _, err := os.Stat(c.configPath); err == nil && !force {
+		fmt.Fprintf(c.stderr, "notify: %s already exists (pass --force to replace it)\n", c.configPath)
 		return exitError
 	}
 	if c.url == "" {
-		fmt.Fprintln(c.stderr, "notify: set NOTIFIER_URL or pass -url")
+		fmt.Fprintln(c.stderr, "notify: set NOTIFIER_URL or pass --url")
 		return exitUsage
 	}
 	if err := checkURL(c.url); err != nil {
@@ -69,16 +36,9 @@ func (c *cli) configCmd(argv []string) int {
 	return 0
 }
 
-func (c *cli) signup(argv []string) int {
-	var force *bool
-	args, ok := c.subFlags("signup", "[-force] INVITE NAME", argv, 2, 2, func(fs *flag.FlagSet) {
-		force = fs.Bool("force", false, "replace a user token already in the config file")
-	})
-	if !ok {
-		return exitUsage
-	}
-	if c.config.Token != "" && !*force {
-		fmt.Fprintf(c.stderr, "notify: %s already holds a user token (pass -force to replace it)\n", c.configPath)
+func (c *cli) signup(args []string, force bool) int {
+	if c.config.Token != "" && !force {
+		fmt.Fprintf(c.stderr, "notify: %s already holds a user token (pass --force to replace it)\n", c.configPath)
 		return exitError
 	}
 	client, ok := c.client("", "") // the invite is the credential
@@ -105,10 +65,7 @@ func (c *cli) signup(argv []string) int {
 	return 0
 }
 
-func (c *cli) invite(argv []string) int {
-	if _, ok := c.subFlags("invite", "", argv, 0, 0, nil); !ok {
-		return exitUsage
-	}
+func (c *cli) invite() int {
 	client, ok := c.userClient()
 	if !ok {
 		return exitUsage
@@ -119,15 +76,12 @@ func (c *cli) invite(argv []string) int {
 	if err != nil {
 		return fail(c.stderr, err, "user token")
 	}
-	fmt.Fprintf(c.stdout, "Invite %s (single use, expires %s). To sign up:\n  notify -url %s signup %s NAME\n",
+	fmt.Fprintf(c.stdout, "Invite %s (single use, expires %s). To sign up:\n  notify --url %s signup %s NAME\n",
 		inv.Code, inv.ExpiresAt.Local().Format(time.DateTime), c.url, inv.Code)
 	return 0
 }
 
-func (c *cli) devices(argv []string) int {
-	if _, ok := c.subFlags("devices", "", argv, 0, 0, nil); !ok {
-		return exitUsage
-	}
+func (c *cli) devices() int {
 	client, ok := c.sendClient()
 	if !ok {
 		return exitUsage
@@ -146,10 +100,7 @@ func (c *cli) devices(argv []string) int {
 	return 0
 }
 
-func (c *cli) pair(argv []string) int {
-	if _, ok := c.subFlags("pair", "", argv, 0, 0, nil); !ok {
-		return exitUsage
-	}
+func (c *cli) pair() int {
 	client, ok := c.userClient()
 	if !ok {
 		return exitUsage
@@ -180,10 +131,7 @@ func (c *cli) printQR(data, scan, manual string) string {
 	return scan
 }
 
-func (c *cli) keys(argv []string) int {
-	if _, ok := c.subFlags("keys", "", argv, 0, 0, nil); !ok {
-		return exitUsage
-	}
+func (c *cli) keys() int {
 	client, ok := c.userClient()
 	if !ok {
 		return exitUsage
@@ -209,72 +157,51 @@ func (c *cli) keys(argv []string) int {
 	return 0
 }
 
-func (c *cli) key(argv []string) int {
-	action := ""
-	if len(argv) > 0 {
-		action, argv = argv[0], argv[1:]
-	}
-	switch action {
-	case "create":
-		var scope multiFlag
-		args, ok := c.subFlags("key create", "[-c CHANNEL]... NAME", argv, 1, 1, func(fs *flag.FlagSet) {
-			fs.Var(&scope, "c", "limit the key to this own `channel`; repeatable or comma-separated")
-		})
-		if !ok {
-			return exitUsage
-		}
-		client, ok := c.userClient()
-		if !ok {
-			return exitUsage
-		}
-		ctx, cancel := c.context()
-		defer cancel()
-		k, err := client.CreateKey(ctx, args[0], scope)
-		if err != nil {
-			return fail(c.stderr, err, "user token")
-		}
-		fmt.Fprintf(c.stdout, "%s\n", k.Key)
-		fmt.Fprintf(c.stderr, "Created API key %s (%s); it is shown only this once.\n", k.Name, k.ID)
-		return 0
-	case "delete":
-		args, ok := c.subFlags("key delete", "NAME|ID", argv, 1, 1, nil)
-		if !ok {
-			return exitUsage
-		}
-		client, ok := c.userClient()
-		if !ok {
-			return exitUsage
-		}
-		ctx, cancel := c.context()
-		defer cancel()
-		keys, err := client.Keys(ctx)
-		if err != nil {
-			return fail(c.stderr, err, "user token")
-		}
-		var matches []APIKey
-		for _, k := range keys {
-			if k.ID == args[0] || k.Name == args[0] {
-				matches = append(matches, k)
-			}
-		}
-		if len(matches) != 1 {
-			fmt.Fprintf(c.stderr, "notify: %d API keys match %q; use an ID from `notify keys`\n", len(matches), args[0])
-			return exitError
-		}
-		if err := client.DeleteKey(ctx, matches[0].ID); err != nil {
-			return fail(c.stderr, err, "user token")
-		}
-		fmt.Fprintln(c.stdout, "Deleted API key", matches[0].ID)
-		return 0
-	}
-	fmt.Fprintln(c.stderr, "Usage: notify key create [-c CHANNEL]... NAME\n       notify key delete NAME|ID")
-	return exitUsage
-}
-
-func (c *cli) channels(argv []string) int {
-	if _, ok := c.subFlags("channels", "", argv, 0, 0, nil); !ok {
+func (c *cli) keyCreate(name string, scope []string) int {
+	client, ok := c.userClient()
+	if !ok {
 		return exitUsage
 	}
+	ctx, cancel := c.context()
+	defer cancel()
+	k, err := client.CreateKey(ctx, name, scope)
+	if err != nil {
+		return fail(c.stderr, err, "user token")
+	}
+	fmt.Fprintf(c.stdout, "%s\n", k.Key)
+	fmt.Fprintf(c.stderr, "Created API key %s (%s); it is shown only this once.\n", k.Name, k.ID)
+	return 0
+}
+
+func (c *cli) keyDelete(sel string) int {
+	client, ok := c.userClient()
+	if !ok {
+		return exitUsage
+	}
+	ctx, cancel := c.context()
+	defer cancel()
+	keys, err := client.Keys(ctx)
+	if err != nil {
+		return fail(c.stderr, err, "user token")
+	}
+	var matches []APIKey
+	for _, k := range keys {
+		if k.ID == sel || k.Name == sel {
+			matches = append(matches, k)
+		}
+	}
+	if len(matches) != 1 {
+		fmt.Fprintf(c.stderr, "notify: %d API keys match %q; use an ID from `notify keys`\n", len(matches), sel)
+		return exitError
+	}
+	if err := client.DeleteKey(ctx, matches[0].ID); err != nil {
+		return fail(c.stderr, err, "user token")
+	}
+	fmt.Fprintln(c.stdout, "Deleted API key", matches[0].ID)
+	return 0
+}
+
+func (c *cli) channels() int {
 	client, ok := c.userClient()
 	if !ok {
 		return exitUsage
@@ -293,29 +220,9 @@ func (c *cli) channels(argv []string) int {
 	return 0
 }
 
-const channelUsage = `Usage:
-  notify channel create NAME
-  notify channel delete NAME
-  notify channel invite NAME
-  notify channel members NAME
-  notify channel leave NAME
-  notify channel join CODE
-  notify channel remove NAME MEMBER`
-
-func (c *cli) channel(argv []string) int {
-	action := ""
-	if len(argv) > 0 {
-		action, argv = argv[0], argv[1:]
-	}
-	nargs := map[string]int{"create": 1, "delete": 1, "invite": 1, "members": 1, "leave": 1, "join": 1, "remove": 2}[action]
-	if nargs == 0 {
-		fmt.Fprintln(c.stderr, channelUsage)
-		return exitUsage
-	}
-	args, ok := c.subFlags("channel "+action, "...", argv, nargs, nargs, nil)
-	if !ok {
-		return exitUsage
-	}
+// channel runs `notify channel ACTION ARGS...`; the command tree has
+// checked the argument count.
+func (c *cli) channel(action string, args []string) int {
 	client, ok := c.userClient()
 	if !ok {
 		return exitUsage
@@ -354,7 +261,7 @@ func (c *cli) channel(argv []string) int {
 		var inv ChannelInvite
 		if inv, err = client.InviteToChannel(ctx, ch.ID); err == nil {
 			how := c.printQR(inv.URI, "Scan with the Notifier app, or join with:", "Join with:")
-			fmt.Fprintf(c.stdout, "%s\n  notify -url %s channel join %s\n  (single use, expires %s)\n",
+			fmt.Fprintf(c.stdout, "%s\n  notify --url %s channel join %s\n  (single use, expires %s)\n",
 				how, c.url, inv.Code, inv.ExpiresAt.Local().Format(time.DateTime))
 		}
 	case "members":
@@ -439,10 +346,7 @@ func table(w io.Writer, header string) *tabwriter.Writer {
 	return t
 }
 
-func (c *cli) heartbeats(argv []string) int {
-	if _, ok := c.subFlags("heartbeats", "", argv, 0, 0, nil); !ok {
-		return exitUsage
-	}
+func (c *cli) heartbeats() int {
 	client, ok := c.userClient()
 	if !ok {
 		return exitUsage
@@ -470,79 +374,59 @@ func (c *cli) heartbeats(argv []string) int {
 	return 0
 }
 
-func (c *cli) heartbeat(argv []string) int {
-	action := ""
-	if len(argv) > 0 {
-		action, argv = argv[0], argv[1:]
+func (c *cli) heartbeatCreate(name, every, grace, channel string) int {
+	interval, err := parseEvery(every)
+	if err != nil {
+		fmt.Fprintln(c.stderr, "notify: --every:", err)
+		return exitUsage
 	}
-	switch action {
-	case "create":
-		every, grace, channel := "1d", "", ""
-		args, ok := c.subFlags("heartbeat create", "[-every 1d] [-grace 5m] [-c CHANNEL] NAME", argv, 1, 1, func(fs *flag.FlagSet) {
-			fs.StringVar(&every, "every", every, "expected time between check-ins (`duration`: 30m, 6h, 1d)")
-			fs.StringVar(&grace, "grace", grace, "extra time allowed before alerting (`duration`; default 5m)")
-			fs.StringVar(&channel, "c", channel, "alert this `channel`, which you own (default: default)")
-		})
-		if !ok {
+	var graceD time.Duration
+	if grace != "" {
+		if graceD, err = parseEvery(grace); err != nil {
+			fmt.Fprintln(c.stderr, "notify: --grace:", err)
 			return exitUsage
 		}
-		interval, err := parseEvery(every)
-		if err != nil {
-			fmt.Fprintln(c.stderr, "notify: -every:", err)
-			return exitUsage
-		}
-		var graceD time.Duration
-		if grace != "" {
-			if graceD, err = parseEvery(grace); err != nil {
-				fmt.Fprintln(c.stderr, "notify: -grace:", err)
-				return exitUsage
-			}
-		}
-		client, ok := c.userClient()
-		if !ok {
-			return exitUsage
-		}
-		ctx, cancel := c.context()
-		defer cancel()
-		hb, err := client.CreateHeartbeat(ctx, args[0], interval, graceD, channel)
-		if err != nil {
-			return fail(c.stderr, err, "user token")
-		}
-		fmt.Fprintf(c.stdout, "%s\n", hb.PingURL)
-		fmt.Fprintf(c.stderr, "Created heartbeat %s (%s); its URL is shown only this once.\n"+
-			"Ping it after each successful run, e.g. in a crontab:\n"+
-			"  0 3 * * *  backup.sh && curl -fsS -m 10 --retry 3 %s >/dev/null\n"+
-			"Report a failure with %s/fail (a POSTed body becomes the message).\n",
-			hb.Name, hb.ID, hb.PingURL, hb.PingURL)
-		return 0
-	case "delete":
-		args, ok := c.subFlags("heartbeat delete", "NAME|ID", argv, 1, 1, nil)
-		if !ok {
-			return exitUsage
-		}
-		client, ok := c.userClient()
-		if !ok {
-			return exitUsage
-		}
-		ctx, cancel := c.context()
-		defer cancel()
-		hbs, err := client.Heartbeats(ctx)
-		if err != nil {
-			return fail(c.stderr, err, "user token")
-		}
-		matches := byIDOrName(hbs, args[0], func(hb Heartbeat) (string, string) { return hb.ID, hb.Name })
-		if len(matches) != 1 {
-			fmt.Fprintf(c.stderr, "notify: %d heartbeats match %q; use an ID from `notify heartbeats`\n", len(matches), args[0])
-			return exitError
-		}
-		if err := client.DeleteHeartbeat(ctx, matches[0].ID); err != nil {
-			return fail(c.stderr, err, "user token")
-		}
-		fmt.Fprintln(c.stdout, "Deleted heartbeat", matches[0].ID)
-		return 0
 	}
-	fmt.Fprintln(c.stderr, "Usage: notify heartbeat create [-every 1d] [-grace 5m] [-c CHANNEL] NAME\n       notify heartbeat delete NAME|ID")
-	return exitUsage
+	client, ok := c.userClient()
+	if !ok {
+		return exitUsage
+	}
+	ctx, cancel := c.context()
+	defer cancel()
+	hb, err := client.CreateHeartbeat(ctx, name, interval, graceD, channel)
+	if err != nil {
+		return fail(c.stderr, err, "user token")
+	}
+	fmt.Fprintf(c.stdout, "%s\n", hb.PingURL)
+	fmt.Fprintf(c.stderr, "Created heartbeat %s (%s); its URL is shown only this once.\n"+
+		"Ping it after each successful run, e.g. in a crontab:\n"+
+		"  0 3 * * *  backup.sh && curl -fsS -m 10 --retry 3 %s >/dev/null\n"+
+		"Report a failure with %s/fail (a POSTed body becomes the message).\n",
+		hb.Name, hb.ID, hb.PingURL, hb.PingURL)
+	return 0
+}
+
+func (c *cli) heartbeatDelete(sel string) int {
+	client, ok := c.userClient()
+	if !ok {
+		return exitUsage
+	}
+	ctx, cancel := c.context()
+	defer cancel()
+	hbs, err := client.Heartbeats(ctx)
+	if err != nil {
+		return fail(c.stderr, err, "user token")
+	}
+	matches := byIDOrName(hbs, sel, func(hb Heartbeat) (string, string) { return hb.ID, hb.Name })
+	if len(matches) != 1 {
+		fmt.Fprintf(c.stderr, "notify: %d heartbeats match %q; use an ID from `notify heartbeats`\n", len(matches), sel)
+		return exitError
+	}
+	if err := client.DeleteHeartbeat(ctx, matches[0].ID); err != nil {
+		return fail(c.stderr, err, "user token")
+	}
+	fmt.Fprintln(c.stdout, "Deleted heartbeat", matches[0].ID)
+	return 0
 }
 
 // byIDOrName returns the items [arg] names: an exact ID wins, even over
@@ -561,10 +445,7 @@ func byIDOrName[T any](items []T, arg string, idName func(T) (string, string)) [
 	return matches
 }
 
-func (c *cli) hooks(argv []string) int {
-	if _, ok := c.subFlags("hooks", "", argv, 0, 0, nil); !ok {
-		return exitUsage
-	}
+func (c *cli) hooks() int {
 	client, ok := c.userClient()
 	if !ok {
 		return exitUsage
@@ -599,64 +480,46 @@ var hookHints = map[string]string{
 		"  curl -fsS -m 10 -d '{\"title\":\"Deploy done\",\"body\":\"v1.2.3\",\"priority\":\"default\"}' %s\n",
 }
 
-func (c *cli) hook(argv []string) int {
-	action := ""
-	if len(argv) > 0 {
-		action, argv = argv[0], argv[1:]
+func (c *cli) hookCreate(format, name, channel string) int {
+	client, ok := c.userClient()
+	if !ok {
+		return exitUsage
 	}
-	switch action {
-	case "create":
-		channel := ""
-		args, ok := c.subFlags("hook create", "[-c CHANNEL] FORMAT NAME", argv, 2, 2, func(fs *flag.FlagSet) {
-			fs.StringVar(&channel, "c", channel, "publish to this `channel`, which you own (default: default)")
-		})
-		if !ok {
-			return exitUsage
-		}
-		client, ok := c.userClient()
-		if !ok {
-			return exitUsage
-		}
-		ctx, cancel := c.context()
-		defer cancel()
-		h, err := client.CreateHook(ctx, args[1], args[0], channel)
-		if err != nil {
-			return fail(c.stderr, err, "user token")
-		}
-		fmt.Fprintf(c.stdout, "%s\n", h.URL)
-		fmt.Fprintf(c.stderr, "Created hook %s (%s); its URL is shown only this once.\n", h.Name, h.ID)
-		if hint, ok := hookHints[h.Format]; ok {
-			fmt.Fprintf(c.stderr, hint, h.URL)
-		}
-		return 0
-	case "delete":
-		args, ok := c.subFlags("hook delete", "NAME|ID", argv, 1, 1, nil)
-		if !ok {
-			return exitUsage
-		}
-		client, ok := c.userClient()
-		if !ok {
-			return exitUsage
-		}
-		ctx, cancel := c.context()
-		defer cancel()
-		hooks, err := client.Hooks(ctx)
-		if err != nil {
-			return fail(c.stderr, err, "user token")
-		}
-		matches := byIDOrName(hooks, args[0], func(h Hook) (string, string) { return h.ID, h.Name })
-		if len(matches) != 1 {
-			fmt.Fprintf(c.stderr, "notify: %d hooks match %q; use an ID from `notify hooks`\n", len(matches), args[0])
-			return exitError
-		}
-		if err := client.DeleteHook(ctx, matches[0].ID); err != nil {
-			return fail(c.stderr, err, "user token")
-		}
-		fmt.Fprintln(c.stdout, "Deleted hook", matches[0].ID)
-		return 0
+	ctx, cancel := c.context()
+	defer cancel()
+	h, err := client.CreateHook(ctx, name, format, channel)
+	if err != nil {
+		return fail(c.stderr, err, "user token")
 	}
-	fmt.Fprintln(c.stderr, "Usage: notify hook create [-c CHANNEL] FORMAT NAME\n       notify hook delete NAME|ID\nFormats: alertmanager, grafana, generic")
-	return exitUsage
+	fmt.Fprintf(c.stdout, "%s\n", h.URL)
+	fmt.Fprintf(c.stderr, "Created hook %s (%s); its URL is shown only this once.\n", h.Name, h.ID)
+	if hint, ok := hookHints[h.Format]; ok {
+		fmt.Fprintf(c.stderr, hint, h.URL)
+	}
+	return 0
+}
+
+func (c *cli) hookDelete(sel string) int {
+	client, ok := c.userClient()
+	if !ok {
+		return exitUsage
+	}
+	ctx, cancel := c.context()
+	defer cancel()
+	hooks, err := client.Hooks(ctx)
+	if err != nil {
+		return fail(c.stderr, err, "user token")
+	}
+	matches := byIDOrName(hooks, sel, func(h Hook) (string, string) { return h.ID, h.Name })
+	if len(matches) != 1 {
+		fmt.Fprintf(c.stderr, "notify: %d hooks match %q; use an ID from `notify hooks`\n", len(matches), sel)
+		return exitError
+	}
+	if err := client.DeleteHook(ctx, matches[0].ID); err != nil {
+		return fail(c.stderr, err, "user token")
+	}
+	fmt.Fprintln(c.stdout, "Deleted hook", matches[0].ID)
+	return 0
 }
 
 // parseEvery reads a duration in whole seconds, as time.ParseDuration does
