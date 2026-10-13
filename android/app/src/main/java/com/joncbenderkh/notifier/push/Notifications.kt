@@ -16,6 +16,9 @@ import com.joncbenderkh.notifier.MainActivity
 import com.joncbenderkh.notifier.R
 
 object Notifications {
+    /** Set on the intent a tapped notification opens: show the history. */
+    const val EXTRA_OPEN_HISTORY = "com.joncbenderkh.notifier.OPEN_HISTORY"
+
     private const val CHANNEL_DEFAULT = ChannelRoute.DEFAULT
     private const val CHANNEL_HIGH = ChannelRoute.HIGH
 
@@ -48,8 +51,9 @@ object Notifications {
         val openApp = PendingIntent.getActivity(
             context,
             0,
-            Intent(context, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE,
+            Intent(context, MainActivity::class.java).putExtra(EXTRA_OPEN_HISTORY, true),
+            // UPDATE_CURRENT: an intent cached without the extra must not be reused.
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         val notification = NotificationCompat.Builder(context, route.androidChannelId)
             .setSmallIcon(R.drawable.ic_notification)

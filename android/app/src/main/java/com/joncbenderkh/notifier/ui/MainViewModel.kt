@@ -9,6 +9,8 @@ import com.google.firebase.messaging.FirebaseMessaging
 import com.joncbenderkh.notifier.BuildConfig
 import com.joncbenderkh.notifier.NotifierApp
 import com.joncbenderkh.notifier.data.DeviceChannel
+import com.joncbenderkh.notifier.data.HistoryEntry
+import com.joncbenderkh.notifier.data.HistoryStore
 import com.joncbenderkh.notifier.data.NotifierLink
 import com.joncbenderkh.notifier.data.Pairing
 import com.joncbenderkh.notifier.data.PairingStore
@@ -16,6 +18,7 @@ import com.joncbenderkh.notifier.data.ServerClient
 import com.joncbenderkh.notifier.data.ServerException
 import com.joncbenderkh.notifier.push.ChannelRoute
 import com.joncbenderkh.notifier.push.Notifications
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -36,21 +39,54 @@ data class UiState(
     val channels: List<DeviceChannel>? = null,
     /** A scanned or opened channel invite waiting for the user to confirm. */
     val pendingJoin: NotifierLink.Join? = null,
+    /** The history screen is open in place of the main one. */
+    val showHistory: Boolean = false,
 )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val store = PairingStore(application)
     private val client = ServerClient()
+    private val historyStore = HistoryStore.get(application)
 
     private val _state = MutableStateFlow(UiState(pairing = store.load()))
     val state: StateFlow<UiState> = _state.asStateFlow()
 
     val defaultDeviceName: String = Build.MODEL
 
+    /** Received notifications, newest first; updated as messages arrive. */
+    val history: StateFlow<List<HistoryEntry>> = historyStore.entries
+
     init {
         _state.value.pairing?.let {
             syncFcmToken(it)
             refreshChannels()
+        }
+        editHistory { historyStore.load() }
+    }
+
+    fun openHistory() {
+        if (_state.value.pairing == null) return
+        _state.update { it.copy(showHistory = true) }
+        // Drops what expired while the app stayed open.
+        editHistory { historyStore.load() }
+    }
+
+    fun closeHistory() {
+        _state.update { it.copy(showHistory = false) }
+    }
+
+    fun deleteHistory(id: String) = editHistory { historyStore.delete(id) }
+
+    fun clearHistory() = editHistory { historyStore.clear() }
+
+    private fun editHistory(block: () -> Unit) {
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) { block() }
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                _state.update { it.copy(message = "Could not update the history: ${e.message}") }
+            }
         }
     }
 
@@ -85,6 +121,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      */
     fun openLink(raw: String) {
         val link = NotifierLink.parse(raw, allowHttp = BuildConfig.DEBUG)
+        // Back to the main screen, where the form and the join dialog are.
+        _state.update { it.copy(showHistory = false) }
         _state.update {
             val pairing = it.pairing
             when (link) {
@@ -187,6 +225,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 "Unpaired locally; the server could not be reached, so remove this device there too."
             }
             store.clear()
+            // The next pairing may be another account: its history starts empty.
+            withContext(Dispatchers.IO) { historyStore.clear() }
             _state.update { UiState(message = message) }
         }
     }
