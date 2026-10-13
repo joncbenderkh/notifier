@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"syscall"
 )
 
 // State is this desktop's pairing: the server and the device credentials it
@@ -24,6 +25,32 @@ type State struct {
 }
 
 var errNotPaired = errors.New("not paired; run: notifyd pair LINK")
+
+var errAlreadyRunning = errors.New("another notifyd is running with this state file (systemctl --user status notifyd)")
+
+// lockRun keeps a second `notifyd run` of the same pairing from starting.
+// The server keeps one connection per device, so a second daemon would
+// replace the first, which then exits for good (exitReplaced). The lock,
+// beside the state file (symlinks resolved, so an alias finds it too), is
+// held until release or the process exits.
+func lockRun(statePath string) (release func(), err error) {
+	path, err := filepath.EvalSymlinks(statePath)
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path+".lock", os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, errAlreadyRunning
+		}
+		return nil, err
+	}
+	return func() { f.Close() }, nil
+}
 
 // statePath is $NOTIFYD_STATE, or notifyd.json in $XDG_CONFIG_HOME/notifier
 // (default ~/.config/notifier).

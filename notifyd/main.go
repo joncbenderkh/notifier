@@ -39,15 +39,15 @@ const (
 const usage = `Usage:
   notifyd pair [-name NAME] [-force] LINK
   notifyd pair -server URL [-name NAME] [-force] CODE
-  notifyd [run]
+  notifyd run
   notifyd test
   notifyd history [-n COUNT] [-json]
   notifyd history clear
   notifyd unpair
   notifyd version
 
-Pair with the notifier://pair link (or the code) from ` + "`notify pair`" + `, then run
-notifyd, usually as a systemd user service. The pairing is kept in
+Pair with the notifier://pair link (or the code) from ` + "`notify pair`" + `, then
+` + "`notifyd run`" + `, usually as a systemd user service. The pairing is kept in
 $XDG_CONFIG_HOME/notifier/notifyd.json (override with NOTIFYD_STATE), and
 what it received in $XDG_STATE_HOME/notifier/notifyd-history.jsonl (override
 with NOTIFYD_HISTORY).
@@ -84,6 +84,11 @@ func refuseRedirect(*http.Request, []*http.Request) error {
 }
 
 func (a *app) run(args []string) int {
+	if len(args) == 0 {
+		// Not run: a second daemon would take over from the service's.
+		fmt.Fprint(a.stderr, usage)
+		return exitUsage
+	}
 	if a.statePath == "" {
 		p, err := statePath()
 		if err != nil {
@@ -103,11 +108,7 @@ func (a *app) run(args []string) int {
 	if a.now == nil {
 		a.now = time.Now
 	}
-	cmd := "run"
-	if len(args) > 0 {
-		cmd, args = args[0], args[1:]
-	}
-	switch cmd {
+	switch cmd, args := args[0], args[1:]; cmd {
 	case "pair":
 		return a.pair(args)
 	case "run":
@@ -246,6 +247,11 @@ func (a *app) listen(args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
+	release, err := lockRun(a.statePath)
+	if err != nil {
+		return a.fail(err)
+	}
+	defer release()
 	ctx, stop := a.signals()
 	defer stop()
 	desktop, err := a.desktop(ctx)
