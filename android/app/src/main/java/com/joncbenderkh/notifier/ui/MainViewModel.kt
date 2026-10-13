@@ -41,6 +41,10 @@ data class UiState(
     val pendingJoin: NotifierLink.Join? = null,
     /** The history screen is open in place of the main one. */
     val showHistory: Boolean = false,
+    /** Why the last pairing attempt failed, shown under the form. */
+    val pairError: String? = null,
+    /** Just paired: explain the notification permission before Android asks for it. */
+    val askNotifications: Boolean = false,
 )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -99,18 +103,43 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             else -> null
         }
         if (validationError != null || url == null) {
-            _state.update { it.copy(message = validationError) }
+            _state.update { it.copy(pairError = validationError) }
             return
         }
-        run("Paired.") {
-            val fcmToken = FirebaseMessaging.getInstance().token.await()
-            val name = deviceName.trim().ifEmpty { defaultDeviceName }
-            val response = withContext(Dispatchers.IO) { client.register(url, code.trim(), name, fcmToken) }
-            val pairing = Pairing(url, response.deviceId, name, response.deviceToken, response.sealKey)
-            store.save(pairing)
-            _state.update { it.copy(pairing = pairing) }
-            loadChannels(pairing)
+        viewModelScope.launch {
+            _state.update { it.copy(busy = true, message = null, pairError = null) }
+            val pairing = try {
+                val fcmToken = FirebaseMessaging.getInstance().token.await()
+                val name = deviceName.trim().ifEmpty { defaultDeviceName }
+                val response = withContext(Dispatchers.IO) { client.register(url, code.trim(), name, fcmToken) }
+                Pairing(url, response.deviceId, name, response.deviceToken, response.sealKey).also { store.save(it) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _state.update { it.copy(busy = false, pairError = pairingError(e)) }
+                return@launch
+            }
+            _state.update { it.copy(busy = false, pairing = pairing, message = "Paired.", askNotifications = true) }
+            run(null) { loadChannels(pairing) }
         }
+    }
+
+    private fun pairingError(e: Exception): String = when {
+        // The server answers one 403 for every unusable code, on purpose.
+        e is ServerException && e.status == 403 ->
+            "This code is invalid, expired or already used, or your account has reached its device " +
+                "limit. Create a new pairing code on your server."
+        e is ServerException -> e.message ?: "The server refused the pairing."
+        e is IOException -> "Could not reach the server: ${e.message}"
+        else -> "Failed: ${e.message}"
+    }
+
+    fun clearPairError() {
+        _state.update { it.copy(pairError = null) }
+    }
+
+    fun notificationsAsked() {
+        _state.update { it.copy(askNotifications = false) }
     }
 
     /**
@@ -129,7 +158,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 null -> it.copy(message = "That is not a Notifier code.")
                 is NotifierLink.Pair ->
                     if (pairing != null) it.copy(message = "Already paired. Unpair first to pair with another server.")
-                    else it.copy(prefill = link, message = "Check the server URL, then tap Pair.")
+                    else it.copy(prefill = link, pairError = null)
                 is NotifierLink.Join -> when {
                     pairing == null -> it.copy(message = "Pair this phone first, then open the invite again.")
                     // Pairings saved before origins were normalized may be spelled differently.
