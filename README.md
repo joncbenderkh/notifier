@@ -428,7 +428,12 @@ another user's device or key IDs answer 404.
 | `POST /v1/device/memberships`     | Device               | `{"invite"}`: its owner joins, and the device subscribes |
 | `GET /healthz`                    | —                    | |
 
-Limits: title 256 bytes, body 2048 bytes.
+Limits: title 256 bytes, body 2048 bytes. Titles and bodies may not
+contain control characters other than newline and tab, nor bidi
+embeddings, overrides or isolates (U+202A–U+202E, U+2066–U+2069); names
+of users, devices and keys, once their surrounding whitespace is trimmed,
+may not contain any of them. Such a request
+answers 400.
 
 ### WebSocket transport
 

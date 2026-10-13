@@ -293,6 +293,32 @@ describe("authentication", () => {
     expect(error).toBe("name must be valid UTF-8");
   });
 
+  it.each([
+    ["NUL", "a\u0000b"],
+    ["an escape", "\u001b[2Jcleared"],
+    ["a carriage return", "ok\rspoofed"],
+    ["DEL", "a\u007fb"],
+    ["a C1 control", "a\u009bb"],
+    ["a bidi override", "invoice\u202Efdp.exe"],
+    ["a bidi isolate", "a\u2066b\u2069"],
+  ])("rejects %s in names and message text", async (_, text) => {
+    await pair("phone", "fcm-phone");
+    const { error } = await call<{ error: string }>("POST", "/v1/keys", USER, { name: text }, 400);
+    expect(error).toBe("name must not contain control or bidi override characters");
+    for (const req of [{ title: text }, { title: "ok", body: text }]) {
+      const res = await call<{ error: string }>("POST", "/v1/notifications", USER, req, 400);
+      expect(res.error).toMatch(/must not contain control or bidi override characters/);
+    }
+  });
+
+  it("keeps newlines, tabs, bidi marks and joiners", async () => {
+    await pair("phone", "fcm-phone");
+    const body = "line one\n\tline two \u200F\u05E9\u05DC\u05D5\u05DD\u200E \u{1F468}\u200D\u{1F4BB}";
+    await call("POST", "/v1/notifications", USER, { title: "\u05E9\u05DC\u05D5\u05DD \u{1F44B}", body }, 200);
+    await call("POST", "/v1/keys", USER, { name: "\u05E9\u05DC\u05D5\u05DD" }, 201);
+    await call("POST", "/v1/keys", USER, { name: "line\nbreak" }, 400);
+  });
+
   it("rejects a revoked API key", async () => {
     await pair("phone", "fcm-phone");
     const { id, key } = await call<{ id: string; key: string }>("POST", "/v1/keys", USER, { name: "ci" }, 201);
