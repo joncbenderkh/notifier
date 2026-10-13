@@ -278,6 +278,39 @@ func TestTrimsCRLF(t *testing.T) {
 	}
 }
 
+func TestCleansWhatTheServerRefuses(t *testing.T) {
+	f := newFakeServer(t)
+	log := "\x1b[31mFAIL\x1b[0m pkg\r\n10%\r100%\n\x1b]0;title\x07done\x00 \u202Eevil\tok \u200F\u05E9\n"
+	if code, _, stderr := f.run(log, "\x1b[1mBuild\x1b[0m\u2066", "-"); code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	if got := f.got[0]; got.Title != "Build\uFFFD" || got.Body != "FAIL pkg\n10%\n100%\ndone\uFFFD \uFFFDevil\tok \u200F\u05E9" {
+		t.Fatalf("title %q, body %q", got.Title, got.Body)
+	}
+}
+
+func TestCleanedStdinLosesTrailingNewlines(t *testing.T) {
+	f := newFakeServer(t)
+	f.run("\x1b(B\x1b[mdone\r\x1b[K", "T", "-")
+	if f.got[0].Body != "done" {
+		t.Fatalf("body %q", f.got[0].Body)
+	}
+}
+
+func TestCutTailStartsAtALine(t *testing.T) {
+	f := newFakeServer(t)
+	log := strings.Repeat("x", stdinTailBytes) + "\x1b[1;31mFAIL\x1b[0m\nlast line\n"
+	f.run(log, "T", "-")
+	if body := f.got[0].Body; body != "…last line" {
+		t.Fatalf("body %q", body)
+	}
+	// One long line: nothing to cut it at.
+	f.run(strings.Repeat("y", stdinTailBytes+10)+"\n", "T", "-")
+	if body := f.got[1].Body; !strings.HasSuffix(body, "yyy") {
+		t.Fatalf("body %q", body)
+	}
+}
+
 func TestRefusesPlainHTTPExceptLoopback(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"-url", "http://notifier.example.com", "-key", testKey, "Hi"}, strings.NewReader(""), &stdout, &stderr, nil)
