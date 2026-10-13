@@ -370,7 +370,12 @@ cp notifyd/contrib/i3blocks/{notifier,show-history} ~/.config/i3blocks/notifier/
 interval=5
 ```
 
-`notifyd` stops, and systemd does not restart it, in two cases:
+The service runs `notifyd run`. A second `notifyd run` with the same state
+file refuses to start while it is running, since the server keeps one
+connection per device and would hand it to the newcomer; `notifyd` alone
+only prints its usage.
+
+`notifyd` stops, and systemd does not restart it, in three cases:
 - the device was unpaired on the server (exit status 4); pair it again
   with `notifyd pair -force LINK`;
 - another `notifyd` connected as the same device (exit status 5);

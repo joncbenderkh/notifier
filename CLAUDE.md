@@ -103,6 +103,13 @@ See `README.md` for the user-facing setup and API table.
   timeouts. `pair -force` saves the new pairing before unpairing the old
   one.
 
+  Bare `notifyd` prints usage instead of running (issue #22): the server
+  keeps one connection per device, so a second daemon replaces the
+  service's, which then exits 5 and stays down. For the same reason
+  `notifyd run` takes a non-blocking `flock` on `<state file>.lock`
+  (symlinks resolved; a copied state file is not caught) for its lifetime and exits 1 if another holds it; the unit's
+  `Restart=on-failure` then retries every 10 s until it is free.
+
   History (issue #16): each opened message is appended, before it is
   shown (so refused ones are kept too), as a JSON line to 0600
   `$XDG_STATE_HOME/notifier/notifyd-history.jsonl` (`NOTIFYD_HISTORY`

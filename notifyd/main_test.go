@@ -259,6 +259,7 @@ func TestPairUsageErrors(t *testing.T) {
 		{"pair", "notifier://join?server=https://x.example&code=C"},
 		{"run", "extra"},
 		{"bogus"},
+		{},
 	} {
 		a, _, _ := newTestApp(t)
 		if code := a.run(args); code != exitUsage {
@@ -308,7 +309,47 @@ func TestRunExitsWhenUnpaired(t *testing.T) {
 	srv := serveStream(t) // rejects every token but testToken
 	a, _, stderr := newTestApp(t)
 	saveState(a.statePath, State{URL: srv.URL, DeviceID: testDevice, DeviceToken: "nd_gone", SealKey: testKey})
-	if code := a.run(nil); code != exitUnpaired {
+	if code := a.run([]string{"run"}); code != exitUnpaired {
 		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	release, err := lockRun(a.statePath)
+	if err != nil {
+		t.Fatalf("run kept its lock: %v", err)
+	}
+	release()
+}
+
+func TestRunRefusesASecondDaemon(t *testing.T) {
+	a, _, stderr := newTestApp(t)
+	saveState(a.statePath, State{URL: "http://127.0.0.1:1", DeviceID: testDevice, DeviceToken: testToken, SealKey: testKey})
+	release, err := lockRun(a.statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code := a.run([]string{"run"}); code != exitError || !strings.Contains(stderr.String(), "another notifyd") {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	// The same file through a symlink is the same daemon.
+	alias := filepath.Join(t.TempDir(), "alias.json")
+	if err := os.Symlink(a.statePath, alias); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lockRun(alias); !errors.Is(err, errAlreadyRunning) {
+		t.Fatalf("lock through a symlink: %v", err)
+	}
+	release()
+	if release, err = lockRun(a.statePath); err != nil {
+		t.Fatalf("lock not released: %v", err)
+	}
+	release()
+}
+
+func TestBareInvocationPrintsUsage(t *testing.T) {
+	t.Setenv("HOME", "")
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("NOTIFYD_STATE", "")
+	a := &app{stdout: new(bytes.Buffer), stderr: new(bytes.Buffer)}
+	if code := a.run(nil); code != exitUsage || !strings.Contains(a.stderr.(*bytes.Buffer).String(), "Usage:") {
+		t.Fatalf("exit %d: %s", code, a.stderr)
 	}
 }
