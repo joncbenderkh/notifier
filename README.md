@@ -317,6 +317,7 @@ notifyd pair 'notifier://pair?server=...&code=...'   # or: notifyd pair -server 
 install -Dm644 notifyd/notifyd.service ~/.config/systemd/user/notifyd.service
 systemctl --user enable --now notifyd
 notifyd test                      # sends this desktop a test notification
+notifyd history                   # what it received, newest first (-n COUNT, -json)
 ```
 
 The unit runs `~/go/bin/notifyd`, where `go install` puts it; with a
@@ -324,10 +325,20 @@ downloaded binary from the releases, edit `ExecStart` to point at it.
 
 The pairing is kept in `~/.config/notifier/notifyd.json`, mode 0600 (set
 `NOTIFYD_STATE` to move it). `notifyd unpair` removes it, both from the
-server and locally. The unit starts with `graphical-session.target`. On a
-window manager that does not reach that target (plain i3 or sway), use
-`default.target` in the unit instead; systemd restarts `notifyd` until the
-notification daemon is up.
+server and locally.
+
+`notifyd history` lists the messages this desktop received, so one that
+was dismissed can still be read, including one the notification service
+refused to show. The list is limited to the last 500 messages within 30
+days. It lives only on this machine, in
+`~/.local/state/notifier/notifyd-history.jsonl` with mode 0600 (set
+`NOTIFYD_HISTORY` to move it). `notifyd history clear` empties it, and
+pairing or unpairing clears it too.
+
+The unit starts with `graphical-session.target`. On a window manager that
+does not reach that target (plain i3 or sway), use `default.target` in the
+unit instead; systemd restarts `notifyd` until the notification daemon is
+up.
 
 High-priority messages are shown with critical urgency. A message sent to a
 channel carries the category `notifier.<channel>`, so notification daemon

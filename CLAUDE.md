@@ -103,6 +103,25 @@ See `README.md` for the user-facing setup and API table.
   timeouts. `pair -force` saves the new pairing before unpairing the old
   one.
 
+  History (issue #16): each opened message is appended, before it is
+  shown (so refused ones are kept too), as a JSON line to 0600
+  `$XDG_STATE_HOME/notifier/notifyd-history.jsonl` (`NOTIFYD_HISTORY`
+  overrides). The file is opened per write and set to 0600 before
+  appending. Every change takes a `flock` on `<file>.lock`, shared with
+  `history clear`, `pair` and `unpair` in other processes. Under that lock
+  the daemon checks that `notifyd.json` still holds the device it runs as,
+  so a stale daemon cannot write into a new pairing's history, and a
+  compaction cannot undo a clear. The file is not encrypted, since
+  `notifyd.json` keeps the seal key in the clear beside it.
+
+  Reading deduplicates by ID, keeping the first arrival, and returns the
+  newest first: at most 500, none older than 30 days. Past 600 lines the
+  file is rewritten to that. Pairing and unpairing clear it.
+  `notifyd history` replaces control and format characters (escapes, bidi
+  overrides) in what it prints, and `-json` escapes them, since senders
+  choose the text. Its tests' `TestMain` points `NOTIFYD_STATE`
+  and `NOTIFYD_HISTORY` at missing temporary files.
+
   Close 4001, 401/404 on connect, or no state file exits 4; close 4000
   exits 5. The
   unit's `RestartPreventExitStatus=4 5` stops systemd from looping on
@@ -253,8 +272,9 @@ See `README.md` for the user-facing setup and API table.
   client, name → ID resolution), `pair.go` (terminal QR). `main_test.go` and
   `commands_test.go` run it against `httptest` servers; `TestMain` clears
   `NOTIFIER_*` and points `NOTIFIER_CONFIG` at a missing file.
-- `notifyd/` — `main.go` (subcommands: `pair`, `run`, `test`, `unpair`,
-  `version`; exit codes), `state.go` (`notifyd.json`), `link.go`
+- `notifyd/` — `main.go` (subcommands: `pair`, `run`, `test`, `history`,
+  `unpair`, `version`; exit codes), `state.go` (`notifyd.json`, atomic
+  writes), `history.go` (the history file), `link.go`
   (`notifier://pair` parsing), `seal.go` (envelope v1 open, pinned by the
   shared vector), `stream.go` (connection loop), `desktop.go` (D-Bus),
   `notifyd.service` (systemd user unit). The tests use `httptest`
