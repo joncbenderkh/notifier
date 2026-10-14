@@ -8,6 +8,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -35,6 +37,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -49,6 +52,7 @@ import androidx.compose.ui.unit.dp
 import com.joncbenderkh.notifier.R
 import com.joncbenderkh.notifier.data.HistoryEntry
 import com.joncbenderkh.notifier.push.ChannelRoute
+import kotlinx.coroutines.delay
 
 /** Notifications this phone received, newest first; only this phone has them. */
 @OptIn(ExperimentalMaterial3Api::class)
@@ -59,6 +63,8 @@ fun HistoryScreen(
     onBack: () -> Unit,
     onDelete: (String) -> Unit,
     onClear: () -> Unit,
+    answering: Set<String>,
+    onAnswer: (HistoryEntry, String) -> Unit,
 ) {
     BackHandler(onBack = onBack)
     var confirmClear by rememberSaveable { mutableStateOf(false) }
@@ -125,7 +131,7 @@ fun HistoryScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
-                items(entries, key = { it.id }) { HistoryCard(it, onDelete) }
+                items(entries, key = { it.id }) { HistoryCard(it, onDelete, it.id in answering, onAnswer) }
             }
         }
     }
@@ -156,9 +162,18 @@ private fun roughly(seconds: Long): String = when {
     else -> "${seconds / 86400} d"
 }
 
-/** One notification: its body collapses to two lines, and it can be deleted. */
+/**
+ * One notification: its body collapses to two lines, it can be deleted, and
+ * a question it asks can be answered until it expires.
+ */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun HistoryCard(entry: HistoryEntry, onDelete: (String) -> Unit) {
+private fun HistoryCard(
+    entry: HistoryEntry,
+    onDelete: (String) -> Unit,
+    answering: Boolean,
+    onAnswer: (HistoryEntry, String) -> Unit,
+) {
     var expanded by rememberSaveable(entry.id) { mutableStateOf(false) }
     var overflows by remember(entry.id) { mutableStateOf(false) }
     val now = System.currentTimeMillis()
@@ -231,6 +246,35 @@ private fun HistoryCard(entry: HistoryEntry, onDelete: (String) -> Unit) {
                             .clickable(onClickLabel = if (expanded) "Collapse" else "Read message") { expanded = !expanded }
                             .padding(vertical = 8.dp, horizontal = 0.dp),
                     )
+                }
+            }
+            val reply = entry.reply
+            if (reply != null) {
+                // Turns to "expired" on time, even while the screen stays open.
+                var expired by remember(entry.id) { mutableStateOf(now / 1000 >= reply.expiresAt) }
+                LaunchedEffect(entry.id, expired) {
+                    if (!expired) {
+                        delay(reply.expiresAt * 1000 - System.currentTimeMillis())
+                        expired = true
+                    }
+                }
+                val settled = entry.outcome ?: "The question has expired".takeIf { expired }
+                if (settled != null) {
+                    Text(
+                        settled,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 8.dp, end = 12.dp),
+                    )
+                } else {
+                    FlowRow(
+                        Modifier.padding(top = 8.dp, end = 12.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        reply.options.forEach { option ->
+                            OutlinedButton(onClick = { onAnswer(entry, option) }, enabled = !answering) { Text(option) }
+                        }
+                    }
                 }
             }
         }

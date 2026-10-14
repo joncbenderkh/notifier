@@ -45,6 +45,19 @@ class HistoryStore private constructor(context: Context) {
         }
     }
 
+    /** What became of the answer to [id]'s question, if it is settled. */
+    fun outcome(id: String): String? = synchronized(lock) {
+        val current = history ?: read().also {
+            history = it
+            _entries.value = it.entries
+        }
+        current.entries.firstOrNull { it.id == id }?.outcome
+    }
+
+    fun settled(id: String, outcome: String) {
+        update { it.settled(id, outcome) }
+    }
+
     fun delete(id: String) {
         update { it.remove(id) }
     }

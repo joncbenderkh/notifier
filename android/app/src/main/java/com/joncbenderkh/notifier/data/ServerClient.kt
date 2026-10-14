@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package com.joncbenderkh.notifier.data
 
+import com.joncbenderkh.notifier.push.SealedReply
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -86,9 +87,15 @@ class ServerClient(private val http: OkHttpClient = sharedClient) {
         return json.decodeFromString(execute(authorized(pairing, "v1/device/memberships").post(body)))
     }
 
-    private fun authorized(pairing: Pairing, path: String): Request.Builder =
+    /** Answers the question [messageId] with [reply], sealed for the asker. */
+    fun reply(pairing: Pairing, messageId: String, reply: SealedReply) {
+        val body = json.encodeToString(reply).toRequestBody(jsonType)
+        execute(authorized(pairing, "v1/replies", messageId).post(body))
+    }
+
+    private fun authorized(pairing: Pairing, path: String, segment: String? = null): Request.Builder =
         Request.Builder()
-            .url(endpoint(pairing.serverUrl, path))
+            .url(endpoint(pairing.serverUrl, path).let { if (segment == null) it else it.newBuilder().addPathSegment(segment).build() })
             .header("Authorization", "Bearer ${pairing.deviceToken}")
 
     private fun endpoint(serverUrl: String, path: String): HttpUrl =

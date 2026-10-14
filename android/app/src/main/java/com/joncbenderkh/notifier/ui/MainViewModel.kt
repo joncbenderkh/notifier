@@ -16,6 +16,7 @@ import com.joncbenderkh.notifier.data.Pairing
 import com.joncbenderkh.notifier.data.PairingStore
 import com.joncbenderkh.notifier.data.ServerClient
 import com.joncbenderkh.notifier.data.ServerException
+import com.joncbenderkh.notifier.push.Answers
 import com.joncbenderkh.notifier.push.ChannelRoute
 import com.joncbenderkh.notifier.push.Notifications
 import kotlinx.coroutines.CancellationException
@@ -52,6 +53,8 @@ data class UiState(
     val pendingJoin: NotifierLink.Join? = null,
     /** The history screen is open in place of the main one. */
     val showHistory: Boolean = false,
+    /** Messages whose question this phone is answering from the history. */
+    val answering: Set<String> = emptySet(),
     /** Why the last pairing attempt failed, shown under the form. */
     val pairError: String? = null,
     /** Just paired: explain the notification permission before Android asks for it. */
@@ -93,6 +96,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun deleteHistory(id: String) = editHistory("Notification deleted.") { historyStore.delete(id) }
 
     fun clearHistory() = editHistory("History cleared.") { historyStore.clear() }
+
+    /** Answers [entry]'s question with [option], and says what became of it. */
+    fun answer(entry: HistoryEntry, option: String) {
+        val reply = entry.reply ?: return
+        val deviceId = _state.value.pairing?.deviceId ?: return
+        if (entry.id in _state.value.answering) return
+        _state.update { it.copy(answering = it.answering + entry.id) }
+        viewModelScope.launch {
+            val outcome = withContext(Dispatchers.IO) { Answers.send(getApplication(), entry.id, reply, option, deviceId) }
+            _state.update { it.copy(answering = it.answering - entry.id).say(outcome?.text) }
+        }
+    }
 
     private fun editHistory(done: String? = null, block: () -> Unit) {
         viewModelScope.launch {
