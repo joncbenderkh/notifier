@@ -144,6 +144,16 @@ See `README.md` for the user-facing setup and API table.
   the server advertises `body-markup`), urgency normal/critical by
   priority, and `category` `notifier.<channel label>`.
 
+  Sounds: `internal/sounds` synthesizes notifier's three sounds
+  (`message`, `urgent`, `question`) as WAV, deterministically; `run`
+  writes them to `$XDG_CACHE_HOME/notifier/sounds/` (rewriting only what
+  differs) and names one in the `sound-file` hint: `question` for an open
+  question, else `urgent` for high priority, else `message`. Outcomes
+  carry `suppress-sound`. `--no-sound`, or a cache that cannot be
+  written, sends no hint. The Android app bundles the same files in
+  `res/raw`, written by `go run ./internal/sounds/gen`; a test fails when
+  they differ from the synthesizer's output.
+
   Questions (issue #32): a payload's `reply` (kept in the history entry,
   `histfile.Reply`) becomes Notify actions keyed by option index, with
   `expire_timeout` until the question closes, when the service has the
@@ -425,7 +435,9 @@ See `README.md` for the user-facing setup and API table.
   writes), `history.go` (the history file), `reply.go` (answering questions), `link.go`
   (`notifier://pair` parsing), `seal.go` (envelope v1 open, pinned by the
   shared vector), `stream.go` (connection loop), `desktop.go` (D-Bus),
-  `notifyd.service` (systemd user unit), `internal/histfile` (the
+  `notifyd.service` (systemd user unit), `internal/sounds` (the
+  synthesized sounds, and `gen`, which writes the Android copies),
+  `internal/histfile` (the
   history file and its lock, shared with the window),
   `cmd/notifyd-history` (the GTK 4 / libadwaita history window, gotk4;
   its GTK-free logic is in `internal/histview` with tests; the window

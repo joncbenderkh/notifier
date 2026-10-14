@@ -166,7 +166,7 @@ func newTestApp(t *testing.T) (*app, *bytes.Buffer, *bytes.Buffer) {
 		historyPath: filepath.Join(dir, "state", "notifyd-history.jsonl"),
 		now:         func() time.Time { return time.Unix(testNow, 0) },
 		http:        &http.Client{CheckRedirect: refuseRedirect},
-		desktop:     func(context.Context, AnswerFunc) (Desktop, error) { return newFakeDesktop(), nil },
+		desktop:     func(context.Context, AnswerFunc, map[string]string) (Desktop, error) { return newFakeDesktop(), nil },
 		hostname:    func() (string, error) { return "workstation", nil },
 		signals:     func() (context.Context, context.CancelFunc) { return context.WithCancel(context.Background()) },
 	}, &stdout, &stderr
@@ -373,5 +373,33 @@ func TestHelpUnknownCommandsAndOldFlags(t *testing.T) {
 		if code != tc.code || !strings.Contains(out, tc.out) {
 			t.Errorf("%q: exit %d, output %.300q", tc.args, code, out)
 		}
+	}
+}
+
+func TestInstallsSoundsUnlessTold(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	a, _, stderr := newTestApp(t)
+	paths := a.sounds()
+	for _, name := range []string{"message", "urgent", "question"} {
+		if _, err := os.Stat(paths[name]); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	a.noSound = true
+	if paths := a.sounds(); paths != nil {
+		t.Fatalf("--no-sound gave %v", paths)
+	}
+
+	a.noSound = false
+	t.Setenv("XDG_CACHE_HOME", "/dev/null")
+	if paths := a.sounds(); paths != nil || !strings.Contains(stderr.String(), "no sound") {
+		t.Fatalf("unwritable cache gave %v: %s", paths, stderr)
+	}
+	run, _, err := a.newRoot().Find([]string{"run"})
+	if err == nil {
+		err = run.ParseFlags([]string{"--no-sound"})
+	}
+	if err != nil || !a.noSound {
+		t.Fatalf("run --no-sound: %v", err)
 	}
 }

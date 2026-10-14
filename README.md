@@ -470,6 +470,13 @@ category = notifier.homelab
 urgency = low
 ```
 
+Each message names one of notifier's sounds in the `sound-file` hint: one
+for messages, a more insistent one for high priority, and one for open
+questions. `notifyd run` writes them to `$XDG_CACHE_HOME/notifier/sounds/`.
+The outcome of an answer is silent. Services that play sounds use the
+hint; others, such as dunst, ignore it. `notifyd run --no-sound` leaves the
+hint out, so the service's own sound settings apply.
+
 For i3blocks, `notifyd/contrib/i3blocks/` has a status bar block:
 - `NTF 3` counts the messages the history window has not listed yet, and
   turns red as `NTF off` when the service is not running.

@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"slices"
 	"strings"
 	"syscall"
@@ -23,6 +24,7 @@ import (
 	"unicode/utf16"
 
 	"github.com/joncbenderkh/notifier/notifyd/internal/histfile"
+	"github.com/joncbenderkh/notifier/notifyd/internal/sounds"
 )
 
 // version is set by release builds with -ldflags "-X main.version=...".
@@ -43,9 +45,11 @@ type app struct {
 	historyPath    string
 	now            func() time.Time
 	http           *http.Client
-	desktop        func(context.Context, AnswerFunc) (Desktop, error)
+	desktop        func(context.Context, AnswerFunc, map[string]string) (Desktop, error)
 	hostname       func() (string, error)
 	signals        func() (context.Context, context.CancelFunc)
+	// noSound keeps run from giving notifications a sound.
+	noSound bool
 }
 
 func main() {
@@ -224,7 +228,7 @@ func (a *app) listen() int {
 	desktop, err := a.desktop(ctx, func(id string, q histfile.Reply, option string) string {
 		outcome, _ := a.answer(st, id, q, option)
 		return outcome
-	})
+	}, a.sounds())
 	if err != nil {
 		return a.fail(fmt.Errorf("cannot reach the desktop's notification service: %w", err))
 	}
@@ -478,4 +482,22 @@ func escapeInvisible(raw []byte) []byte {
 		}
 	}
 	return b.Bytes()
+}
+
+// sounds writes notifier's sounds to $XDG_CACHE_HOME/notifier/sounds and
+// returns their paths; none with --no-sound, or if they cannot be
+// written, which costs only the sound.
+func (a *app) sounds() map[string]string {
+	if a.noSound {
+		return nil
+	}
+	dir, err := os.UserCacheDir()
+	if err == nil {
+		var paths map[string]string
+		if paths, err = sounds.Install(filepath.Join(dir, "notifier", "sounds")); err == nil {
+			return paths
+		}
+	}
+	a.logf("notifications will have no sound: %v", err)
+	return nil
 }

@@ -522,3 +522,49 @@ func TestOutcomeAfterAReconnectReplacesNothing(t *testing.T) {
 		t.Fatalf("outcome %v", args)
 	}
 }
+
+func TestPicksASoundAndKeepsOutcomesQuiet(t *testing.T) {
+	bus := &fakeBus{calls: make(chan []any, 10)}
+	d := &dbusDesktop{
+		object:  func(string) dbus.BusObject { return bus },
+		actions: true,
+		owner:   ":1.5",
+		now:     func() time.Time { return time.Unix(testNow, 0) },
+		pending: map[uint32]question{},
+		sounds:  map[string]string{"message": "/m.wav", "urgent": "/u.wav", "question": "/q.wav"},
+		answer:  func(string, histfile.Reply, string) string { return "Answered: yes" },
+	}
+	q := testQuestion
+	closed := q
+	closed.ExpiresAt = testNow
+	for _, c := range []struct {
+		p    Payload
+		want string
+	}{
+		{Payload{ID: "a", Title: "Hi"}, "/m.wav"},
+		{Payload{ID: "b", Title: "Disk", Priority: "high"}, "/u.wav"},
+		{Payload{ID: "c", Title: "Deploy?", Priority: "high", Reply: &q}, "/q.wav"},
+		{Payload{ID: "d", Title: "Deploy?", Reply: &closed}, "/m.wav"},
+	} {
+		if err := d.show(context.Background(), c.p); err != nil {
+			t.Fatal(err)
+		}
+		hints := bus.call(t)[6].(map[string]dbus.Variant)
+		if hints["sound-file"] != dbus.MakeVariant(c.want) {
+			t.Errorf("%s: sound %v, want %s", c.p.ID, hints["sound-file"], c.want)
+		}
+	}
+	d.signal(0, &dbus.Signal{Sender: ":1.5", Name: notificationsInterface + ".ActionInvoked", Body: []any{uint32(3), "0"}})
+	hints := bus.call(t)[6].(map[string]dbus.Variant)
+	if _, ok := hints["sound-file"]; ok || hints["suppress-sound"] != dbus.MakeVariant(true) {
+		t.Fatalf("outcome hints %v", hints)
+	}
+
+	d.sounds = nil // --no-sound, or the files could not be written
+	if err := d.show(context.Background(), Payload{ID: "e", Title: "Hi"}); err != nil {
+		t.Fatal(err)
+	}
+	if hints := bus.call(t)[6].(map[string]dbus.Variant); hints["sound-file"].Value() != nil {
+		t.Fatalf("a sound without sound files: %v", hints)
+	}
+}
