@@ -12,6 +12,17 @@ import type { Channel, Device } from "./store";
 
 export const MESSAGE_TTL_SECONDS = 24 * 60 * 60;
 const ENVELOPE_VERSION = "1";
+const NONCE_BYTES = 12;
+const TAG_BYTES = 16;
+/** FCM's limit on a data message, keys and values together. */
+export const MAX_FCM_DATA_BYTES = 4096;
+
+/** The bytes [p] takes in an FCM data message once sealed: keys v, n, c and their values. */
+export function sealedDataBytes(p: Payload): number {
+  const base64 = (bytes: number) => Math.ceil(bytes / 3) * 4;
+  const plaintext = new TextEncoder().encode(JSON.stringify(p)).length;
+  return 3 + ENVELOPE_VERSION.length + base64(NONCE_BYTES) + base64(plaintext + TAG_BYTES);
+}
 
 /** How a member sees a channel: bare when they own it, "owner/name" otherwise. */
 export const channelLabel = (ch: Channel, viewer: string) =>
@@ -21,6 +32,13 @@ export const channelLabel = (ch: Channel, viewer: string) =>
 export interface Target {
   device: Device;
   channel?: Channel;
+}
+
+/** What [t] receives: [base], labelled with its channel as its owner names it, plus what [extra] adds. */
+export function payloadFor(t: Target, base: Payload, extra?: (t: Target) => Partial<Payload>): Payload {
+  const ch = t.channel;
+  const p = ch ? { ...base, channel: channelLabel(ch, t.device.user_id), channel_id: ch.id } : base;
+  return { ...p, ...extra?.(t) };
 }
 
 /**
@@ -45,6 +63,9 @@ export interface Published {
 export function publisher(deps: Deps) {
   async function deliver(env: Env, d: Device, p: Payload): Promise<Delivery> {
     if (d.transport === "fcm" && d.fcm_token === "") return { device_id: d.id, status: "unreachable" };
+    if (d.transport === "fcm" && sealedDataBytes(p) > MAX_FCM_DATA_BYTES) {
+      return { device_id: d.id, status: "failed", error: "message too large for FCM" };
+    }
     try {
       const envelope = await seal(fromBase64(d.seal_key), d.id, new TextEncoder().encode(JSON.stringify(p)));
       const data = { v: ENVELOPE_VERSION, n: toBase64(envelope.nonce), c: toBase64(envelope.ciphertext) };
@@ -91,11 +112,10 @@ export function publisher(deps: Deps) {
       console.error("push prepare failed", err);
     }
     const all = await Promise.all(
-      [...targets].map(async (t) => {
-        const { device: d, channel: ch } = t;
-        const p = ch ? { ...base, channel: channelLabel(ch, d.user_id), channel_id: ch.id } : base;
-        return { own: d.user_id === userId, delivery: await deliver(env, d, { ...p, ...extra?.(t) }) };
-      }),
+      [...targets].map(async (t) => ({
+        own: t.device.user_id === userId,
+        delivery: await deliver(env, t.device, payloadFor(t, base, extra)),
+      })),
     );
     const deliveries = all.filter((x) => x.own).map((x) => x.delivery);
     const members: Published["members"] = {};

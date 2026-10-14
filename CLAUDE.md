@@ -230,6 +230,12 @@ See `README.md` for the user-facing setup and API table.
   `invite:` prefix so they can never redeem as pairing codes. Secrets are stored only as unsalted SHA-256 digests — fine
   because they are 256-bit random; don't reuse that scheme for anything
   low-entropy.
+- **FCM size:** FCM carries at most 4 KiB of data (keys and values).
+  Text within the limits can exceed it once JSON-escaped, sealed and
+  base64-encoded, so `POST /v1/notifications` computes each FCM target's
+  exact size (`sealedDataBytes` in `publish.ts`) and answers 400 if any
+  is over; `deliver` reports `failed` for such a message from heartbeats
+  or hooks instead of calling FCM.
 - **Unsafe characters (issue #24):** the server answers 400 to a title or
   body holding a control character other than `\n` and `\t` (C0, DEL, C1;
   so `\r` too) or a bidi embedding, override or isolate (U+202A–U+202E,

@@ -30,7 +30,15 @@ import { pairPageRoutes } from "./pairPage";
 import { fromBase64, toBase64 } from "./encoding";
 import { joinUri, pairingUri, qrSvg } from "./pairing";
 import type { Sender } from "./push";
-import { addSubscribers, channelLabel, MESSAGE_TTL_SECONDS, publisher } from "./publish";
+import {
+  addSubscribers,
+  channelLabel,
+  MAX_FCM_DATA_BYTES,
+  MESSAGE_TTL_SECONDS,
+  payloadFor,
+  publisher,
+  sealedDataBytes,
+} from "./publish";
 import type { Target } from "./publish";
 import type { Replies, Responder } from "./replies";
 import type { Stream } from "./stream";
@@ -975,6 +983,7 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     const base: Payload = { id: newId("msg_"), title, priority, sent_at: deps.now() };
     if (body !== "") base.body = body;
     let extra: ((t: Target) => Partial<Payload>) | undefined;
+    let openBox: (() => Promise<void>) | undefined;
     const question = parseQuestion(req.question);
     if (question) {
       const answering = [...targets.values()].filter((t) => question.anyone || t.device.user_id === userId);
@@ -988,12 +997,22 @@ export function createApp(deps: Deps): Hono<AppEnv> {
         label: d.user_id === userId ? d.name : (names.get(d.user_id) ?? d.user_id),
       }));
       const expiresAt = deps.now() + question.expiresIn;
-      // Opened first, so an answer that comes back at once finds it.
-      await deps.replies(c.env, base.id).open({ userId, expiresAt, responders }, deps.now());
+      openBox = () => deps.replies(c.env, base.id).open({ userId, expiresAt, responders }, deps.now());
       const reply = { options: question.options, key: question.key, expires_at: expiresAt };
       const allowed = new Set(responders.map((r) => r.device_id));
       extra = (t) => (allowed.has(t.device.id) ? { reply } : {});
     }
+    // Escaping can grow text that fits the limits past what FCM carries.
+    // A phone without a token is skipped at delivery, so it cannot refuse.
+    const tooLarge = [...targets.values()].some(
+      (t) =>
+        t.device.transport === "fcm" &&
+        t.device.fcm_token !== "" &&
+        sealedDataBytes(payloadFor(t, base, extra)) > MAX_FCM_DATA_BYTES,
+    );
+    if (tooLarge) fail(400, "title and body are too long once encoded for a phone (at most 4 KiB); shorten them");
+    // Opened before publishing, so an answer that comes back at once finds it.
+    await openBox?.();
     const { deliveries, members } = await publish(c.env, userId, targets.values(), base, extra);
     return c.json({ id: base.id, deliveries, ...(Object.keys(members).length > 0 ? { members } : {}) });
   });

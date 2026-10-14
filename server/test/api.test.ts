@@ -18,6 +18,7 @@ import type { Delivery, Payload } from "../src/app";
 import { fromBase64, toBase64 } from "../src/encoding";
 import { heartbeatAlerts, MAX_HEARTBEATS_PER_USER } from "../src/heartbeats";
 import { MAX_HOOKS_PER_USER } from "../src/hooks";
+import { MAX_FCM_DATA_BYTES, sealedDataBytes } from "../src/publish";
 import { UnregisteredError } from "../src/push";
 import type { PushMessage, Sender } from "../src/push";
 import { open, seal } from "../src/seal";
@@ -159,6 +160,31 @@ describe("notifications", () => {
       const p = JSON.parse(new TextDecoder().decode(plaintext)) as Payload;
       expect(p).toMatchObject({ id: resp.id, title: "Build done", body: "main is green", priority: "high" });
     }
+  });
+
+  it("refuses text that FCM could not carry once escaped and sealed", async () => {
+    const phone = await pair("phone", "fcm-phone");
+    await call("POST", "/v1/notifications", USER, { title: "t", body: '"'.repeat(2048) }, 400);
+    expect(sender.sent).toHaveLength(0);
+
+    // The estimate is exact: the largest message that fits arrives at 4 KiB or less.
+    const body = "x".repeat(1548);
+    await call("POST", "/v1/notifications", USER, { title: "t".repeat(256), body: '"'.repeat(500) + body }, 200);
+    const m = sender.sent[0]!;
+    const bytes = Object.entries(m.data).reduce((sum, [k, v]) => sum + k.length + v.length, 0);
+    expect(bytes).toBe(sealedDataBytes(await payloadFor(phone, 0)));
+    expect(bytes).toBeLessThanOrEqual(MAX_FCM_DATA_BYTES);
+
+    // A WebSocket device has no such limit, and a phone without a token
+    // (skipped as unreachable) does not hold it back.
+    const { code } = await call<{ code: string }>("POST", "/v1/pairings", USER, undefined, 201);
+    const desktop = await call<Registration>("POST", "/v1/devices", "", { code, name: "desktop", transport: "ws" }, 201);
+    await env.DB.prepare("UPDATE devices SET fcm_token = '' WHERE id = ?").bind(phone.device_id).run();
+    const sent = await call<NotifyResponse>("POST", "/v1/notifications", USER, { title: "t", body: '"'.repeat(2048) }, 200);
+    expect(sent.deliveries).toEqual([
+      { device_id: phone.device_id, status: "unreachable" },
+      { device_id: desktop.device_id, status: "queued" },
+    ]);
   });
 
   it.each(["", null])("treats priority %j as default", async (priority) => {
@@ -1454,6 +1480,15 @@ describe("questions", () => {
     expect((await payloadFor(bobPhone, 2)).reply).toMatchObject({ options: ["yes", "no"], expires_at: now + 600 });
     await answer(bobPhone, anyone.id, "yes");
     expect(await poll(anyone.id)).toMatchObject({ status: "answered", by: "bob" });
+  });
+
+  it("refuses a question that makes the message too large for FCM, before opening it", async () => {
+    await pair("phone", "fcm-phone");
+    const options = ["a", "b", "c"].map((x) => x.repeat(32));
+    const big = { title: "t".repeat(256), body: '"'.repeat(500) + "x".repeat(1548) };
+    const { error } = await call<{ error: string }>("POST", "/v1/notifications", USER, { ...big, question: { options, key: KEY } }, 400);
+    expect(error).toMatch(/too long once encoded/);
+    expect(sender.sent).toHaveLength(0);
   });
 
   it("refuses a question none of the asker's devices can answer", async () => {

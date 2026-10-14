@@ -549,7 +549,10 @@ contain control characters other than newline and tab, nor bidi
 embeddings, overrides or isolates (U+202A–U+202E, U+2066–U+2069); names
 of users, devices and keys, once their surrounding whitespace is trimmed,
 may not contain any of them. Such a request
-answers 400.
+answers 400. A message for a phone must also fit FCM's 4 KiB once
+escaped as JSON and sealed, which text full of quotes or backslashes, or a
+question's answers, can exceed; that also answers 400 (the desktop's
+WebSocket transport has no such limit).
 
 ### WebSocket transport
 
