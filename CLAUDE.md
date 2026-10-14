@@ -143,6 +143,21 @@ See `README.md` for the user-facing setup and API table.
   them. Notify mapping: summary = title, body = body (markup-escaped when
   the server advertises `body-markup`), urgency normal/critical by
   priority, and `category` `notifier.<channel label>`.
+
+  Questions (issue #32): a payload's `reply` (kept in the history entry,
+  `histfile.Reply`) becomes Notify actions keyed by option index, with
+  `expire_timeout` until the question closes, when the service has the
+  `actions` capability; otherwise the body gets a `notifyd reply` hint.
+  `dbusDesktop` calls the service by its owner's unique name (the
+  well-known name only when none runs, which can start one), so a
+  successor never gets a call meant for its predecessor; it maps
+  notification IDs to questions tagged with that owner, takes
+  `ActionInvoked`/`NotificationClosed` only from it, drops an exited
+  owner's questions on `NameOwnerChanged`, and answers off the
+  signal loop through `app.answer` (`reply.go`: seals under the key, posts
+  `/v1/replies/<id>` with the device token), then replaces the
+  notification with the outcome. `notifyd reply ID ANSWER` does the same
+  from the history. Tests fake the bus object (`fakeBus`).
 - **WebSocket transport (issue #7):** FCM cannot reach Linux desktops, so
   `devices.transport` is `fcm` or `ws` (migration 0004). A `ws` device has
   a SQLite-backed Durable Object (`src/stream.ts`, `DeviceStream`, bound as
@@ -387,10 +402,10 @@ See `README.md` for the user-facing setup and API table.
   client, name → ID resolution), `pair.go` (terminal QR). `main_test.go` and
   `commands_test.go` run it against `httptest` servers; `TestMain` clears
   `NOTIFIER_*` and points `NOTIFIER_CONFIG` at a missing file.
-- `notifyd/` — `cmd.go` (the Cobra command tree: `pair`, `run`, `test`,
+- `notifyd/` — `cmd.go` (the Cobra command tree: `pair`, `run`, `test`, `reply`,
   `history`, `unpair`, `version`, `completion`), `main.go` (the commands and
   exit codes), `state.go` (`notifyd.json`, atomic
-  writes), `history.go` (the history file), `link.go`
+  writes), `history.go` (the history file), `reply.go` (answering questions), `link.go`
   (`notifier://pair` parsing), `seal.go` (envelope v1 open, pinned by the
   shared vector), `stream.go` (connection loop), `desktop.go` (D-Bus),
   `notifyd.service` (systemd user unit), `internal/histfile` (the
