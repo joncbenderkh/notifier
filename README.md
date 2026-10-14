@@ -187,6 +187,9 @@ curl -X POST $S/v1/notifications -H "$T" -d '{"title": "disk full", "channels": 
   invite's QR code, opening its `notifier://join` link (it asks first), or
   typing the code. Each channel other than `default` gets its own group in
   Android's notification settings, so it can be muted or given a sound.
+  Notifications play notifier's own sounds: one for messages, a more
+  insistent one for high priority, and one for questions, each its own
+  Android channel. A sound you chose for a channel before is kept.
 
 ### Heartbeats
 
@@ -469,6 +472,13 @@ rules can treat channels differently. For dunst:
 category = notifier.homelab
 urgency = low
 ```
+
+Each message names one of notifier's sounds in the `sound-file` hint: one
+for messages, a more insistent one for high priority, and one for open
+questions. `notifyd run` writes them to `$XDG_CACHE_HOME/notifier/sounds/`.
+The outcome of an answer is silent. Services that play sounds use the
+hint; others, such as dunst, ignore it. `notifyd run --no-sound` leaves the
+hint out, so the service's own sound settings apply.
 
 For i3blocks, `notifyd/contrib/i3blocks/` has a status bar block:
 - `NTF 3` counts the messages the history window has not listed yet, and
