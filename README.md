@@ -266,7 +266,8 @@ Each question carries a one-time key, inside the sealed message. The
 device seals the answer under it, so the server holds the answer only in a
 form it cannot read, and forgets it an hour after the question expires.
 Devices that predate questions show the question without buttons; the
-buttons come to notifyd and the Android app in follow-up releases (#32).
+buttons come to the Android app in a follow-up release (#32); notifyd
+shows them already (see [notifyd](#linux-desktop-notifyd)).
 
 ### History
 
@@ -414,6 +415,7 @@ install -Dm644 notifyd/notifyd.service ~/.config/systemd/user/notifyd.service
 systemctl --user enable --now notifyd
 notifyd test                      # sends this desktop a test notification
 notifyd history                   # what it received, newest first (-n COUNT, --json)
+notifyd reply ID ANSWER           # answers a question from the history
 ```
 
 The unit runs `~/go/bin/notifyd`, where `go install` puts it; with a
@@ -446,6 +448,15 @@ The unit starts with `graphical-session.target`. On a window manager that
 does not reach that target (plain i3 or sway), use `default.target` in the
 unit instead; systemd restarts `notifyd` until the notification daemon is
 up.
+
+A question (`notify ask`) shows its answers as notification actions, if
+the notification service supports them (dunst lists them in its context
+menu, GNOME and KDE as buttons). It stays until answered or until the
+question closes; once answered, it is replaced by the outcome ("Answered:
+yes", "Already answered"). Without actions, or after a restart of
+`notifyd`, which forgets the buttons of notifications already shown,
+answer with `notifyd reply ID ANSWER`: `notifyd history` shows the ID and
+the answers.
 
 High-priority messages are shown with critical urgency. A message sent to a
 channel carries the category `notifier.<channel>`, so notification daemon

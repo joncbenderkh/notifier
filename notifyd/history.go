@@ -58,6 +58,7 @@ func (h *history) append(p Payload) error {
 	line, err := json.Marshal(historyEntry{
 		ID: p.ID, Title: p.Title, Body: p.Body, Priority: p.Priority,
 		SentAt: p.SentAt, ReceivedAt: h.now().Unix(), Channel: p.Channel, ChannelID: p.ChannelID,
+		Reply: p.Reply,
 	})
 	if err != nil {
 		return err
