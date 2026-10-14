@@ -31,11 +31,12 @@ type Device struct {
 }
 
 type Notification struct {
-	Title     string   `json:"title"`
-	Body      string   `json:"body,omitempty"`
-	Priority  string   `json:"priority,omitempty"`
-	Channels  []string `json:"channels,omitempty"`
-	DeviceIDs []string `json:"device_ids,omitempty"`
+	Title     string    `json:"title"`
+	Body      string    `json:"body,omitempty"`
+	Priority  string    `json:"priority,omitempty"`
+	Channels  []string  `json:"channels,omitempty"`
+	DeviceIDs []string  `json:"device_ids,omitempty"`
+	Question  *Question `json:"question,omitempty"`
 }
 
 type Delivery struct {
@@ -80,6 +81,21 @@ func (c *Client) Pair(ctx context.Context) (Pairing, error) {
 func (c *Client) Notify(ctx context.Context, n Notification) (NotifyResult, error) {
 	var result NotifyResult
 	return result, c.do(ctx, http.MethodPost, "/v1/notifications", n, &result)
+}
+
+// ReplyState is a question's state; N and C hold the sealed answer.
+type ReplyState struct {
+	Status string `json:"status"`
+	By     string `json:"by"`
+	N      string `json:"n"`
+	C      string `json:"c"`
+}
+
+// Reply waits up to [wait] seconds for the answer to the question [id].
+func (c *Client) Reply(ctx context.Context, id string, wait int) (ReplyState, error) {
+	var r ReplyState
+	path := fmt.Sprintf("/v1/replies/%s?wait=%d", url.PathEscape(id), wait)
+	return r, c.do(ctx, http.MethodGet, path, nil, &r)
 }
 
 type Signup struct {

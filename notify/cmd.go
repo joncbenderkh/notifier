@@ -94,6 +94,39 @@ func newRoot(c *cli) *cobra.Command {
 	send.Flags().StringArrayVarP(&channels, "channel", "c", nil, "own `channel` to publish to; repeatable or comma-separated (default: the config file's, else default)")
 	send.Flags().BoolVar(&high, "high", false, "send as high priority (heads-up, may wake the phone)")
 
+	var askTo, askChannels, options []string
+	var askHigh, anyone bool
+	var wait time.Duration
+	ask := &cobra.Command{
+		Use:   "ask [flags] QUESTION [BODY | -]",
+		Short: "Ask a question and print the answer",
+		Long: "Send a question with up to three answers, as buttons on your devices,\n" +
+			"and wait for the first one tapped. It prints the answer on standard\n" +
+			"output and exits 0, or exits 4 when nobody answered in time (3 when\n" +
+			"the question reached no device). Only your own devices may answer,\n" +
+			"unless --anyone lets other members of the channels answer too.\n\n" +
+			"Targets, BODY and flag order work as for send.",
+		Example: "  if [ \"$(notify ask -o yes,no 'Deploy prod?')\" = yes ]; then make deploy; fi\n" +
+			"  notify ask -o restart,ignore --wait 1h -c homelab --anyone \"Disk full\" -",
+		Args:        cobra.RangeArgs(1, 2),
+		Annotations: map[string]string{flagsEndAtArgs: "yes"},
+	}
+	ask.RunE = withSettings(true, func(args []string) int {
+		var h *bool
+		if ask.Flags().Changed("high") {
+			h = &askHigh
+		}
+		return c.askCmd(args, splitList(askTo), splitList(askChannels), splitList(options), h, wait, anyone)
+	})
+	ask.Flags().SetInterspersed(false)
+	ask.Flags().StringArrayVarP(&options, "options", "o", nil, "the `answers` to offer, at most 3; repeatable or comma-separated")
+	ask.Flags().DurationVar(&wait, "wait", 10*time.Minute, "how long the question stays open (10s to 24h)")
+	ask.Flags().BoolVar(&anyone, "anyone", false, "let other channel members' devices answer too")
+	ask.Flags().StringArrayVar(&askTo, "to", nil, "device `name or ID` to ask; repeatable or comma-separated")
+	ask.Flags().StringArrayVarP(&askChannels, "channel", "c", nil, "own `channel` to ask in; repeatable or comma-separated (default: the config file's, else default)")
+	ask.Flags().BoolVar(&askHigh, "high", false, "send as high priority (heads-up, may wake the phone)")
+	_ = ask.MarkFlagRequired("options")
+
 	var force bool
 	signup := leaf("signup INVITE NAME", "Create an account with an invite and save its token", cobra.ExactArgs(2), func(args []string) int {
 		return c.signup(args, force)
@@ -165,6 +198,7 @@ func newRoot(c *cli) *cobra.Command {
 	noArgs := func(fn func() int) func([]string) int { return func([]string) int { return fn() } }
 	root.AddCommand(
 		send,
+		ask,
 		&cobra.Command{
 			Use:   "version",
 			Short: "Print the version",
