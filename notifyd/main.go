@@ -16,11 +16,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
-	"unicode"
 	"unicode/utf16"
+
+	"github.com/joncbenderkh/notifier/notifyd/internal/histfile"
 )
 
 // version is set by release builds with -ldflags "-X main.version=...".
@@ -363,6 +365,25 @@ func (a *app) historyClear() int {
 	return 0
 }
 
+// historyDelete removes the entries with [ids]; an ID it does not hold
+// fails, so a typo is not mistaken for success.
+func (a *app) historyDelete(ids []string) int {
+	var removed int
+	err := withHistoryLock(a.historyPath, func() (err error) {
+		removed, err = histfile.Delete(a.historyPath, a.now(), ids...)
+		return err
+	})
+	if err != nil {
+		return a.fail(err)
+	}
+	if want := len(slices.Compact(slices.Sorted(slices.Values(ids)))); removed < want {
+		fmt.Fprintf(a.stderr, "notifyd: deleted %d of %d messages; the others are not in the history\n", removed, want)
+		return 1
+	}
+	fmt.Fprintf(a.stdout, "Deleted %d.\n", removed)
+	return 0
+}
+
 // history prints the [n] newest entries (all for 0).
 func (a *app) history(n int, asJSON bool) int {
 	if n < 0 {
@@ -427,19 +448,10 @@ func formatEntry(e historyEntry) string {
 	return b.String()
 }
 
-// printable replaces control and format characters (terminal escapes, bidi
-// overrides, zero-width characters) with U+FFFD, keeping tabs, and newlines
-// only when multiline.
-func printable(s string, multiline bool) string {
-	return strings.Map(func(r rune) rune {
-		if r == '\t' || multiline && r == '\n' || !invisible(r) {
-			return r
-		}
-		return '\uFFFD'
-	}, s)
-}
-
-func invisible(r rune) bool { return unicode.IsControl(r) || unicode.Is(unicode.Cf, r) }
+var (
+	printable = histfile.Printable
+	invisible = histfile.Invisible
+)
 
 // escapeInvisible rewrites, as \uXXXX escapes, what encoding/json leaves
 // raw but a terminal may act on: DEL, C1 controls, and format characters.

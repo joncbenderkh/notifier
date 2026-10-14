@@ -400,8 +400,19 @@ was dismissed can still be read, including one the notification service
 refused to show. The list is limited to the last 500 messages within 30
 days. It lives only on this machine, in
 `~/.local/state/notifier/notifyd-history.jsonl` with mode 0600 (set
-`NOTIFYD_HISTORY` to move it). `notifyd history clear` empties it, and
-pairing or unpairing clears it too.
+`NOTIFYD_HISTORY` to move it). `notifyd history delete ID…` removes
+messages, `notifyd history clear` empties it, and pairing or unpairing
+clears it too.
+
+`notifyd-history` shows the history in a window (GTK 4 and libadwaita
+1.9 or later): the list beside the selected message, search, a channel
+filter, delete with undo, and clear all. It follows new messages as they
+arrive. Building it needs the libadwaita headers (`dnf install
+libadwaita-devel` on Fedora):
+
+```sh
+go install github.com/joncbenderkh/notifier/notifyd/cmd/notifyd-history@latest
+```
 
 The unit starts with `graphical-session.target`. On a window manager that
 does not reach that target (plain i3 or sway), use `default.target` in the
@@ -421,11 +432,11 @@ urgency = low
 For i3blocks, `notifyd/contrib/i3blocks/` has a status bar block:
 - `NTF 3` counts the messages the history window has not listed yet, and
   turns red as `NTF off` when the service is not running.
-- Left-click opens the history in a window (`zenity`), where a message can
-  be opened in full.
+- Left-click opens the history window: `notifyd-history` when installed,
+  else a simpler `zenity` one (`show-history`).
 - Middle-click restarts the service.
 
-It needs `jq` and `zenity`:
+It needs `jq`, and `zenity` for the fallback window:
 
 ```sh
 mkdir -p ~/.config/i3blocks/notifier

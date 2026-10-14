@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/joncbenderkh/notifier/notifyd/internal/histfile"
 )
 
 const testNow = 1_800_000_000
@@ -69,12 +71,12 @@ func TestHistoryKeepsTheNewestFirstAndEachMessageOnce(t *testing.T) {
 func TestHistoryDropsOldEntriesAndCompacts(t *testing.T) {
 	h, now := testHistory(t)
 	h.record(Payload{ID: "old"})
-	*now += int64(maxHistoryAge / time.Second)
+	*now += int64(histfile.MaxAge / time.Second)
 	for i := range compactAfterLines {
 		h.record(Payload{ID: fmt.Sprintf("m%d", i)})
 	}
 	got, _ := readHistory(h.path, time.Unix(*now, 0))
-	if len(got) != maxHistoryEntries || strings.Contains(ids(got), "old") || got[0].ID != fmt.Sprintf("m%d", compactAfterLines-1) {
+	if len(got) != histfile.MaxEntries || strings.Contains(ids(got), "old") || got[0].ID != fmt.Sprintf("m%d", compactAfterLines-1) {
 		t.Fatalf("%d entries, first %q", len(got), got[0].ID)
 	}
 	if lines, _ := countLines(h.path); lines > compactAfterLines {
@@ -161,6 +163,21 @@ func TestHistoryCommand(t *testing.T) {
 		t.Fatalf("json output %q", stdout)
 	}
 
+	stdout.Reset()
+	h.record(Payload{ID: "m2"}) // a replay: delete removes every copy
+	if code := a.run([]string{"history", "delete", "m2", "m2"}); code != 0 || stdout.String() != "Deleted 1.\n" {
+		t.Fatalf("delete: exit %d, %q %s", code, stdout, stderr)
+	}
+	if code := a.run([]string{"history", "delete", "m1", "nope"}); code != 1 || !strings.Contains(stderr.String(), "deleted 1 of 2") {
+		t.Fatalf("delete missing: exit %d, %s", code, stderr)
+	}
+	if got, _ := readHistory(a.historyPath, a.now()); ids(got) != "m3" {
+		t.Fatalf("after delete: %q", ids(got))
+	}
+	if info, _ := os.Stat(a.historyPath); info.Mode().Perm() != 0o600 {
+		t.Fatalf("mode after delete %v", info.Mode())
+	}
+
 	if code := a.run([]string{"history", "clear"}); code != 0 {
 		t.Fatalf("clear: exit %d", code)
 	}
@@ -169,7 +186,7 @@ func TestHistoryCommand(t *testing.T) {
 	if strings.TrimSpace(stdout.String()) != "[]" {
 		t.Fatalf("after clear: %q", stdout)
 	}
-	for _, args := range [][]string{{"history", "extra"}, {"history", "-n", "-1"}, {"history", "clear", "now"}} {
+	for _, args := range [][]string{{"history", "extra"}, {"history", "-n", "-1"}, {"history", "clear", "now"}, {"history", "delete"}} {
 		if code := a.run(args); code != exitUsage {
 			t.Errorf("%v: exit %d", args, code)
 		}
