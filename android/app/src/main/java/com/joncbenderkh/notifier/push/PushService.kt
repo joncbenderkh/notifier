@@ -39,7 +39,7 @@ class PushService : FirebaseMessagingService() {
         } catch (e: Exception) {
             Log.w(TAG, "could not record the message in the history", e)
         }
-        Notifications.show(this, payload)
+        Notifications.show(this, payload, pairing.deviceId, Answers.settled(this, payload.id))
     }
 
     private companion object {

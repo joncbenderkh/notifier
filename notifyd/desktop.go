@@ -59,6 +59,8 @@ type question struct {
 type dbusDesktop struct {
 	answer AnswerFunc
 	now    func() time.Time
+	// sounds are the sound files by name (see [sound]); none, no sound hint.
+	sounds map[string]string
 
 	// showMu makes a signal wait for a Notify call in flight, so an action
 	// on a question just shown finds it registered.
@@ -83,8 +85,8 @@ type dbusDesktop struct {
 	gen uint64
 }
 
-func connectDesktop(ctx context.Context, answer AnswerFunc) (Desktop, error) {
-	d := &dbusDesktop{answer: answer, now: time.Now, pending: map[uint32]question{}}
+func connectDesktop(ctx context.Context, answer AnswerFunc, sounds map[string]string) (Desktop, error) {
+	d := &dbusDesktop{answer: answer, now: time.Now, sounds: sounds, pending: map[uint32]question{}}
 	if err := d.connect(ctx); err != nil {
 		return nil, err
 	}
@@ -241,7 +243,11 @@ func (d *dbusDesktop) showOnce(ctx context.Context, p Payload) error {
 		d.markup, d.actions, d.capsStale = markup, actions, false
 		d.mu.Unlock()
 	}
-	n := notification(p, markup, actions, d.now())
+	now := d.now()
+	n := notification(p, markup, actions, now)
+	if path, ok := d.sounds[sound(p, now)]; ok {
+		n.hints["sound-file"] = dbus.MakeVariant(path)
+	}
 	var id uint32
 	err := obj.CallWithContext(ctx, notificationsInterface+".Notify", 0,
 		"notifier", uint32(0), "", n.summary, n.body, n.actions, n.hints, n.timeout).Store(&id)
@@ -378,7 +384,8 @@ func (d *dbusDesktop) outcomeOnce(ctx context.Context, nid uint32, q question, o
 	if markup {
 		body = escapeMarkup(body)
 	}
-	hints := map[string]dbus.Variant{"urgency": dbus.MakeVariant(urgencyNormal)}
+	// Quiet: it answers a click.
+	hints := map[string]dbus.Variant{"urgency": dbus.MakeVariant(urgencyNormal), "suppress-sound": dbus.MakeVariant(true)}
 	return obj.CallWithContext(ctx, notificationsInterface+".Notify", 0,
 		"notifier", replaces, "", dropNUL(outcome), body, []string{}, hints, int32(-1)).Err
 }
@@ -449,6 +456,19 @@ func notification(p Payload, markup, actions bool, now time.Time) notifyArgs {
 		n.body = escapeMarkup(n.body)
 	}
 	return n
+}
+
+// sound names the sound for a message: a question still open, then high
+// priority, then any other.
+func sound(p Payload, now time.Time) string {
+	switch {
+	case p.Reply != nil && len(p.Reply.Options) > 0 && now.Unix() < p.Reply.ExpiresAt:
+		return "question"
+	case p.Priority == "high":
+		return "urgent"
+	default:
+		return "message"
+	}
 }
 
 // dropNUL removes NUL characters, which JSON allows but D-Bus strings

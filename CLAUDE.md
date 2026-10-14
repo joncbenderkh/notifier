@@ -72,13 +72,32 @@ See `README.md` for the user-facing setup and API table.
   (issue #41). Each way it only pre-fills the form — never pair without the user tapping Pair, or
   a hostile QR code could silently point the phone at another server. A
   join link likewise asks before joining, and only for the paired server.
-- **Android channels:** each Notifier channel except the user's `default`
-  gets an Android `NotificationChannelGroup` (`ch:<channel id>`) holding
-  `<channel id>` and `<channel id>.high`, created on first message, so it
-  can be muted or given a sound in system settings; `default` and direct
-  sends keep the original `default`/`high` channels (`push/ChannelRoute.kt`).
-  Keyed by channel ID, never the label, which is not unique. Loading the
-  channel list deletes groups of channels the user no longer belongs to.
+- **Android channels:** one Android channel per kind of message
+  (`ChannelRoute.Kind`): `message`, `urgent` (high priority) and
+  `question` (any payload with `reply`; high importance, so the buttons
+  show), each with notifier's sound from `res/raw` (see notifyd's Sounds),
+  addressed by resource name since IDs change between builds. Each
+  Notifier channel except the user's `default` gets an Android
+  `NotificationChannelGroup` (`ch:<channel id>`) holding
+  `<channel id>.<kind>`, created on first message, so it can be muted or
+  given a sound in system settings; `default` and direct sends use the
+  ungrouped channels (`push/ChannelRoute.kt`). Keyed by channel ID, never
+  the label, which is not unique. Loading the channel list deletes groups
+  of channels the user no longer belongs to. A channel's sound is fixed
+  once created, so the channels from before sounds (`default`/`high`, and
+  `<channel id>`/`<channel id>.high`) are replaced at app start: the
+  successor takes the old one's importance, vibration, lights and badge,
+  and its sound unless that was the system default; `question` takes
+  them from the ordinary channel, staying high importance unless that
+  was turned down. Recreating an existing channel passes its current
+  importance, since a lower one would lower it. The old one is
+  deleted once no notification shows in it (deleting a channel removes
+  them). Android gives a new channel the app's lock-screen visibility
+  and Do Not Disturb setting whatever the app asks, so an old channel
+  the user made private or secret, or let through Do Not Disturb, is
+  not replaced: messages keep going to it (`channelFor`). This is
+  checked at every start, since an old channel kept for a notification
+  still showing can be changed meanwhile.
 - **Android stack:** Kotlin + Jetpack Compose, AGP 9 with built-in Kotlin
   (no `org.jetbrains.kotlin.android` plugin), Gradle Kotlin DSL with a version
   catalog. `minSdk = 26`, `compileSdk = 37.2`, `targetSdk = 37`. OkHttp +
@@ -144,6 +163,16 @@ See `README.md` for the user-facing setup and API table.
   the server advertises `body-markup`), urgency normal/critical by
   priority, and `category` `notifier.<channel label>`.
 
+  Sounds: `internal/sounds` synthesizes notifier's three sounds
+  (`message`, `urgent`, `question`) as WAV, deterministically; `run`
+  writes them to `$XDG_CACHE_HOME/notifier/sounds/` (rewriting only what
+  differs) and names one in the `sound-file` hint: `question` for an open
+  question, else `urgent` for high priority, else `message`. Outcomes
+  carry `suppress-sound`. `--no-sound`, or a cache that cannot be
+  written, sends no hint. The Android app bundles the same files in
+  `res/raw`, written by `go run ./internal/sounds/gen`; a test fails when
+  they differ from the synthesizer's output.
+
   Questions (issue #32): a payload's `reply` (kept in the history entry,
   `histfile.Reply`) becomes Notify actions keyed by option index, with
   `expire_timeout` until the question closes, when the service has the
@@ -158,6 +187,23 @@ See `README.md` for the user-facing setup and API table.
   `/v1/replies/<id>` with the device token), then replaces the
   notification with the outcome. `notifyd reply ID ANSWER` does the same
   from the history. Tests fake the bus object (`fakeBus`).
+
+  On Android, `Notifications.show` adds a button per answer: an
+  immutable broadcast to the non-exported `ReplyReceiver`, whose intent
+  data (`notifier-reply:<id>/<index>`) keeps each message's buttons
+  apart. An inexact alarm at expiry takes the buttons off again; the
+  history card turns to "expired" on time too. The receiver answers on a
+  thread under `goAsync` (calls time out after 8 s). `Answers.send`,
+  shared with the history's buttons, checks the pairing is still the one
+  that received the message, seals (`Replies`, pinned by the shared
+  vector in `RepliesTest`), posts, records a settled outcome in the
+  history entry (`outcome`; the first stays), and replaces the
+  notification with it if still showing. A failure that may pass keeps
+  the buttons. A second tap while a question is being answered does
+  nothing, rather than wait past its broadcast's deadline, and a settled
+  question (in memory or in the history) is not sent again, nor shown
+  with buttons when FCM delivers it twice, so "Answered" never turns into
+  "Already answered".
 - **WebSocket transport (issue #7):** FCM cannot reach Linux desktops, so
   `devices.transport` is `fcm` or `ws` (migration 0004). A `ws` device has
   a SQLite-backed Durable Object (`src/stream.ts`, `DeviceStream`, bound as
@@ -408,7 +454,9 @@ See `README.md` for the user-facing setup and API table.
   writes), `history.go` (the history file), `reply.go` (answering questions), `link.go`
   (`notifier://pair` parsing), `seal.go` (envelope v1 open, pinned by the
   shared vector), `stream.go` (connection loop), `desktop.go` (D-Bus),
-  `notifyd.service` (systemd user unit), `internal/histfile` (the
+  `notifyd.service` (systemd user unit), `internal/sounds` (the
+  synthesized sounds, and `gen`, which writes the Android copies),
+  `internal/histfile` (the
   history file and its lock, shared with the window),
   `cmd/notifyd-history` (the GTK 4 / libadwaita history window, gotk4;
   its GTK-free logic is in `internal/histview` with tests; the window
@@ -425,8 +473,10 @@ See `README.md` for the user-facing setup and API table.
   - `data/` — `PairingStore` and `HistoryStore` (both over
     `KeystoreCipher`), `ServerClient` (blocking; callers pick the thread),
     `NotifierLink` and `History` (pure JVM, unit-tested).
-  - `push/` — `PushService` (FCM), `SealedMessage` and `ChannelRoute` (pure
-    JVM, unit-tested), `Notifications` (Android channels and groups).
+  - `push/` — `PushService` (FCM), `SealedMessage`, `Replies` and
+    `ChannelRoute` (pure JVM, unit-tested), `Notifications` (Android
+    channels and groups), `Answers` and `ReplyReceiver` (answering
+    questions).
   - `ui/` — `MainViewModel`, `NotifierScreen`, `HistoryScreen`, theme.
 
 ## Commands

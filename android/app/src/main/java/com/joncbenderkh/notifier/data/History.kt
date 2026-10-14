@@ -2,6 +2,7 @@
 package com.joncbenderkh.notifier.data
 
 import com.joncbenderkh.notifier.push.Payload
+import com.joncbenderkh.notifier.push.Reply
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 
@@ -17,6 +18,10 @@ data class HistoryEntry(
     /** As this user names it ("homelab", "alice/homelab"); null for a direct send. */
     val channel: String? = null,
     val channelId: String? = null,
+    /** The question this phone may answer, if it asked one. */
+    val reply: Reply? = null,
+    /** What became of this phone's answer ("Answered: yes", "Already answered"), once settled. */
+    val outcome: String? = null,
 ) {
     companion object {
         fun of(payload: Payload, receivedAt: Long) = HistoryEntry(
@@ -28,6 +33,7 @@ data class HistoryEntry(
             receivedAt,
             payload.channel,
             payload.channelId,
+            payload.reply,
         )
     }
 }
@@ -44,6 +50,10 @@ data class History(val entries: List<HistoryEntry> = emptyList()) {
         else History((listOf(entry) + entries).sortedByDescending { it.receivedAt }).pruned(now)
 
     fun remove(id: String) = History(entries.filterNot { it.id == id })
+
+    /** Records what became of the answer to [id]'s question; the first outcome stays. */
+    fun settled(id: String, outcome: String) =
+        History(entries.map { if (it.id == id && it.reply != null && it.outcome == null) it.copy(outcome = outcome) else it })
 
     fun pruned(now: Long) = History(entries.filter { it.receivedAt > now - MAX_AGE_SECONDS }.take(MAX_ENTRIES))
 

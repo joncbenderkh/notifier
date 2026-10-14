@@ -113,6 +113,8 @@ fun NotifierScreen(viewModel: MainViewModel = viewModel()) {
                 onBack = viewModel::closeHistory,
                 onDelete = viewModel::deleteHistory,
                 onClear = viewModel::clearHistory,
+                answering = state.answering,
+                onAnswer = viewModel::answer,
             )
         }
         return

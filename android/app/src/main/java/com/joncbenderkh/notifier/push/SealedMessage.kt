@@ -20,6 +20,16 @@ data class Payload(
     /** The channel it came through, as this user names it ("homelab", "alice/homelab"). */
     val channel: String? = null,
     @SerialName("channel_id") val channelId: String? = null,
+    /** Set when this device may answer the message's question. */
+    val reply: Reply? = null,
+)
+
+/** A question's answers, the one-time key to seal one under, and when it expires (Unix seconds). */
+@Serializable
+data class Reply(
+    val options: List<String>,
+    val key: String,
+    @SerialName("expires_at") val expiresAt: Long,
 )
 
 /**

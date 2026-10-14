@@ -28,6 +28,7 @@ func TestMain(m *testing.M) {
 	}
 	os.Setenv("NOTIFYD_STATE", filepath.Join(dir, "missing", "notifyd.json"))
 	os.Setenv("NOTIFYD_HISTORY", filepath.Join(dir, "missing", "history.jsonl"))
+	os.Setenv("XDG_CACHE_HOME", filepath.Join(dir, "cache"))
 	code := m.Run()
 	os.RemoveAll(dir)
 	os.Exit(code)

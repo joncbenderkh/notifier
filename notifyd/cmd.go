@@ -74,10 +74,13 @@ func (a *app) newRoot() *cobra.Command {
 	reply.Flags().SetInterspersed(false)
 	reply.Annotations = map[string]string{flagsEndAtArgs: "yes"}
 
+	// Never the default: a second daemon would replace the service's.
+	run := leaf("run", "Receive and show messages until stopped (the systemd service)", cobra.NoArgs, none(a.listen))
+	run.Flags().BoolVar(&a.noSound, "no-sound", false, "give notifications no sound of notifier's own")
+
 	root.AddCommand(
 		pair,
-		// Never the default: a second daemon would replace the service's.
-		leaf("run", "Receive and show messages until stopped (the systemd service)", cobra.NoArgs, none(a.listen)),
+		run,
 		leaf("test", "Show a test notification through the server", cobra.NoArgs, none(a.test)),
 		reply,
 		history,

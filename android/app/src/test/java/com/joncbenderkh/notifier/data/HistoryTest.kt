@@ -2,6 +2,7 @@
 package com.joncbenderkh.notifier.data
 
 import com.joncbenderkh.notifier.push.Payload
+import com.joncbenderkh.notifier.push.Reply
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -34,6 +35,20 @@ class HistoryTest {
             HistoryEntry("msg_1", "Disk", "full", "high", 100, 160, "alice/homelab", "ch_x"),
             HistoryEntry.of(payload, receivedAt = 160),
         )
+    }
+
+    @Test
+    fun recordsWhatBecameOfAnAnswer() {
+        val reply = Reply(listOf("yes", "no"), "key", now + 600)
+        val question = HistoryEntry.of(Payload("msg_q", "Deploy?", sentAt = now, reply = reply), receivedAt = now)
+        assertEquals(reply, question.reply)
+        val history = History().add(question, now).add(entry("plain"), now)
+            .settled("msg_q", "Answered: yes")
+            .settled("plain", "Answered: yes")
+        assertEquals(listOf(null, "Answered: yes"), history.entries.map { it.outcome })
+        // A repeated tap after a restart gets 409; the first outcome stays.
+        assertEquals("Answered: yes", history.settled("msg_q", "Already answered").entries.last().outcome)
+        assertEquals(history, History.decode(history.encode()))
     }
 
     @Test
