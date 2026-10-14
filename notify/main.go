@@ -45,6 +45,7 @@ const (
 	exitError       = 1
 	exitUsage       = 2
 	exitUndelivered = 3
+	// exitNoAnswer (4), in ask.go: a question expired unanswered.
 
 	// maxTitleBytes and maxBodyBytes mirror the server's limits.
 	maxTitleBytes = 256
@@ -192,14 +193,23 @@ func (c *cli) resolve(f settingsFlags, loadFile bool) int {
 // sendCmd sends [args] (TITLE [BODY | -]); [high] is nil unless --high was
 // given, so the config file's priority applies otherwise.
 func (c *cli) sendCmd(args, to, channels []string, high *bool) int {
+	n, to := c.notification(args[0], to, channels, high)
+	_, _, code := c.deliver(n, to, args[1:], c.stdout, true)
+	return code
+}
+
+// notification builds a message titled [title] and returns the devices to
+// resolve for it: the config file's targets apply when neither [to] nor
+// [channels] is given, and its priority unless [high] is set.
+func (c *cli) notification(title string, to, channels []string, high *bool) (Notification, []string) {
 	if len(to) == 0 && len(channels) == 0 {
 		to, channels = c.config.To, c.config.Channels
 	}
-	n := Notification{Title: fitTitle(args[0]), Channels: channels}
+	n := Notification{Title: fitTitle(title), Channels: channels}
 	if high != nil && *high || high == nil && c.config.Priority == "high" {
 		n.Priority = "high"
 	}
-	return c.send(n, to, args[1:])
+	return n, to
 }
 
 // legacyToken is NOTIFIER_ADMIN_TOKEN, which `notify pair` read before users
@@ -264,10 +274,15 @@ func (c *cli) context() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), c.timeout)
 }
 
-func (c *cli) send(n Notification, to []string, body []string) int {
+// deliver sends [n] with [body] (none, BODY or -) to [to] and its
+// channels, and reports each device on [out], or on stderr when it was
+// missed. It returns the message ID, if the message reached one of the
+// sender's devices or, when [members] counts them, another member's, and
+// the exit code.
+func (c *cli) deliver(n Notification, to []string, body []string, out io.Writer, members bool) (*Client, string, int) {
 	client, ok := c.sendClient()
 	if !ok {
-		return exitUsage
+		return nil, "", exitUsage
 	}
 	if len(body) == 1 {
 		text, dropped := body[0], false
@@ -275,7 +290,7 @@ func (c *cli) send(n Notification, to []string, body []string) int {
 			// Read before the timeout starts: the producer may be a long job.
 			b, more, err := readTail(c.stdin, stdinTailBytes)
 			if err != nil {
-				return fail(c.stderr, err, c.sendCredName)
+				return nil, "", fail(c.stderr, err, c.sendCredName)
 			}
 			text, dropped = strings.TrimRight(string(b), "\r\n"), more
 			if i := strings.IndexByte(text, '\n'); dropped && i >= 0 {
@@ -293,29 +308,30 @@ func (c *cli) send(n Notification, to []string, body []string) int {
 	if len(to) > 0 {
 		devices, err := client.Devices(ctx)
 		if err != nil {
-			return fail(c.stderr, err, c.sendCredName)
+			return nil, "", fail(c.stderr, err, c.sendCredName)
 		}
 		if n.DeviceIDs, err = ResolveDevices(devices, to); errors.Is(err, ErrNoSuchDevice) {
 			fmt.Fprintln(c.stderr, "notify:", err)
-			return exitUndelivered
+			return nil, "", exitUndelivered
 		} else if err != nil {
-			return fail(c.stderr, err, c.sendCredName)
+			return nil, "", fail(c.stderr, err, c.sendCredName)
 		}
 	}
 
 	result, err := client.Notify(ctx, n)
 	var apiErr *APIError
 	if errors.As(err, &apiErr) && apiErr.Status == http.StatusNotFound &&
-		(apiErr.Message == noDevicesMessage || strings.HasPrefix(apiErr.Message, noDeviceMessage)) {
+		(apiErr.Message == noDevicesMessage || strings.HasPrefix(apiErr.Message, noDeviceMessage) ||
+			strings.HasPrefix(apiErr.Message, noAnswererMessage)) {
 		// No paired (or subscribed) phone, or one unpaired since name
 		// resolution: nothing was delivered.
 		fmt.Fprintln(c.stderr, "notify:", apiErr.Message)
-		return exitUndelivered
+		return nil, "", exitUndelivered
 	}
 	if err != nil {
-		return fail(c.stderr, err, c.sendCredName)
+		return nil, "", fail(c.stderr, err, c.sendCredName)
 	}
-	code := 0
+	code, reached := 0, false
 	for _, d := range result.Deliveries {
 		line := fmt.Sprintf("%s: %s", d.DeviceID, d.Status)
 		if d.Error != "" {
@@ -325,18 +341,22 @@ func (c *cli) send(n Notification, to []string, body []string) int {
 			code = exitUndelivered
 			fmt.Fprintln(c.stderr, line)
 		} else {
-			fmt.Fprintln(c.stdout, line)
+			reached = true
+			fmt.Fprintln(out, line)
 		}
 	}
 	// Other members' phones are theirs: report them, but only fail when
 	// nothing reached anyone.
 	if len(result.Members) > 0 {
-		fmt.Fprintf(c.stdout, "other members' devices: %s\n", countsLine(result.Members))
+		fmt.Fprintf(out, "other members' devices: %s\n", countsLine(result.Members))
 	}
-	if len(result.Deliveries) == 0 && result.Members["sent"]+result.Members["queued"] == 0 {
-		code = exitUndelivered
+	if members && result.Members["sent"]+result.Members["queued"] > 0 {
+		reached = true
 	}
-	return code
+	if !reached {
+		return client, "", exitUndelivered
+	}
+	return client, result.ID, code
 }
 
 // delivered reports whether a device has the message or will get it: a
@@ -376,12 +396,14 @@ func checkURL(raw string) error {
 	return fmt.Errorf("server URL must use https (got %q)", raw)
 }
 
-// noDevicesMessage is the server's 404 when no paired phone matches, and
+// noDevicesMessage is the server's 404 when no paired phone matches,
 // noDeviceMessage prefixes the one for a device ID that is not (or no
-// longer) paired, as opposed to a 404 from a wrong server URL.
+// longer) paired, and noAnswererMessage the one for a question none of the
+// matching devices may answer, as opposed to a 404 from a wrong server URL.
 const (
-	noDevicesMessage = "no matching paired devices"
-	noDeviceMessage  = "no paired device "
+	noDevicesMessage  = "no matching paired devices"
+	noDeviceMessage   = "no paired device "
+	noAnswererMessage = "no matching paired devices may answer"
 )
 
 // readTail reads r to the end, keeping only its last max bytes; more reports

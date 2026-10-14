@@ -58,6 +58,9 @@ describe("0002_users", () => {
       stream: () => {
         throw new Error("no WebSocket devices here");
       },
+      replies: () => {
+        throw new Error("no questions here");
+      },
       now: () => 1_790_000_000,
     });
     const req = (path: string, token: string, method = "GET") =>

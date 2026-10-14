@@ -230,6 +230,12 @@ See `README.md` for the user-facing setup and API table.
   `invite:` prefix so they can never redeem as pairing codes. Secrets are stored only as unsalted SHA-256 digests — fine
   because they are 256-bit random; don't reuse that scheme for anything
   low-entropy.
+- **FCM size:** FCM carries at most 4 KiB of data (keys and values).
+  Text within the limits can exceed it once JSON-escaped, sealed and
+  base64-encoded, so `POST /v1/notifications` computes each FCM target's
+  exact size (`sealedDataBytes` in `publish.ts`) and answers 400 if any
+  is over; `deliver` reports `failed` for such a message from heartbeats
+  or hooks instead of calling FCM.
 - **Unsafe characters (issue #24):** the server answers 400 to a title or
   body holding a control character other than `\n` and `\t` (C0, DEL, C1;
   so `\r` too) or a bidi embedding, override or isolate (U+202A–U+202E,
@@ -299,6 +305,23 @@ See `README.md` for the user-facing setup and API table.
   the alert it answers 503 so the tool retries, which can repeat an alert
   on devices that did get it; no notice is queued server-side. A
   disabled user's hooks answer 404.
+- **Questions (issue #32):** `notify ask` adds `question` (1–3 options,
+  a 32-byte key the CLI generates, `expires_in` 10 s–24 h, `anyone`) to
+  `POST /v1/notifications`. Devices allowed to answer (the asker's own;
+  with `anyone`, every recipient) get `reply` (options, key, `expires_at`)
+  in their sealed payload; others get the plain message. Each question has
+  a SQLite-backed Durable Object (`src/replies.ts`, `ReplyBox`, bound as
+  `REPLY_BOX`, keyed `idFromName(message id)`), opened before publishing
+  so an instant answer finds it. It keeps the responders, the first answer
+  (sealed by the device: AES-256-GCM under the key, AAD `reply:` + message
+  ID, plaintext `{"answer"}`, pinned by a shared vector in
+  `seal.test.ts` and `notify/ask_test.go`), and is deleted by an alarm an
+  hour after expiry. `GET /v1/replies/<id>?wait=N` long-polls (N ≤ 50):
+  `answer` wakes waiting polls. The DO takes the app's clock as an
+  argument, so `api.test.ts` drives the real object with the fake clock.
+  The CLI checks the answer is one of its options and exits 4 when none
+  came. **Rollback:** the `v2` DO migration means every later version must
+  export `ReplyBox`, as with `DeviceStream`.
 - **Wire format (envelope v1):** FCM data `{"v":"1","n":<b64 nonce>,"c":<b64
   ciphertext>}`; AES-256-GCM, 12-byte nonce, 128-bit tag, per-device key,
   AAD = device ID. Plaintext is the JSON `Payload` (`server/src/app.ts`,
@@ -348,6 +371,8 @@ See `README.md` for the user-facing setup and API table.
   encryption, secret generation/hashing, FCM + log senders, byte encodings.
 - `server/src/stream.ts` — `DeviceStream`, the Durable Object behind the
   WebSocket transport (exported from `index.ts`).
+- `server/src/replies.ts` — `ReplyBox`, the Durable Object holding a
+  question's answer (exported from `index.ts`).
 - `server/src/{pairing,pairPage}.ts` — the `notifier://pair` link and QR, and
   the static `/pair` page.
 - `server/src/publish.ts` — sealing and fan-out to devices, shared by
@@ -358,7 +383,7 @@ See `README.md` for the user-facing setup and API table.
 - `server/src/index.ts` — the deployed entry point (`fetch` and the
   `scheduled` cron handler).
 - `notify/` — `cmd.go` (the Cobra command tree and flags), `main.go`
-  (settings, sending, exit codes), `commands.go` (the other commands), `config.go` (config file), `client.go` (API
+  (settings, sending, exit codes), `ask.go` (`notify ask`), `commands.go` (the other commands), `config.go` (config file), `client.go` (API
   client, name → ID resolution), `pair.go` (terminal QR). `main_test.go` and
   `commands_test.go` run it against `httptest` servers; `TestMain` clears
   `NOTIFIER_*` and points `NOTIFIER_CONFIG` at a missing file.

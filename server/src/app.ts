@@ -27,11 +27,20 @@ import {
 import { FORMATS, HOOK_SECRET_PREFIX, isFormat, MAX_HOOKS_PER_USER, PayloadError } from "./hooks";
 import type { Message } from "./hooks";
 import { pairPageRoutes } from "./pairPage";
-import { toBase64 } from "./encoding";
+import { fromBase64, toBase64 } from "./encoding";
 import { joinUri, pairingUri, qrSvg } from "./pairing";
 import type { Sender } from "./push";
-import { addSubscribers, channelLabel, publisher } from "./publish";
+import {
+  addSubscribers,
+  channelLabel,
+  MAX_FCM_DATA_BYTES,
+  MESSAGE_TTL_SECONDS,
+  payloadFor,
+  publisher,
+  sealedDataBytes,
+} from "./publish";
 import type { Target } from "./publish";
+import type { Replies, Responder } from "./replies";
 import type { Stream } from "./stream";
 import { newSealKey } from "./seal";
 import { cleanTail, MAX_BODY_BYTES, MAX_TITLE_BYTES, UNSAFE_IN_NAME, UNSAFE_IN_TEXT, utf8Length } from "./text";
@@ -73,6 +82,8 @@ export interface Deps {
   sender: (env: Env) => Sender;
   /** The Durable Object holding a WebSocket-transport device's socket and queue. */
   stream: (env: Env, deviceId: string) => Stream;
+  /** The Durable Object holding a question's answer. */
+  replies: (env: Env, messageId: string) => Replies;
   /** Unix seconds. */
   now: () => number;
 }
@@ -101,6 +112,8 @@ export interface Payload {
   /** The channel it was published to, as this device's owner names it. */
   channel?: string;
   channel_id?: string;
+  /** Present for the devices that may answer a question. */
+  reply?: { options: string[]; key: string; expires_at: number };
 }
 
 export interface Delivery {
@@ -112,7 +125,7 @@ export interface Delivery {
 
 const iso = (seconds: number) => new Date(seconds * 1000).toISOString().replace(".000Z", "Z");
 
-function fail(status: 400 | 401 | 403 | 404 | 409 | 426 | 429 | 503, message: string): never {
+function fail(status: 400 | 401 | 403 | 404 | 409 | 410 | 426 | 429 | 503, message: string): never {
   throw new HTTPException(status, { message });
 }
 
@@ -188,6 +201,75 @@ function channelNames(raw: unknown): string[] {
   const bad = names.find((n) => !CHANNEL_NAME.test(n));
   if (bad !== undefined) fail(400, `invalid channel name "${bad}"`);
   return names;
+}
+
+export const MAX_REPLY_OPTIONS = 3;
+const MAX_OPTION_BYTES = 32;
+const MIN_QUESTION_SECONDS = 10;
+const DEFAULT_QUESTION_SECONDS = 600;
+const REPLY_KEY_BYTES = 32;
+const REPLY_NONCE_BYTES = 12;
+const REPLY_TAG_BYTES = 16;
+/** An answer is a short option plus a 16-byte tag; this leaves room to spare. */
+const MAX_REPLY_CIPHERTEXT_BYTES = 1024;
+const MESSAGE_ID = /^msg_[a-z2-7]{16}$/;
+const MAX_REPLY_WAIT_SECONDS = 50;
+
+interface QuestionRequest {
+  options: string[];
+  key: string;
+  expiresIn: number;
+  anyone: boolean;
+}
+
+/** Decodes a base64 field, or fails unless it holds [min] to [max] bytes. */
+function base64Field(raw: unknown, field: string, min: number, max: number): Uint8Array {
+  let bytes: Uint8Array | undefined;
+  try {
+    if (typeof raw === "string") bytes = fromBase64(raw);
+  } catch {
+    // Reported below.
+  }
+  if (!bytes || bytes.length < min || bytes.length > max) {
+    fail(400, min === max ? `${field} must be ${min} bytes, base64` : `${field} must be base64`);
+  }
+  return bytes;
+}
+
+function parseQuestion(raw: unknown): QuestionRequest | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "object" || Array.isArray(raw)) fail(400, "question must be an object");
+  const q = raw as Record<string, unknown>;
+  const unknown = Object.keys(q).find((k) => !["options", "key", "expires_in", "anyone"].includes(k));
+  if (unknown !== undefined) fail(400, `invalid question: unknown field "${unknown}"`);
+  const options = stringList(q.options, "question.options");
+  if (options.length === 0 || options.length > MAX_REPLY_OPTIONS) {
+    fail(400, `question.options must hold 1 to ${MAX_REPLY_OPTIONS} answers`);
+  }
+  for (const o of options) {
+    if (o.trim() === "" || utf8Length(o) > MAX_OPTION_BYTES || !o.isWellFormed() || UNSAFE_IN_NAME.test(o)) {
+      fail(400, `each answer must be 1 to ${MAX_OPTION_BYTES} bytes of text without control characters`);
+    }
+  }
+  if (new Set(options).size !== options.length) fail(400, "question.options must be distinct");
+  // Re-encoded: atob skips whitespace, which would otherwise ride along.
+  const key = toBase64(base64Field(q.key, "question.key", REPLY_KEY_BYTES, REPLY_KEY_BYTES));
+  const expiresIn = q.expires_in ?? DEFAULT_QUESTION_SECONDS;
+  if (
+    typeof expiresIn !== "number" ||
+    !Number.isInteger(expiresIn) ||
+    expiresIn < MIN_QUESTION_SECONDS ||
+    expiresIn > MESSAGE_TTL_SECONDS
+  ) {
+    fail(400, `question.expires_in must be ${MIN_QUESTION_SECONDS} to ${MESSAGE_TTL_SECONDS} seconds`);
+  }
+  if (q.anyone !== undefined && typeof q.anyone !== "boolean") fail(400, "question.anyone must be a boolean");
+  return { options, key, expiresIn, anyone: q.anyone === true };
+}
+
+function messageId(raw: string): string {
+  if (!MESSAGE_ID.test(raw)) fail(404, "not found");
+  return raw;
 }
 
 /** Invites, channel invites, and pairing codes share an alphabet; prefixes keep them apart. */
@@ -861,7 +943,8 @@ export function createApp(deps: Deps): Hono<AppEnv> {
       priority: string;
       device_ids: string[];
       channels: string[];
-    }>(c, ["title", "body", "priority", "device_ids", "channels"]);
+      question: unknown;
+    }>(c, ["title", "body", "priority", "device_ids", "channels", "question"]);
     const title = typeof req.title === "string" ? req.title : "";
     const body = typeof req.body === "string" ? req.body : "";
     if (title.trim() === "") fail(400, "title is required");
@@ -899,8 +982,66 @@ export function createApp(deps: Deps): Hono<AppEnv> {
 
     const base: Payload = { id: newId("msg_"), title, priority, sent_at: deps.now() };
     if (body !== "") base.body = body;
-    const { deliveries, members } = await publish(c.env, userId, targets.values(), base);
+    let extra: ((t: Target) => Partial<Payload>) | undefined;
+    let openBox: (() => Promise<void>) | undefined;
+    const question = parseQuestion(req.question);
+    if (question) {
+      const answering = [...targets.values()].filter((t) => question.anyone || t.device.user_id === userId);
+      if (answering.length === 0) fail(404, "no matching paired devices may answer; set anyone to let other members' devices answer");
+      const names = await store.userNames(
+        c.env.DB,
+        answering.filter((t) => t.device.user_id !== userId).map((t) => t.device.user_id),
+      );
+      const responders: Responder[] = answering.map(({ device: d }) => ({
+        device_id: d.id,
+        label: d.user_id === userId ? d.name : (names.get(d.user_id) ?? d.user_id),
+      }));
+      const expiresAt = deps.now() + question.expiresIn;
+      openBox = () => deps.replies(c.env, base.id).open({ userId, expiresAt, responders }, deps.now());
+      const reply = { options: question.options, key: question.key, expires_at: expiresAt };
+      const allowed = new Set(responders.map((r) => r.device_id));
+      extra = (t) => (allowed.has(t.device.id) ? { reply } : {});
+    }
+    // Escaping can grow text that fits the limits past what FCM carries.
+    // A phone without a token is skipped at delivery, so it cannot refuse.
+    const tooLarge = [...targets.values()].some(
+      (t) =>
+        t.device.transport === "fcm" &&
+        t.device.fcm_token !== "" &&
+        sealedDataBytes(payloadFor(t, base, extra)) > MAX_FCM_DATA_BYTES,
+    );
+    if (tooLarge) fail(400, "title and body are too long once encoded for a phone (at most 4 KiB); shorten them");
+    // Opened before publishing, so an answer that comes back at once finds it.
+    await openBox?.();
+    const { deliveries, members } = await publish(c.env, userId, targets.values(), base, extra);
     return c.json({ id: base.id, deliveries, ...(Object.keys(members).length > 0 ? { members } : {}) });
+  });
+
+  // --- replies ---
+
+  // A device answers a question it was asked; the first answer wins.
+  app.post("/v1/replies/:id", device, async (c) => {
+    const id = messageId(c.req.param("id"));
+    const req = await readJson<{ n: string; c: string }>(c, ["n", "c"]);
+    const n = toBase64(base64Field(req.n, "n", REPLY_NONCE_BYTES, REPLY_NONCE_BYTES));
+    // At least the 16-byte tag and one byte, or a garbled answer could take the first slot.
+    const ct = toBase64(base64Field(req.c, "c", REPLY_TAG_BYTES + 1, MAX_REPLY_CIPHERTEXT_BYTES));
+    const result = await deps.replies(c.env, id).answer(c.get("device").id, n, ct, deps.now());
+    if (result === "forbidden") fail(404, "not found");
+    if (result === "answered") fail(409, "already answered");
+    if (result === "expired") fail(410, "the question has expired");
+    return c.json({ status: "answered" }, 201);
+  });
+
+  // The asker long-polls for the answer, still sealed.
+  app.get("/v1/replies/:id", userOrApiKey, async (c) => {
+    const id = messageId(c.req.param("id"));
+    const raw = c.req.query("wait") ?? "0";
+    const wait = /^\d{1,2}$/.test(raw) ? Number(raw) : NaN;
+    if (!(wait <= MAX_REPLY_WAIT_SECONDS)) fail(400, `wait must be 0 to ${MAX_REPLY_WAIT_SECONDS} seconds`);
+    const state = await deps.replies(c.env, id).wait(c.get("userId"), wait, deps.now());
+    if (state.status === "missing") fail(404, "not found");
+    return c.json(state);
   });
 
   app.notFound((c) => c.json({ error: "not found" }, 404));
