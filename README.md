@@ -187,6 +187,9 @@ curl -X POST $S/v1/notifications -H "$T" -d '{"title": "disk full", "channels": 
   invite's QR code, opening its `notifier://join` link (it asks first), or
   typing the code. Each channel other than `default` gets its own group in
   Android's notification settings, so it can be muted or given a sound.
+  Notifications play notifier's own sounds: one for messages, a more
+  insistent one for high priority, and one for questions, each its own
+  Android channel. A sound you chose for a channel before is kept.
 
 ### Heartbeats
 

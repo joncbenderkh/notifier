@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package com.joncbenderkh.notifier.push
 
+import com.joncbenderkh.notifier.push.ChannelRoute.Kind
 import kotlinx.serialization.json.Json
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -13,24 +14,41 @@ class ChannelRouteTest {
         Payload("msg_1", "Hi", priority = priority, sentAt = 1, channel = channel, channelId = channelId)
 
     @Test
-    fun messagesWithoutAChannelUseTheOriginalChannels() {
-        assertEquals(ChannelRoute("default", null, null), ChannelRoute.of(payload()))
-        assertEquals(ChannelRoute("high", null, null), ChannelRoute.of(payload("high")))
+    fun messagesWithoutAChannelAreUngrouped() {
+        assertEquals(ChannelRoute("message", null, null, Kind.MESSAGE), ChannelRoute.of(payload()))
+        assertEquals(ChannelRoute("urgent", null, null, Kind.URGENT), ChannelRoute.of(payload("high")))
     }
 
     @Test
-    fun theDefaultChannelUsesTheOriginalChannels() {
+    fun theDefaultChannelIsUngrouped() {
         val p = payload("high", "default", "ch_default_usr_abc")
-        assertEquals(ChannelRoute("high", null, null), ChannelRoute.of(p))
+        assertEquals(ChannelRoute("urgent", null, null, Kind.URGENT), ChannelRoute.of(p))
     }
 
     @Test
     fun otherChannelsGetAGroupKeyedByID() {
         assertEquals(
-            ChannelRoute("ch_x", "ch:ch_x", "alice/homelab"),
+            ChannelRoute("ch_x.message", "ch:ch_x", "alice/homelab", Kind.MESSAGE),
             ChannelRoute.of(payload(channel = "alice/homelab", channelId = "ch_x")),
         )
-        assertEquals("ch_x.high", ChannelRoute.of(payload("high", "alice/homelab", "ch_x")).androidChannelId)
+        assertEquals("ch_x.urgent", ChannelRoute.of(payload("high", "alice/homelab", "ch_x")).androidChannelId)
+    }
+
+    @Test
+    fun questionsHaveTheirOwnChannelWhateverThePriority() {
+        val reply = Reply(listOf("yes"), "k", 1)
+        assertEquals(ChannelRoute("question", null, null, Kind.QUESTION), ChannelRoute.of(payload("high").copy(reply = reply)))
+        assertEquals("ch_x.question", ChannelRoute.of(payload(channelId = "ch_x").copy(reply = reply)).androidChannelId)
+    }
+
+    @Test
+    fun namesTheChannelsFromBeforeSounds() {
+        assertEquals("default", ChannelRoute.legacyChannelId(Kind.MESSAGE))
+        assertEquals("high", ChannelRoute.legacyChannelId(Kind.URGENT))
+        assertEquals("ch_x", ChannelRoute.legacyChannelId(Kind.MESSAGE, "ch_x"))
+        assertEquals("ch_x.high", ChannelRoute.legacyChannelId(Kind.URGENT, "ch_x"))
+        assertEquals("default", ChannelRoute.legacyChannelId(Kind.QUESTION))
+        assertEquals("ch_x", ChannelRoute.legacyChannelId(Kind.QUESTION, "ch_x"))
     }
 
     @Test
