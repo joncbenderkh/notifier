@@ -158,6 +158,23 @@ See `README.md` for the user-facing setup and API table.
   `/v1/replies/<id>` with the device token), then replaces the
   notification with the outcome. `notifyd reply ID ANSWER` does the same
   from the history. Tests fake the bus object (`fakeBus`).
+
+  On Android, `Notifications.show` adds a button per answer: an
+  immutable broadcast to the non-exported `ReplyReceiver`, whose intent
+  data (`notifier-reply:<id>/<index>`) keeps each message's buttons
+  apart. An inexact alarm at expiry takes the buttons off again; the
+  history card turns to "expired" on time too. The receiver answers on a
+  thread under `goAsync` (calls time out after 8 s). `Answers.send`,
+  shared with the history's buttons, checks the pairing is still the one
+  that received the message, seals (`Replies`, pinned by the shared
+  vector in `RepliesTest`), posts, records a settled outcome in the
+  history entry (`outcome`; the first stays), and replaces the
+  notification with it if still showing. A failure that may pass keeps
+  the buttons. A second tap while a question is being answered does
+  nothing, rather than wait past its broadcast's deadline, and a settled
+  question (in memory or in the history) is not sent again, nor shown
+  with buttons when FCM delivers it twice, so "Answered" never turns into
+  "Already answered".
 - **WebSocket transport (issue #7):** FCM cannot reach Linux desktops, so
   `devices.transport` is `fcm` or `ws` (migration 0004). A `ws` device has
   a SQLite-backed Durable Object (`src/stream.ts`, `DeviceStream`, bound as
@@ -425,8 +442,10 @@ See `README.md` for the user-facing setup and API table.
   - `data/` — `PairingStore` and `HistoryStore` (both over
     `KeystoreCipher`), `ServerClient` (blocking; callers pick the thread),
     `NotifierLink` and `History` (pure JVM, unit-tested).
-  - `push/` — `PushService` (FCM), `SealedMessage` and `ChannelRoute` (pure
-    JVM, unit-tested), `Notifications` (Android channels and groups).
+  - `push/` — `PushService` (FCM), `SealedMessage`, `Replies` and
+    `ChannelRoute` (pure JVM, unit-tested), `Notifications` (Android
+    channels and groups), `Answers` and `ReplyReceiver` (answering
+    questions).
   - `ui/` — `MainViewModel`, `NotifierScreen`, `HistoryScreen`, theme.
 
 ## Commands

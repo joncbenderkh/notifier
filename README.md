@@ -265,9 +265,11 @@ on a shared channel, `--anyone` lets other members' devices answer too.
 Each question carries a one-time key, inside the sealed message. The
 device seals the answer under it, so the server holds the answer only in a
 form it cannot read, and forgets it an hour after the question expires.
-Devices that predate questions show the question without buttons; the
-buttons come to the Android app in a follow-up release (#32); notifyd
-shows them already (see [notifyd](#linux-desktop-notifyd)).
+Devices that predate questions show the question without buttons. The
+Android app shows the answers as buttons on the notification, and on the
+question in its history until it expires; either way, the notification
+then says what became of the answer. notifyd shows them too (see
+[notifyd](#linux-desktop-notifyd)).
 
 ### History
 
