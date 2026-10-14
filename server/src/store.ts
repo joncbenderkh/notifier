@@ -497,6 +497,16 @@ export async function members(
   return results;
 }
 
+/** The names of the users with [ids]. */
+export async function userNames(db: D1Database, ids: readonly string[]): Promise<Map<string, string>> {
+  if (ids.length === 0) return new Map();
+  const { results } = await db
+    .prepare("SELECT id, name FROM users WHERE id IN (SELECT value FROM json_each(?))")
+    .bind(JSON.stringify([...new Set(ids)]))
+    .all<{ id: string; name: string }>();
+  return new Map(results.map((r) => [r.id, r.name]));
+}
+
 /**
  * Removes a member who is not the owner, and unsubscribes that member's
  * devices from the channel.

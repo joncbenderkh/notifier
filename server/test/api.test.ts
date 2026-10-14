@@ -15,15 +15,18 @@ import {
   PAIRING_TTL_SECONDS,
 } from "../src/app";
 import type { Delivery, Payload } from "../src/app";
-import { fromBase64 } from "../src/encoding";
+import { fromBase64, toBase64 } from "../src/encoding";
 import { heartbeatAlerts, MAX_HEARTBEATS_PER_USER } from "../src/heartbeats";
 import { MAX_HOOKS_PER_USER } from "../src/hooks";
 import { UnregisteredError } from "../src/push";
 import type { PushMessage, Sender } from "../src/push";
-import { open } from "../src/seal";
+import { open, seal } from "../src/seal";
 import type { Stream, StreamMessage } from "../src/stream";
 
 const ADMIN = env.ADMIN_TOKEN;
+
+/** The real question boxes: they take the app's clock, so the fake one works. */
+const replies = (e: Env, id: string) => e.REPLY_BOX.get(e.REPLY_BOX.idFromName(id));
 
 class FakeSender implements Sender {
   sent: PushMessage[] = [];
@@ -89,7 +92,7 @@ beforeEach(async () => {
   sender = new FakeSender();
   streams = new FakeStreams();
   now = 1_790_000_000;
-  app = createApp({ sender: () => sender, stream: (_, id) => streams.for(id), now: () => now });
+  app = createApp({ sender: () => sender, stream: (_, id) => streams.for(id), replies, now: () => now });
   USER = await signup("alice");
 });
 
@@ -172,6 +175,7 @@ describe("notifications", () => {
         throw new Error("FCM_SERVICE_ACCOUNT secret is not set");
       },
       stream: (_, id) => streams.for(id),
+      replies,
       now: () => now,
     });
     const resp = await call<NotifyResponse>("POST", "/v1/notifications", key, { title: "hi" }, 200);
@@ -849,7 +853,7 @@ describe("heartbeats", () => {
   }
 
   const create = (body: object, status = 201) => call<Created>("POST", "/v1/heartbeats", USER, body, status);
-  const check = () => heartbeatAlerts({ sender: () => sender, stream: (_, id) => streams.for(id), now: () => now }).check(env);
+  const check = () => heartbeatAlerts({ sender: () => sender, stream: (_, id) => streams.for(id), replies, now: () => now }).check(env);
 
   async function ping(url: string, suffix = "", body?: string, wantStatus = 200): Promise<void> {
     const res = await app.request(new URL(url).pathname + suffix, { method: body === undefined ? "GET" : "POST", body }, env);
@@ -969,7 +973,7 @@ describe("heartbeats", () => {
     await create({ name: "backup", interval: 3600 });
     now += 3600 + 300;
     const failing: Sender = { send: () => Promise.reject(new Error("FCM down")) };
-    await heartbeatAlerts({ sender: () => failing, stream: (_, id) => streams.for(id), now: () => now }).check(env);
+    await heartbeatAlerts({ sender: () => failing, stream: (_, id) => streams.for(id), replies, now: () => now }).check(env);
     let list = await call<Listed[]>("GET", "/v1/heartbeats", USER, undefined, 200);
     expect(list[0]!.state).toBe("up");
     // Retried behind heartbeats that went overdue earlier.
@@ -988,7 +992,7 @@ describe("heartbeats", () => {
     now += 3600 + 300;
     await check();
     const failing: Sender = { send: () => Promise.reject(new Error("FCM down")) };
-    const downApp = createApp({ sender: () => failing, stream: (_, id) => streams.for(id), now: () => now });
+    const downApp = createApp({ sender: () => failing, stream: (_, id) => streams.for(id), replies, now: () => now });
     now += 600;
     const res = await downApp.request(new URL(hb.ping_url).pathname, {}, env);
     expect(res.status).toBe(200);
@@ -1007,7 +1011,7 @@ describe("heartbeats", () => {
     now += 3600 + 300;
     await check();
     const failing: Sender = { send: () => Promise.reject(new Error("FCM down")) };
-    const downApp = createApp({ sender: () => failing, stream: (_, id) => streams.for(id), now: () => now });
+    const downApp = createApp({ sender: () => failing, stream: (_, id) => streams.for(id), replies, now: () => now });
     await downApp.request(new URL(hb.ping_url).pathname, {}, env); // recovery kept pending
     await ping(hb.ping_url, "/fail"); // delivered, replacing it
     now += 600;
@@ -1031,7 +1035,7 @@ describe("heartbeats", () => {
   }
 
   const titles = (phone: Registration) => Promise.all(sender.sent.map((_, i) => payloadFor(phone, i).then((p) => p.title)));
-  const depsWith = (s: Sender) => ({ sender: () => s, stream: (_: Env, id: string) => streams.for(id), now: () => now });
+  const depsWith = (s: Sender) => ({ sender: () => s, stream: (_: Env, id: string) => streams.for(id), replies, now: () => now });
 
   it("drops a recovery notice that a failure overtook", async () => {
     const phone = await pair("phone", "fcm-phone");
@@ -1172,7 +1176,7 @@ describe("heartbeats", () => {
     const phone = await pair("phone", "fcm-phone");
     const hb = await create({ name: "build", interval: 3600 });
     const failing: Sender = { send: () => Promise.reject(new Error("FCM down")) };
-    const deps = { sender: () => failing, stream: (_: Env, id: string) => streams.for(id), now: () => now };
+    const deps = { sender: () => failing, stream: (_: Env, id: string) => streams.for(id), replies, now: () => now };
     await createApp(deps).request(new URL(hb.ping_url).pathname + "/fail", { method: "POST", body: "the log" }, env);
     now += 3600 + 300;
     await heartbeatAlerts(deps).check(env); // missed alert fails and is undone
@@ -1330,7 +1334,7 @@ describe("inbound webhooks", () => {
     const reg = await pair("phone", "fcm-phone");
     const hook = await create({ name: "am", format: "alertmanager" });
     const failing = { send: () => Promise.reject(new Error("FCM down")) };
-    app = createApp({ sender: () => failing, stream: (_, id) => streams.for(id), now: () => now });
+    app = createApp({ sender: () => failing, stream: (_, id) => streams.for(id), replies, now: () => now });
     await post(hook.url, firing, 503);
     // Nobody listening is not worth a retry.
     await call("DELETE", `/v1/devices/${reg.device_id}`, USER, undefined, 204);
@@ -1373,6 +1377,136 @@ describe("inbound webhooks", () => {
     const many = { ...firing, alerts: Array.from({ length: 2000 }, (_, i) => ({ ...firing.alerts[0], labels: { ...firing.alerts[0]!.labels, instance: `host-${i}` } })) };
     await post(hook.url, many);
     await post(hook.url, { ...firing, padding: "x".repeat(1024 * 1024) }, 413);
+  });
+});
+
+describe("questions", () => {
+  const KEY = toBase64(new Uint8Array(32).fill(7));
+  type Answered = { status: string; by?: string; replied_at?: number; n?: string; c?: string };
+
+  const ask = (body: object, wantStatus = 200, token = USER) =>
+    call<NotifyResponse>(
+      "POST",
+      "/v1/notifications",
+      token,
+      { title: "Deploy prod?", question: { options: ["yes", "no"], key: KEY, expires_in: 600 }, ...body },
+      wantStatus,
+    );
+
+  async function answer(reg: Registration, id: string, text: string, wantStatus = 201) {
+    const env = await seal(fromBase64(KEY), `reply:${id}`, new TextEncoder().encode(JSON.stringify({ answer: text })));
+    return call("POST", `/v1/replies/${id}`, reg.device_token, { n: toBase64(env.nonce), c: toBase64(env.ciphertext) }, wantStatus);
+  }
+
+  const poll = (id: string, wait = 0, token = USER, wantStatus = 200) =>
+    call<Answered>("GET", `/v1/replies/${id}?wait=${wait}`, token, undefined, wantStatus);
+
+  it("puts the options and key in the payload and returns the first answer, sealed", async () => {
+    const phone = await pair("phone", "fcm-phone");
+    const laptop = await pair("laptop", "fcm-laptop");
+    const { id } = await ask({});
+    expect((await payloadFor(phone, 0)).reply).toEqual({ options: ["yes", "no"], key: KEY, expires_at: now + 600 });
+    // Whitespace, which atob skips, is not carried into the payload.
+    await ask({ question: { options: ["ok"], key: KEY.replace("=", "\n".repeat(4000) + "=") } });
+    expect((await payloadFor(phone, 2)).reply?.key).toBe(KEY);
+    expect(await poll(id)).toEqual({ status: "pending" });
+
+    await answer(phone, id, "no");
+    await answer(laptop, id, "yes", 409);
+    const got = await poll(id, 0, await apiKey());
+    expect(got).toMatchObject({ status: "answered", by: "phone", replied_at: now });
+    const plaintext = await open(fromBase64(KEY), `reply:${id}`, { nonce: fromBase64(got.n!), ciphertext: fromBase64(got.c!) });
+    expect(JSON.parse(new TextDecoder().decode(plaintext))).toEqual({ answer: "no" });
+  });
+
+  it("wakes a waiting poll when the answer arrives", async () => {
+    const phone = await pair("phone", "fcm-phone");
+    const { id } = await ask({});
+    const waiting = poll(id, 30);
+    await new Promise((r) => setTimeout(r, 50));
+    await answer(phone, id, "yes");
+    expect(await waiting).toMatchObject({ status: "answered", by: "phone" });
+  });
+
+  it("refuses answers after expiry and reports it", async () => {
+    const phone = await pair("phone", "fcm-phone");
+    const { id } = await ask({ question: { options: ["ok"], key: KEY, expires_in: 10 } });
+    now += 10;
+    await answer(phone, id, "ok", 410);
+    expect(await poll(id)).toEqual({ status: "expired" });
+  });
+
+  it("lets other members' devices answer only when anyone is set", async () => {
+    const bob = await signup("bob");
+    const homelab = await channel("homelab");
+    const bobPhone = await pair("phone", "fcm-bob", bob);
+    const { code } = await call<{ code: string }>("POST", `/v1/channels/${homelab}/invites`, USER, undefined, 201);
+    await call("POST", "/v1/device/memberships", bobPhone.device_token, { invite: code }, 201);
+    const own = await pair("laptop", "fcm-laptop");
+    await call("PUT", "/v1/device/channels", own.device_token, { channel_ids: [`ch_default_${await userId()}`, homelab] }, 200);
+
+    const mine = await ask({ channels: ["homelab"] });
+    expect((await payloadFor(bobPhone, 0)).reply).toBeUndefined();
+    expect((await payloadFor(own, 1)).reply).toBeDefined();
+    await answer(bobPhone, mine.id, "yes", 404);
+
+    const anyone = await ask({ channels: ["homelab"], question: { options: ["yes", "no"], key: KEY, anyone: true } });
+    expect((await payloadFor(bobPhone, 2)).reply).toMatchObject({ options: ["yes", "no"], expires_at: now + 600 });
+    await answer(bobPhone, anyone.id, "yes");
+    expect(await poll(anyone.id)).toMatchObject({ status: "answered", by: "bob" });
+  });
+
+  it("refuses a question none of the asker's devices can answer", async () => {
+    const bob = await signup("bob");
+    const homelab = await channel("homelab");
+    const bobPhone = await pair("phone", "fcm-bob", bob);
+    const { code } = await call<{ code: string }>("POST", `/v1/channels/${homelab}/invites`, USER, undefined, 201);
+    await call("POST", "/v1/device/memberships", bobPhone.device_token, { invite: code }, 201);
+    await ask({ channels: ["homelab"] }, 404);
+    expect(sender.sent).toHaveLength(0);
+  });
+
+  it("hides questions from other users and other devices", async () => {
+    const phone = await pair("phone", "fcm-phone");
+    const bob = await signup("bob");
+    const bobPhone = await pair("phone", "fcm-bob", bob);
+    const { id } = await ask({});
+    await poll(id, 0, bob, 404);
+    await answer(bobPhone, id, "yes", 404);
+    await poll("msg_aaaaaaaaaaaaaaaa", 0, USER, 404);
+    await call("POST", `/v1/replies/${id}`, USER, { n: "", c: "" }, 401);
+    await answer(phone, id, "yes");
+  });
+
+  it.each([
+    [{ options: [] }],
+    [{ options: ["a", "b", "c", "d"] }],
+    [{ options: ["a", "a"] }],
+    [{ options: [" "] }],
+    [{ options: ["two\nlines"] }],
+    [{ options: ["x".repeat(33)] }],
+    [{ options: ["yes"], key: "short" }],
+    [{ options: ["yes"], expires_in: 9 }],
+    [{ options: ["yes"], expires_in: 86_401 }],
+    [{ options: ["yes"], expires_in: 1.5 }],
+    [{ options: ["yes"], anyone: "yes" }],
+    [{ options: ["yes"], extra: 1 }],
+  ])("rejects the question %j", async (q) => {
+    await pair("phone", "fcm-phone");
+    await ask({ question: { key: KEY, ...q } }, 400);
+    expect(sender.sent).toHaveLength(0);
+  });
+
+  it("checks the reply's shape and the wait", async () => {
+    const phone = await pair("phone", "fcm-phone");
+    const { id } = await ask({});
+    await call("POST", `/v1/replies/${id}`, phone.device_token, { n: "AAAA", c: "AAAA" }, 400);
+    await call("POST", `/v1/replies/${id}`, phone.device_token, { n: toBase64(new Uint8Array(12)), c: "" }, 400);
+    await call("POST", `/v1/replies/${id}`, phone.device_token, { n: toBase64(new Uint8Array(12)), c: "AA==" }, 400);
+    await call("POST", `/v1/replies/${id}`, phone.device_token, { n: toBase64(new Uint8Array(12)), c: toBase64(new Uint8Array(16)) }, 400);
+    expect(await poll(id)).toEqual({ status: "pending" });
+    await poll(id, 51, USER, 400);
+    await call("GET", `/v1/replies/${id}?wait=-1`, USER, undefined, 400);
   });
 });
 

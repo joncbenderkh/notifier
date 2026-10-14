@@ -14,6 +14,17 @@ const VECTOR = {
   plaintext: `{"id":"msg_test","title":"Hello","body":"From the test vector","priority":"high","sent_at":1791590400}`,
 };
 
+// A device seals its answer to a question under the asker's one-time key,
+// with "reply:" + the message ID as associated data. The server never opens
+// it; the notify CLI, notifyd and the Android app assert this vector.
+const REPLY_VECTOR = {
+  key: VECTOR.key,
+  nonce: VECTOR.nonce,
+  ciphertext: "TDMzHSVQ7HW1BXHCzRiocGE39XiLrrhG+LEwUrTqrw8=",
+  aad: "reply:msg_test",
+  plaintext: `{"answer":"yes"}`,
+};
+
 const encode = (s: string) => new TextEncoder().encode(s);
 
 describe("seal", () => {
@@ -28,6 +39,11 @@ describe("seal", () => {
       ciphertext: fromBase64(VECTOR.ciphertext),
     });
     expect(new TextDecoder().decode(plaintext)).toBe(VECTOR.plaintext);
+  });
+
+  it("produces the shared reply vector", async () => {
+    const env = await seal(fromBase64(REPLY_VECTOR.key), REPLY_VECTOR.aad, encode(REPLY_VECTOR.plaintext), fromBase64(REPLY_VECTOR.nonce));
+    expect(toBase64(env.ciphertext)).toBe(REPLY_VECTOR.ciphertext);
   });
 
   it("rejects a payload sealed for another device", async () => {

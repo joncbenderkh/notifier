@@ -25,11 +25,18 @@
       "simple": { "limit": 60, "period": 60 }
     }
   ],
-  // One per WebSocket-transport device (src/stream.ts): its socket and queue.
+  // DEVICE_STREAM: one per WebSocket-transport device (src/stream.ts), its
+  // socket and queue. REPLY_BOX: one per question (src/replies.ts), its answer.
   "durable_objects": {
-    "bindings": [{ "name": "DEVICE_STREAM", "class_name": "DeviceStream" }]
+    "bindings": [
+      { "name": "DEVICE_STREAM", "class_name": "DeviceStream" },
+      { "name": "REPLY_BOX", "class_name": "ReplyBox" }
+    ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["DeviceStream"] }],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["DeviceStream"] },
+    { "tag": "v2", "new_sqlite_classes": ["ReplyBox"] }
+  ],
   "d1_databases": [
     {
       "binding": "DB",

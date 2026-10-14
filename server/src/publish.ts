@@ -72,8 +72,17 @@ export function publisher(deps: Deps) {
     }
   }
 
-  /** Sends [base] from [userId] to every target, each labelled with its channel as its owner names it. */
-  async function publish(env: Env, userId: string, targets: Iterable<Target>, base: Payload): Promise<Published> {
+  /**
+   * Sends [base] from [userId] to every target, each labelled with its
+   * channel as its owner names it and given what [extra] adds for it.
+   */
+  async function publish(
+    env: Env,
+    userId: string,
+    targets: Iterable<Target>,
+    base: Payload,
+    extra?: (t: Target) => Partial<Payload>,
+  ): Promise<Published> {
     // A failed warm-up (including a missing or invalid FCM_SERVICE_ACCOUNT)
     // is not fatal: each send retries and reports per device.
     try {
@@ -82,10 +91,11 @@ export function publisher(deps: Deps) {
       console.error("push prepare failed", err);
     }
     const all = await Promise.all(
-      [...targets].map(async ({ device: d, channel: ch }) => ({
-        own: d.user_id === userId,
-        delivery: await deliver(env, d, ch ? { ...base, channel: channelLabel(ch, d.user_id), channel_id: ch.id } : base),
-      })),
+      [...targets].map(async (t) => {
+        const { device: d, channel: ch } = t;
+        const p = ch ? { ...base, channel: channelLabel(ch, d.user_id), channel_id: ch.id } : base;
+        return { own: d.user_id === userId, delivery: await deliver(env, d, { ...p, ...extra?.(t) }) };
+      }),
     );
     const deliveries = all.filter((x) => x.own).map((x) => x.delivery);
     const members: Published["members"] = {};

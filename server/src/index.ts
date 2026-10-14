@@ -4,11 +4,13 @@ import { createApp } from "./app";
 import { heartbeatAlerts } from "./heartbeats";
 import { senderFor } from "./push";
 
+export { ReplyBox } from "./replies";
 export { DeviceStream } from "./stream";
 
 const deps: Deps = {
   sender: senderFor,
   stream: (env, deviceId) => env.DEVICE_STREAM.get(env.DEVICE_STREAM.idFromName(deviceId)),
+  replies: (env, messageId) => env.REPLY_BOX.get(env.REPLY_BOX.idFromName(messageId)),
   now: () => Math.floor(Date.now() / 1000),
 };
 const app = createApp(deps);
