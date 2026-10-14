@@ -38,6 +38,16 @@ type Entry struct {
 	ReceivedAt int64  `json:"received_at"`
 	Channel    string `json:"channel,omitempty"`
 	ChannelID  string `json:"channel_id,omitempty"`
+	Reply      *Reply `json:"reply,omitempty"`
+}
+
+// Reply is a question's answers, the one-time key to seal one under, and
+// when the question closes (Unix seconds); only devices that may answer
+// get it.
+type Reply struct {
+	Options   []string `json:"options"`
+	Key       string   `json:"key"`
+	ExpiresAt int64    `json:"expires_at"`
 }
 
 // OnDefaultChannel reports whether e went to the user's default channel,

@@ -67,11 +67,19 @@ func (a *app) newRoot() *cobra.Command {
 		leaf("delete ID...", "Forget the messages with these IDs", cobra.MinimumNArgs(1), a.historyDelete),
 	)
 
+	// Answers are the sender's text and may start with a dash.
+	reply := leaf("reply ID ANSWER", "Answer a question from the history", cobra.ExactArgs(2), func(args []string) int {
+		return a.reply(args[0], args[1])
+	})
+	reply.Flags().SetInterspersed(false)
+	reply.Annotations = map[string]string{flagsEndAtArgs: "yes"}
+
 	root.AddCommand(
 		pair,
 		// Never the default: a second daemon would replace the service's.
 		leaf("run", "Receive and show messages until stopped (the systemd service)", cobra.NoArgs, none(a.listen)),
 		leaf("test", "Show a test notification through the server", cobra.NoArgs, none(a.test)),
+		reply,
 		history,
 		leaf("unpair", "Unpair this desktop and forget its pairing", cobra.NoArgs, none(a.unpair)),
 		&cobra.Command{

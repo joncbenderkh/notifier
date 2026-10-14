@@ -43,7 +43,7 @@ type app struct {
 	historyPath    string
 	now            func() time.Time
 	http           *http.Client
-	desktop        func(context.Context) (Desktop, error)
+	desktop        func(context.Context, AnswerFunc) (Desktop, error)
 	hostname       func() (string, error)
 	signals        func() (context.Context, context.CancelFunc)
 }
@@ -221,7 +221,10 @@ func (a *app) listen() int {
 	defer release()
 	ctx, stop := a.signals()
 	defer stop()
-	desktop, err := a.desktop(ctx)
+	desktop, err := a.desktop(ctx, func(id string, q histfile.Reply, option string) string {
+		outcome, _ := a.answer(st, id, q, option)
+		return outcome
+	})
 	if err != nil {
 		return a.fail(fmt.Errorf("cannot reach the desktop's notification service: %w", err))
 	}
@@ -444,6 +447,13 @@ func formatEntry(e historyEntry) string {
 		for line := range strings.SplitSeq(printable(e.Body, true), "\n") {
 			b.WriteString("    " + line + "\n")
 		}
+	}
+	if q := e.Reply; q != nil {
+		options := make([]string, len(q.Options))
+		for i, o := range q.Options {
+			options[i] = printable(o, false)
+		}
+		b.WriteString("    answers: " + strings.Join(options, " | ") + "  (notifyd reply " + e.ID + " ANSWER)\n")
 	}
 	return b.String()
 }

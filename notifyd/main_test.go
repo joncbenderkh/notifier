@@ -65,26 +65,26 @@ func TestParsesPairLinks(t *testing.T) {
 }
 
 func TestMapsPayloadsOntoNotify(t *testing.T) {
-	summary, body, hints := notification(Payload{Title: "Disk", Body: "a < b & c", Priority: "high", Channel: "alice/homelab"}, true)
-	if summary != "Disk" || body != "a &lt; b &amp; c" {
-		t.Fatalf("summary %q, body %q", summary, body)
+	n := notification(Payload{Title: "Disk", Body: "a < b & c", Priority: "high", Channel: "alice/homelab"}, true, true, time.Now())
+	if n.summary != "Disk" || n.body != "a &lt; b &amp; c" || len(n.actions) != 0 || n.timeout != -1 {
+		t.Fatalf("%+v", n)
 	}
-	if hints["urgency"] != dbus.MakeVariant(urgencyCritical) || hints["category"] != dbus.MakeVariant("notifier.alice/homelab") {
-		t.Fatalf("hints %v", hints)
+	if n.hints["urgency"] != dbus.MakeVariant(urgencyCritical) || n.hints["category"] != dbus.MakeVariant("notifier.alice/homelab") {
+		t.Fatalf("hints %v", n.hints)
 	}
-	_, body, hints = notification(Payload{Title: "Hi", Body: "a < b", Priority: "default"}, false)
-	if body != "a < b" || hints["urgency"] != dbus.MakeVariant(urgencyNormal) {
-		t.Fatalf("body %q, hints %v", body, hints)
+	n = notification(Payload{Title: "Hi", Body: "a < b", Priority: "default"}, false, false, time.Now())
+	if n.body != "a < b" || n.hints["urgency"] != dbus.MakeVariant(urgencyNormal) {
+		t.Fatalf("%+v", n)
 	}
-	if _, ok := hints["category"]; ok {
+	if _, ok := n.hints["category"]; ok {
 		t.Fatal("category without a channel")
 	}
 }
 
 func TestDropsNULAndTellsRejectionsFromOutages(t *testing.T) {
-	summary, body, hints := notification(Payload{Title: "a\x00b", Body: "c\x00d", Channel: "e\x00f"}, false)
-	if summary != "ab" || body != "cd" || hints["category"] != dbus.MakeVariant("notifier.ef") {
-		t.Fatalf("%q %q %v", summary, body, hints)
+	n := notification(Payload{Title: "a\x00b", Body: "c\x00d", Channel: "e\x00f"}, false, false, time.Now())
+	if n.summary != "ab" || n.body != "cd" || n.hints["category"] != dbus.MakeVariant("notifier.ef") {
+		t.Fatalf("%+v", n)
 	}
 	for _, c := range []struct {
 		err  error
@@ -166,7 +166,7 @@ func newTestApp(t *testing.T) (*app, *bytes.Buffer, *bytes.Buffer) {
 		historyPath: filepath.Join(dir, "state", "notifyd-history.jsonl"),
 		now:         func() time.Time { return time.Unix(testNow, 0) },
 		http:        &http.Client{CheckRedirect: refuseRedirect},
-		desktop:     func(context.Context) (Desktop, error) { return newFakeDesktop(), nil },
+		desktop:     func(context.Context, AnswerFunc) (Desktop, error) { return newFakeDesktop(), nil },
 		hostname:    func() (string, error) { return "workstation", nil },
 		signals:     func() (context.Context, context.CancelFunc) { return context.WithCancel(context.Background()) },
 	}, &stdout, &stderr

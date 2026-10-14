@@ -8,6 +8,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+
+	"github.com/joncbenderkh/notifier/notifyd/internal/histfile"
 )
 
 // envelopeVersion is the sealed format this daemon reads (server/src/seal.ts).
@@ -22,6 +24,8 @@ type Payload struct {
 	SentAt    int64  `json:"sent_at"`
 	Channel   string `json:"channel,omitempty"`
 	ChannelID string `json:"channel_id,omitempty"`
+	// Reply is set when this device may answer the message's question.
+	Reply *histfile.Reply `json:"reply,omitempty"`
 }
 
 // openEnvelope decrypts envelope v1: AES-256-GCM with a 12-byte nonce, the
