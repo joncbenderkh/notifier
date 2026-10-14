@@ -247,6 +247,27 @@ the tool retries, which can repeat an alert. `notify hooks` lists them;
 to `default`. The URL is the credential, so treat it like an API key; each
 user has up to 20 hooks, and they count toward the send limit.
 
+### Questions
+
+A script can ask and wait for the answer:
+
+```sh
+if [ "$(notify ask -o yes,no "Deploy prod?")" = yes ]; then make deploy; fi
+```
+
+The question goes out like any message, with up to three answers (each at
+most 32 bytes) shown as buttons on your devices. The first one tapped wins:
+`notify ask` prints it on standard output (and who answered on standard
+error) and exits 0. It exits 4 when nobody answered within `--wait`
+(default 10 minutes, at most 24 hours). Only your own devices may answer;
+on a shared channel, `--anyone` lets other members' devices answer too.
+
+Each question carries a one-time key, inside the sealed message. The
+device seals the answer under it, so the server holds the answer only in a
+form it cannot read, and forgets it an hour after the question expires.
+Devices that predate questions show the question without buttons; the
+buttons come to notifyd and the Android app in follow-up releases (#32).
+
 ### History
 
 The app keeps the notifications it received, so one dismissed by accident
@@ -263,6 +284,7 @@ copy: it relays sealed messages and keeps no content.
 
 ```
 notify send [flags] TITLE [BODY | -]  send
+notify ask -o A,B [flags] QUESTION [BODY | -]   ask; prints the answer (see Questions)
 notify devices                        list your paired devices
 notify pair                           print a pairing QR code
 notify signup [--force] INVITE NAME   create a user; saves the token to the config file
@@ -287,6 +309,11 @@ send flags:
                    Without --to or -c: the config file's, else the default
                    channel (every paired device)
   --high           high priority (heads-up, may wake the phone)
+
+ask flags: those of send, plus
+  -o, --options A  the answers to offer, at most 3; repeatable or comma-separated
+  --wait D         how long the question stays open (default 10m, 10s to 24h)
+  --anyone         let other channel members' devices answer too
 
 Flags for every command:
   --url URL        server; must be https except for localhost or a loopback
@@ -360,7 +387,8 @@ still counts as reached (unpair it with `DELETE /v1/devices/{id}`). Exit
 status is 3 when nothing reached one of them (a delivery failed, a phone
 was unreachable or unpaired before sending, or no phone matched or
 subscribed), or when the message reached no device at all; 1 on other
-errors; and 2 on usage errors. Other members' devices on a shared channel
+errors; and 2 on usage errors. `notify ask` also exits 4 when its question
+expired unanswered. Other members' devices on a shared channel
 are reported as counts and do not affect the exit status unless none got
 the message.
 
@@ -473,7 +501,8 @@ another user's device or key IDs answer 404.
 
 | Method & path                     | Auth                 | Body / notes |
 |-----------------------------------|----------------------|--------------|
-| `POST /v1/notifications`          | User or API key      | `{"title", "body"?, "priority"?: "default"\|"high", "channels"?: [names], "device_ids"?: [...]}` — reaches devices subscribed to the named channels (the caller's own) plus the listed devices, each once; with neither, the `default` channel. Returns per-device delivery status for the sender's own devices, and `members` (counts by status) for other members'. At most 60 a minute per user (429 after). |
+| `POST /v1/notifications`          | User or API key      | `{"title", "body"?, "priority"?: "default"\|"high", "channels"?: [names], "device_ids"?: [...]}` — reaches devices subscribed to the named channels (the caller's own) plus the listed devices, each once; with neither, the `default` channel. Returns per-device delivery status for the sender's own devices, and `members` (counts by status) for other members'. At most 60 a minute per user (429 after). An optional `"question": {"options": [1–3 answers], "key": <32 bytes, base64>, "expires_in"?: 10–86400 (600), "anyone"?: false}` asks for an answer: see [Replies](#replies). |
+| `GET /v1/replies/{message id}?wait=N` | User or API key  | Waits up to N seconds (0–50) for the answer; `{"status": "pending"\|"expired"}` or `{"status": "answered", "by", "replied_at", "n", "c"}` |
 | `GET /v1/devices`                 | User or API key      | `transport` (`fcm` or `ws`); activity timestamps only with a user token |
 | `POST /v1/pairings`               | User                 | Returns a single-use code valid for 10 minutes and its `notifier://pair` link (`uri`); `?qr=svg` adds `qr_svg`. At most 20 devices and 5 unused codes per user. |
 | `GET /pair`                       | —                    | Static page that calls `POST /v1/pairings` with a pasted user token and shows the QR code (`/admin/pair` redirects here) |
@@ -503,6 +532,7 @@ another user's device or key IDs answer 404.
 | `GET /v1/device/channels`         | Device               | Channels its owner can subscribe to, with `subscribed` |
 | `PUT /v1/device/channels`         | Device               | `{"channel_ids"}` (must include `default`) |
 | `POST /v1/device/memberships`     | Device               | `{"invite"}`: its owner joins, and the device subscribes |
+| `POST /v1/replies/{message id}`   | Device               | `{"n", "c"}`: the sealed answer to a question the device may answer. 201; 409 if already answered, 410 if expired |
 | `POST /v1/heartbeats`             | User                 | `{"name", "interval", "grace"?, "channel"?}` (seconds; grace defaults to 300, channel to `default`). Returns `ping_url`, once. At most 20 per user |
 | `GET /v1/heartbeats`              | User                 | With `state` (`up`, `down`, `failed`), `last_ping_at`, `due_at` |
 | `DELETE /v1/heartbeats/{id}`      | User                 | |
@@ -547,6 +577,24 @@ The text frame `ping` is answered with `pong`, for keepalives. A newer
 connection for the same device closes the older one with code 4000.
 Unpairing closes the connection with code 4001 and drops the queue; if
 that fails, the unpair answers 503 and can be retried.
+
+### Replies
+
+A message sent with `question` carries, for each device allowed to answer
+(the sender's own, and with `anyone` other members' too), an extra field
+in its sealed payload:
+
+```json
+"reply": {"options": ["yes", "no"], "key": "<base64, 32 bytes>", "expires_at": 1791590400}
+```
+
+The device answers with `POST /v1/replies/{message id}`, sealing
+`{"answer": "yes"}` with AES-256-GCM under `key`, a fresh 12-byte nonce,
+and `reply:` + the message ID as associated data; `n` and `c` are the
+base64 nonce and ciphertext (with its tag). The first answer wins. The
+server cannot open it: the asker, who chose the key, opens it from
+`GET /v1/replies/{message id}`, where `by` names the answering device (or,
+for another member's, that member).
 
 ## License
 
