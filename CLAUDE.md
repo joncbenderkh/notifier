@@ -383,6 +383,62 @@ See `README.md` for the user-facing setup and API table.
   The CLI checks the answer is one of its options and exits 4 when none
   came. **Rollback:** the `v2` DO migration means every later version must
   export `ReplyBox`, as with `DeviceStream`.
+- **Receipts (issue #33):** opt-in per send: `"receipts": true` on
+  `POST /v1/notifications` (`notify send --receipts`, `--wait-seen`)
+  puts `receipts: true` in the payload of each tracked target and opens a
+  SQLite-backed Durable Object per message (`src/receipts.ts`,
+  `ReceiptBox`, bound as `RECEIPT_BOX`, keyed `idFromName(message id)`)
+  before publishing, holding the recipients and, per device, the first
+  `shown_at` and `opened_at` (opening implies showing). Devices report
+  with `POST /v1/device/receipts`; only recipients count. The sender
+  reads or long-polls (until any device opened it) `GET
+  /v1/notifications/<id>`, which lists their own devices and only counts
+  other members'. An alarm deletes the box a day and an hour after
+  sending. Opened means an explicit act: tapping the notification or a
+  history card (every card's tap reads it, expanding a long message; a tracked notification's tap goes through the
+  non-exported `OpenedActivity`, since any app can fill in the exported
+  `MainActivity`'s extras, with its own `PendingIntent` by data
+  `notifier-open:<id>`), clicking it (notifyd
+  adds the `default` action, labelled "Mark seen" since it opens nothing,
+  only for tracked messages, and not to an open question, where it
+  would replace dunst's menu of answers; `pending` keeps at most 500,
+  evicting the oldest without an open question), or answering,
+  which the server records itself in `POST /v1/replies/<id>` (also
+  when the answer is refused as late or second). Listing
+  the history does not count. Shown is reported once the notification is
+  posted (Android: only where the user lets it show, and once it is
+  among the active notifications, since Android drops some). Clients report
+  best-effort, once per process, and only for the pairing that received
+  the message. `notify send --wait-seen` exits 4 when nothing was opened
+  in time, and its exit status then says only whether it was seen. An
+  answer that came in time counts every opening; one that came late
+  counts only own devices' openings timed by the deadline, and exits 1
+  when only another member's untimed opening was seen. A spaced
+  `--wait-seen 5m TITLE` is refused (the duration is optional, so 5m
+  would be the title). An answer tapped after a tracked question
+  expired locally never reaches the server, so the client reports it
+  opened itself (notifyd for every tracked answer button; Android from
+  the button's `receipts` extra, not the history, which may be cleared).
+  `notifyd reply` does not: its history entry does not record receipts.
+  Android reports shown off the FCM thread, which delivers one message at
+  a time, so a receipt can be lost if the phone dozes or the process is
+  frozen first; that is accepted, receipts being best-effort. A 404 is
+  not retried (`ReceiptLedger`, unit-tested).
+  Tracked targets are the sender's own devices, and other members'
+  where the channel they get it through (`Target.channel`, the first
+  requested one they subscribe to) has `channels.receipts` `required`,
+  or `optional` and the member has not set
+  `channel_members.receipts_declined` (migration 0008, additive). The
+  owner sets it (`PATCH /v1/channels/<id>`; `default` has no other
+  members, so it is refused there), `off` by default; a member declines
+  for all their devices, with the user token or a device's (`PATCH
+  /v1/memberships/<id>`, `/v1/device/memberships/<id>`: the Android
+  channel list's switch), not where it is required (409). Untracked
+  members' devices get no `receipts`, so the server decides and clients
+  need no setting.
+  **Rollback:** the `v3` DO migration means every later version must
+  export `ReceiptBox`, as with `ReplyBox`. Migration 0008 is harmless to
+  the previous Worker, which ignores the columns.
 - **Wire format (envelope v1):** FCM data `{"v":"1","n":<b64 nonce>,"c":<b64
   ciphertext>}`; AES-256-GCM, 12-byte nonce, 128-bit tag, per-device key,
   AAD = device ID. Plaintext is the JSON `Payload` (`server/src/app.ts`,
@@ -434,6 +490,8 @@ See `README.md` for the user-facing setup and API table.
   WebSocket transport (exported from `index.ts`).
 - `server/src/replies.ts` — `ReplyBox`, the Durable Object holding a
   question's answer (exported from `index.ts`).
+- `server/src/receipts.ts` — `ReceiptBox`, the Durable Object holding a
+  tracked message's receipts (exported from `index.ts`).
 - `server/src/{pairing,pairPage}.ts` — the `notifier://pair` link and QR, and
   the static `/pair` page.
 - `server/src/publish.ts` — sealing and fan-out to devices, shared by
@@ -444,7 +502,8 @@ See `README.md` for the user-facing setup and API table.
 - `server/src/index.ts` — the deployed entry point (`fetch` and the
   `scheduled` cron handler).
 - `notify/` — `cmd.go` (the Cobra command tree and flags), `main.go`
-  (settings, sending, exit codes), `ask.go` (`notify ask`), `commands.go` (the other commands), `config.go` (config file), `client.go` (API
+  (settings, sending, exit codes), `ask.go` (`notify ask`, and the long-poll loop), `receipts.go`
+  (`--wait-seen`, `notify status`), `commands.go` (the other commands), `config.go` (config file), `client.go` (API
   client, name → ID resolution), `pair.go` (terminal QR). `main_test.go` and
   `commands_test.go` run it against `httptest` servers; `TestMain` clears
   `NOTIFIER_*` and points `NOTIFIER_CONFIG` at a missing file.
@@ -476,7 +535,9 @@ See `README.md` for the user-facing setup and API table.
   - `push/` — `PushService` (FCM), `SealedMessage`, `Replies` and
     `ChannelRoute` (pure JVM, unit-tested), `Notifications` (Android
     channels and groups), `Answers` and `ReplyReceiver` (answering
-    questions).
+    questions), `Receipts` (reporting shown and opened; `ReceiptLedger`
+    is pure JVM, unit-tested) and `OpenedActivity` (the non-exported
+    trampoline a tracked notification's tap goes through).
   - `ui/` — `MainViewModel`, `NotifierScreen`, `HistoryScreen`, theme.
 
 ## Commands
