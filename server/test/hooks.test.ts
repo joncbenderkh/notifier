@@ -50,7 +50,14 @@ describe("alertmanager", () => {
       title: "[FIRING:2] HostDown",
       body: "nas-01 is down (nas-01:9100)\nNo scrape for 5 minutes. (pi-02:9100)",
       priority: "high",
+      url: "http://alertmanager:9093/",
     });
+  });
+
+  it("links one alert to its source, else to Alertmanager, and drops links it cannot use", () => {
+    const one = { ...alertmanagerPayload, alerts: [alertmanagerPayload.alerts[0]] };
+    expect(alertmanager(one).url).toBe("http://prometheus:9090/graph");
+    expect(alertmanager({ ...one, externalURL: "javascript:1", alerts: [{ ...one.alerts[0], generatorURL: "file:///x" }] }).url).toBeUndefined();
   });
 
   it("pages only for urgent severities, and never for a resolution", () => {
@@ -122,6 +129,7 @@ describe("grafana", () => {
       title: "[FIRING:2] HostDown (node)",
       body: "nas-01 is down (nas-01:9100)\nNo scrape for 5 minutes. (pi-02:9100)",
       priority: "high",
+      url: "http://alertmanager:9093/",
     });
     expect(grafana({ ...grafanaPayload, title: undefined }).title).toBe("[FIRING:2] HostDown");
   });
@@ -135,6 +143,8 @@ describe("generic", () => {
       priority: "high",
     });
     expect(generic({ title: "Hi" })).toEqual({ title: "Hi", body: "", priority: "default" });
+    expect(generic({ title: "Hi", url: "https://ci.example/7" }).url).toBe("https://ci.example/7");
+    expect(generic({ title: "Hi", url: "ftp://ci.example/7" })).toEqual({ title: "Hi", body: "", priority: "default" });
   });
 
   it("cuts and cleans rather than rejecting", () => {

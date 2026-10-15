@@ -18,6 +18,28 @@ export const UNSAFE_IN_NAME = /[\p{Cc}\u202A-\u202E\u2066-\u2069]/u;
 /** As in names, but a message may span lines and hold tabs. */
 export const UNSAFE_IN_TEXT = /[^\P{Cc}\t\n]|[\u202A-\u202E\u2066-\u2069]/u;
 
+export const MAX_LINK_BYTES = 2048;
+
+/**
+ * [raw] as a link a device may open, or undefined: http or https, without
+ * credentials. Returned in its canonical form (a non-ASCII host in
+ * punycode, "https:x.example" as "https://x.example/"), so clients check,
+ * show and open what the browser would.
+ */
+export function webLink(raw: unknown): string | undefined {
+  if (typeof raw !== "string" || raw === "" || utf8Length(raw) > MAX_LINK_BYTES) return undefined;
+  if (/\s/u.test(raw) || !raw.isWellFormed() || UNSAFE_IN_NAME.test(raw)) return undefined;
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return undefined;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
+  if (url.username !== "" || url.password !== "") return undefined;
+  return utf8Length(url.href) <= MAX_LINK_BYTES ? url.href : undefined;
+}
+
 // ANSI escape sequences: CSI, OSC, nF, and the two-byte ones (as notify's clean).
 // eslint-disable-next-line no-control-regex -- matching control characters is the point
 const TERMINAL_ESCAPE = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[ -/]+[0-~]|[@-Z\\-_])/g;

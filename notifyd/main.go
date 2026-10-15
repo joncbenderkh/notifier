@@ -45,7 +45,7 @@ type app struct {
 	historyPath    string
 	now            func() time.Time
 	http           *http.Client
-	desktop        func(context.Context, AnswerFunc, ReceiptFunc, map[string]string) (Desktop, error)
+	desktop        func(context.Context, AnswerFunc, ReceiptFunc, OpenFunc, map[string]string) (Desktop, error)
 	hostname       func() (string, error)
 	signals        func() (context.Context, context.CancelFunc)
 	// noSound keeps run from giving notifications a sound.
@@ -237,6 +237,10 @@ func (a *app) listen() int {
 			defer func() { <-posting }()
 		}
 		a.receipt(st, id, state)
+	}, func(link string) {
+		if err := openLink(ctx, link, a.logf); err != nil {
+			a.logf("could not open %s: %v", link, err)
+		}
 	}, a.sounds())
 	if err != nil {
 		return a.fail(fmt.Errorf("cannot reach the desktop's notification service: %w", err))
@@ -467,6 +471,12 @@ func formatEntry(e historyEntry) string {
 			options[i] = printable(o, false)
 		}
 		b.WriteString("    answers: " + strings.Join(options, " | ") + "  (notifyd reply " + e.ID + " ANSWER)\n")
+	}
+	if e.URL != "" {
+		b.WriteString("    link: " + printable(e.URL, false) + "\n")
+	}
+	for _, a := range e.Actions {
+		b.WriteString("    " + printable(a.Label, false) + ": " + printable(a.URL, false) + "\n")
 	}
 	return b.String()
 }

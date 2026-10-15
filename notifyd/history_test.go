@@ -136,14 +136,16 @@ func TestHistoryCommand(t *testing.T) {
 	h.record(Payload{ID: "m1", Title: "Backup done", Priority: "default", SentAt: testNow})
 	h.record(Payload{ID: "m2", Title: "Disk\x1b[2Jfull", Body: "line one\nline two", Priority: "high",
 		SentAt: testNow - 3600, Channel: "alice/homelab", ChannelID: "ch_x"})
-	h.record(Payload{ID: "m3", Title: "On default\u202e\u0085", Channel: "default", ChannelID: "ch_default_usr_1", SentAt: testNow})
+	h.record(Payload{ID: "m3", Title: "On default\u202e\u0085", Channel: "default", ChannelID: "ch_default_usr_1", SentAt: testNow,
+		URL: "https://ci.example/7", Actions: []histfile.Action{{Label: "Lo\x1bgs", URL: "https://ci.example/7/logs"}}})
 
 	stdout.Reset()
 	if code := a.run([]string{"history", "-n", "2"}); code != 0 {
 		t.Fatalf("exit %d: %s", code, stderr)
 	}
 	out := stdout.String()
-	for _, want := range []string{"On default", "[alice/homelab]  Disk�[2Jfull  (high)  (sent ", "    line one\n    line two\n"} {
+	for _, want := range []string{"On default", "[alice/homelab]  Disk�[2Jfull  (high)  (sent ", "    line one\n    line two\n",
+		"    link: https://ci.example/7\n    Lo\ufffdgs: https://ci.example/7/logs\n"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q in:\n%s", want, out)
 		}

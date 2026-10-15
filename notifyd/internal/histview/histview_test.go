@@ -4,6 +4,7 @@ package histview
 
 import (
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -123,5 +124,17 @@ func TestSeen(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", "/state")
 	if p, _ := SeenPath(); p != "/state/notifier/bar-seen" {
 		t.Error(p)
+	}
+}
+
+func TestLinksNameWhereTheyLead(t *testing.T) {
+	e := histfile.Entry{URL: "https://ci.example/7", Actions: []histfile.Action{
+		{Label: "Lo\x1bgs", URL: "https://logs.example:8443/7"},
+		{Label: "Shell", URL: "file:///bin/sh"},
+		{Label: "Phish", URL: "https://bank.example@evil.example/"},
+	}}
+	want := []Link{{"Open ci.example", "https://ci.example/7"}, {"Lo�gs · logs.example", "https://logs.example:8443/7"}}
+	if got := Links(e); !slices.Equal(got, want) {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }

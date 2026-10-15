@@ -24,7 +24,15 @@ data class Payload(
     val reply: Reply? = null,
     /** Set when the sender asked to know when this device shows and opens it. */
     val receipts: Boolean = false,
+    /** Opened by a tap on the notification. */
+    val url: String? = null,
+    /** Buttons, each opening its own link; never sent with a question. */
+    val actions: List<LinkAction> = emptyList(),
 )
+
+/** A button that opens [url]; one another server sends incomplete is skipped, not the message. */
+@Serializable
+data class LinkAction(val label: String = "", val url: String = "")
 
 /** A question's answers, the one-time key to seal one under, and when it expires (Unix seconds). */
 @Serializable

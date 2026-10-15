@@ -106,6 +106,43 @@ func TestSendsToNamedPhone(t *testing.T) {
 	}
 }
 
+func TestSendsLinkAndActions(t *testing.T) {
+	f := newFakeServer(t)
+	code, _, stderr := f.run("", "send", "--link", "https://ci.example/7",
+		"--action", "Logs=https://ci.example/7/logs?a=b", "--action", " Re-run = http://ci.example/7/rerun", "Build failed")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	want := Notification{Title: "Build failed", URL: "https://ci.example/7", Actions: []Action{
+		{Label: "Logs", URL: "https://ci.example/7/logs?a=b"},
+		{Label: "Re-run", URL: "http://ci.example/7/rerun"},
+	}}
+	if len(f.got) != 1 || !equal(f.got[0], want) {
+		t.Fatalf("sent %+v, want %+v", f.got, want)
+	}
+}
+
+func TestRefusesBadLinks(t *testing.T) {
+	f := newFakeServer(t)
+	for _, args := range [][]string{
+		{"send", "--link", "javascript:alert(1)", "x"},
+		{"send", "--link", "ci.example", "x"},
+		{"send", "--action", "Logs", "x"},
+		{"send", "--action", "=https://x.example", "x"},
+		{"send", "--action", "Go=file:///etc/passwd", "x"},
+		{"send", "--action", "a=https://x.example", "--action", "b=https://x.example",
+			"--action", "c=https://x.example", "--action", "d=https://x.example", "x"},
+		{"ask", "-o", "yes", "--link", "ftp://x.example", "x"},
+	} {
+		if code, _, stderr := f.run("", args...); code != exitUsage || stderr == "" {
+			t.Errorf("%v: exit %d, stderr %q", args, code, stderr)
+		}
+	}
+	if len(f.got) != 0 {
+		t.Fatalf("sent %+v", f.got)
+	}
+}
+
 func TestSendsToAllPhonesByDefault(t *testing.T) {
 	f := newFakeServer(t)
 	if code, _, stderr := f.run("", "send", "Hello"); code != 0 {

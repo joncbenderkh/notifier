@@ -52,6 +52,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.joncbenderkh.notifier.R
 import com.joncbenderkh.notifier.data.HistoryEntry
+import com.joncbenderkh.notifier.data.Links
 import com.joncbenderkh.notifier.push.ChannelRoute
 import kotlinx.coroutines.delay
 
@@ -67,6 +68,7 @@ fun HistoryScreen(
     answering: Set<String>,
     onAnswer: (HistoryEntry, String) -> Unit,
     onOpen: (HistoryEntry) -> Unit,
+    onLink: (HistoryEntry, String) -> Unit,
 ) {
     BackHandler(onBack = onBack)
     var confirmClear by rememberSaveable { mutableStateOf(false) }
@@ -133,7 +135,7 @@ fun HistoryScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
-                items(entries, key = { it.id }) { HistoryCard(it, onDelete, it.id in answering, onAnswer, onOpen) }
+                items(entries, key = { it.id }) { HistoryCard(it, onDelete, it.id in answering, onAnswer, onOpen, onLink) }
             }
         }
     }
@@ -192,10 +194,11 @@ private fun Badge(text: String) {
 }
 
 /**
- * One notification: its body collapses to two lines, it can be deleted, and
- * a question it asks can be answered until it expires. When its sender asked
- * for receipts, only "Mark seen" (or answering) tells them it was opened, so
- * a tap that misses another control never does.
+ * One notification: its body collapses to two lines, it can be deleted, its
+ * links opened (each named by its host, since the sender chose it), and a
+ * question it asks can be answered until it expires. When its sender asked
+ * for receipts, only "Mark seen", a link (or answering) tells them it was
+ * opened, so a tap that misses another control never does.
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -205,6 +208,7 @@ private fun HistoryCard(
     answering: Boolean,
     onAnswer: (HistoryEntry, String) -> Unit,
     onOpen: (HistoryEntry) -> Unit,
+    onLink: (HistoryEntry, String) -> Unit,
 ) {
     var expanded by rememberSaveable(entry.id) { mutableStateOf(false) }
     var overflows by remember(entry.id) { mutableStateOf(false) }
@@ -268,10 +272,15 @@ private fun HistoryCard(
                     onTextLayout = { if (!expanded) overflows = it.hasVisualOverflow },
                     modifier = Modifier.padding(top = 8.dp, end = 12.dp),
                 )
-                Row(horizontalArrangement = Arrangement.spacedBy(24.dp)) {
-                    if (expanded || overflows) {
-                        Link(if (expanded) "Collapse" else "Read message") { expanded = !expanded }
-                    }
+            }
+            val url = Links.web(entry.url)
+            val actions = entry.actions.filter { Links.web(it.url) != null && it.label.isNotBlank() }
+            val readMore = entry.body.isNotEmpty() && (expanded || overflows)
+            if (readMore || entry.receipts || url != null || actions.isNotEmpty()) {
+                FlowRow(Modifier.padding(end = 12.dp), horizontalArrangement = Arrangement.spacedBy(24.dp)) {
+                    if (readMore) Link(if (expanded) "Collapse" else "Read message") { expanded = !expanded }
+                    if (url != null) Link("Open ${Links.host(url)}") { onLink(entry, url) }
+                    actions.forEach { a -> Link("${a.label} · ${Links.host(a.url)}") { onLink(entry, a.url) } }
                     if (entry.receipts) Link("Mark seen") { onOpen(entry) }
                 }
             }

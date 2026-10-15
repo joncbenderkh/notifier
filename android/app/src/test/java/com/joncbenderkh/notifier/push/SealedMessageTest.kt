@@ -39,6 +39,21 @@ class SealedMessageTest {
         assertTrue(SealedMessage.open(key, "dev_test", data).receipts)
     }
 
+    @Test
+    fun keepsAMessageWithAnIncompleteAction() {
+        val nonce = ByteArray(12)
+        val sealed = Cipher.getInstance("AES/GCM/NoPadding").run {
+            init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, nonce))
+            updateAAD("dev_test".toByteArray())
+            doFinal("""{"id":"msg_l","title":"Build","sent_at":1,"url":"https://ci.example/7","actions":[{"label":"x"}]}""".toByteArray())
+        }
+        val b64 = Base64.getEncoder()
+        val data = mapOf("v" to "1", "n" to b64.encodeToString(nonce), "c" to b64.encodeToString(sealed))
+        val payload = SealedMessage.open(key, "dev_test", data)
+        assertEquals("https://ci.example/7", payload.url)
+        assertEquals(listOf(LinkAction("x", "")), payload.actions)
+    }
+
     @Test(expected = SealedMessage.InvalidMessage::class)
     fun rejectsOtherDevice() {
         SealedMessage.open(key, "dev_other", vector)

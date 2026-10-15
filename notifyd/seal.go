@@ -29,6 +29,10 @@ type Payload struct {
 	// Receipts is set when the sender asked to know when it is shown and
 	// opened.
 	Receipts bool `json:"receipts,omitempty"`
+	// URL is opened by a click on the notification; each of Actions is a
+	// button opening its own.
+	URL     string            `json:"url,omitempty"`
+	Actions []histfile.Action `json:"actions,omitempty"`
 }
 
 // openEnvelope decrypts envelope v1: AES-256-GCM with a 12-byte nonce, the

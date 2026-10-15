@@ -449,6 +449,39 @@ See `README.md` for the user-facing setup and API table.
   **Rollback:** the `v3` DO migration means every later version must
   export `ReceiptBox`, as with `ReplyBox`. Migration 0008 is harmless to
   the previous Worker, which ignores the columns.
+- **Links (issue #31):** `POST /v1/notifications` takes an optional
+  `url` and up to three `actions` (`{label, url}`), copied into every
+  target's payload (additive; older clients ignore them). They are only
+  opened, in the browser, on a tap: by design no button makes a request
+  in the background. A tap still opens whatever URL the sender chose,
+  LAN addresses included, so clients name each link's host (Android
+  buttons and history cards, the notifyd window); there is no
+  confirmation. The server accepts only `http`/`https` without
+  credentials and sends the canonical `href` (`webLink` in `text.ts`:
+  punycode hosts, `https:x` as `https://x/`), so clients parse, show
+  and open the same thing; `""` means none. Each client checks again
+  before offering or opening one (Android `Links.web`, which also
+  rejects any `@` in the authority, since `java.net.URI` reports no
+  user info for a host it cannot parse; notifyd `histfile.WebLink`),
+  since other servers and old history may differ. Webhooks add the
+  alert's link (`hooks.ts`), dropped rather than refused when unusable
+  or when it would push the alert past FCM's limit. `actions` with a `question` is refused (400): the answers
+  take the buttons; a `url` may go with one. `notify send --link URL
+  --action LABEL=URL` (`--url` is the server). Android routes the tap
+  and each button (data `notifier-link:<id>/<i>`) through
+  `OpenedActivity`, which reports the opening when tracked, dismisses
+  the notification after a button, opens the link (scheme normalized:
+  intent filters match case-sensitively), and falls back to the history
+  when no app opens it. notifyd makes the url the `default` action
+  ("Open", taking the place of "Mark seen") and each button `link:<i>`;
+  clicking "Open" keeps the buttons where the service keeps the
+  notification. It opens through the portal's `OpenURI` over the shared
+  session bus (the portal answers later and may drop a request whose
+  caller left), falling back to `xdg-open` only when no portal runs (a
+  plain window manager), since another portal error may mean it opened
+  or refused the link; xdg-open's failure is logged. A service without
+  actions, or an open question, gets the links in the body. Opening a
+  link counts as opening a tracked message.
 - **Wire format (envelope v1):** FCM data `{"v":"1","n":<b64 nonce>,"c":<b64
   ciphertext>}`; AES-256-GCM, 12-byte nonce, 128-bit tag, per-device key,
   AAD = device ID. Plaintext is the JSON `Payload` (`server/src/app.ts`,
@@ -520,7 +553,7 @@ See `README.md` for the user-facing setup and API table.
 - `notifyd/` — `cmd.go` (the Cobra command tree: `pair`, `run`, `test`, `reply`,
   `history`, `unpair`, `version`, `completion`), `main.go` (the commands and
   exit codes), `state.go` (`notifyd.json`, atomic
-  writes), `history.go` (the history file), `reply.go` (answering questions), `link.go`
+  writes), `history.go` (the history file), `reply.go` (answering questions), `open.go` (opening links), `link.go`
   (`notifier://pair` parsing), `seal.go` (envelope v1 open, pinned by the
   shared vector), `stream.go` (connection loop), `desktop.go` (D-Bus),
   `notifyd.service` (systemd user unit), `internal/sounds` (the
@@ -541,7 +574,7 @@ See `README.md` for the user-facing setup and API table.
 - `android/app/src/main/java/com/joncbenderkh/notifier/`
   - `data/` — `PairingStore` and `HistoryStore` (both over
     `KeystoreCipher`), `ServerClient` (blocking; callers pick the thread),
-    `NotifierLink` and `History` (pure JVM, unit-tested).
+    `NotifierLink`, `History` and `Links` (pure JVM, unit-tested).
   - `push/` — `PushService` (FCM), `SealedMessage`, `Replies` and
     `ChannelRoute` (pure JVM, unit-tested), `Notifications` (Android
     channels and groups), `Answers` and `ReplyReceiver` (answering

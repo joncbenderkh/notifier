@@ -44,7 +44,16 @@ import type { ReceiptBook, ReceiptState, Recipient } from "./receipts";
 import type { Replies, Responder } from "./replies";
 import type { Stream } from "./stream";
 import { newSealKey } from "./seal";
-import { cleanTail, MAX_BODY_BYTES, MAX_TITLE_BYTES, UNSAFE_IN_NAME, UNSAFE_IN_TEXT, utf8Length } from "./text";
+import {
+  cleanTail,
+  MAX_BODY_BYTES,
+  MAX_LINK_BYTES,
+  MAX_TITLE_BYTES,
+  UNSAFE_IN_NAME,
+  UNSAFE_IN_TEXT,
+  utf8Length,
+  webLink,
+} from "./text";
 import * as store from "./store";
 import type { Channel, Device, ReceiptPolicy, User } from "./store";
 import {
@@ -119,6 +128,15 @@ export interface Payload {
   reply?: { options: string[]; key: string; expires_at: number };
   /** Set when the sender asked for receipts: the device reports when it shows and opens the message. */
   receipts?: true;
+  /** Opened by a tap on the notification: http or https only. */
+  url?: string;
+  /** Buttons, each opening its own URL; never sent with a question, whose answers are the buttons. */
+  actions?: LinkAction[];
+}
+
+export interface LinkAction {
+  label: string;
+  url: string;
 }
 
 export interface Delivery {
@@ -229,6 +247,36 @@ function waitSeconds(raw: string | undefined): number {
   const wait = /^\d{1,2}$/.test(raw ?? "0") ? Number(raw ?? "0") : NaN;
   if (!(wait <= MAX_REPLY_WAIT_SECONDS)) fail(400, `wait must be 0 to ${MAX_REPLY_WAIT_SECONDS} seconds`);
   return wait;
+}
+
+const MAX_ACTIONS = 3;
+const HOOK_LINK_MARGIN = 512;
+const MAX_ACTION_LABEL_CHARS = 40;
+
+/** [raw] as a link a device may open, canonical ([webLink]); [field] names it in errors. */
+function linkUrl(raw: unknown, field: string): string {
+  return (
+    webLink(raw) ??
+    fail(400, `${field} must be an http or https URL of at most ${MAX_LINK_BYTES} bytes, without credentials`)
+  );
+}
+
+function parseActions(raw: unknown): LinkAction[] {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw) || raw.length === 0 || raw.length > MAX_ACTIONS) {
+    fail(400, `actions must hold 1 to ${MAX_ACTIONS} buttons`);
+  }
+  return raw.map((a: unknown, i) => {
+    if (typeof a !== "object" || a === null || Array.isArray(a)) fail(400, `actions[${i}] must be an object`);
+    const o = a as Record<string, unknown>;
+    const unknown = Object.keys(o).find((k) => k !== "label" && k !== "url");
+    if (unknown !== undefined) fail(400, `invalid actions[${i}]: unknown field "${unknown}"`);
+    const label = typeof o.label === "string" ? o.label.trim() : "";
+    if (label === "" || [...label].length > MAX_ACTION_LABEL_CHARS || !label.isWellFormed() || UNSAFE_IN_NAME.test(label)) {
+      fail(400, `actions[${i}].label must be 1 to ${MAX_ACTION_LABEL_CHARS} characters without control characters`);
+    }
+    return { label, url: linkUrl(o.url, `actions[${i}].url`) };
+  });
 }
 
 interface QuestionRequest {
@@ -1002,6 +1050,9 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     if (m.title.trim() === "") fail(400, "the alert has no title");
     const p: Payload = { id: newId("msg_"), title: m.title, priority: m.priority, sent_at: deps.now() };
     if (m.body !== "") p.body = m.body;
+    // A link is a bonus: it never costs the alert its delivery to a phone.
+    // The margin covers what each target adds (the channel's label and ID).
+    if (m.url !== undefined && sealedDataBytes({ ...p, url: m.url }) <= MAX_FCM_DATA_BYTES - HOOK_LINK_MARGIN) p.url = m.url;
     const delivered = await publishToChannel(c.env, hook.user_id, hook.channel_id, p);
     await store.touchHook(c.env.DB, hook.id, deps.now());
     if (!delivered) fail(503, "no device took the message; try again later");
@@ -1021,7 +1072,9 @@ export function createApp(deps: Deps): Hono<AppEnv> {
       channels: string[];
       question: unknown;
       receipts: boolean;
-    }>(c, ["title", "body", "priority", "device_ids", "channels", "question", "receipts"]);
+      url: string;
+      actions: unknown;
+    }>(c, ["title", "body", "priority", "device_ids", "channels", "question", "receipts", "url", "actions"]);
     const title = typeof req.title === "string" ? req.title : "";
     const body = typeof req.body === "string" ? req.body : "";
     if (title.trim() === "") fail(400, "title is required");
@@ -1035,6 +1088,12 @@ export function createApp(deps: Deps): Hono<AppEnv> {
       req.priority === undefined || req.priority === null || req.priority === "" ? "default" : req.priority;
     if (priority !== "default" && priority !== "high") fail(400, 'priority must be "default" or "high"');
     if (req.receipts !== undefined && typeof req.receipts !== "boolean") fail(400, "receipts must be a boolean");
+    // Empty means none, as for body and priority.
+    const url = req.url === undefined || req.url === null || req.url === "" ? undefined : linkUrl(req.url, "url");
+    const actions = parseActions(req.actions);
+    if (actions.length > 0 && req.question !== undefined && req.question !== null) {
+      fail(400, "actions cannot go with a question: its answers are the buttons");
+    }
     const ids = stringList(req.device_ids, "device_ids");
     let names = channelNames(req.channels);
     const scope = c.get("keyScope");
@@ -1060,6 +1119,8 @@ export function createApp(deps: Deps): Hono<AppEnv> {
 
     const base: Payload = { id: newId("msg_"), title, priority, sent_at: deps.now() };
     if (body !== "") base.body = body;
+    if (url !== undefined) base.url = url;
+    if (actions.length > 0) base.actions = actions;
     let openReceipts: (() => Promise<void>) | undefined;
     let tracked: Set<string> | undefined;
     if (req.receipts === true) {
@@ -1106,7 +1167,7 @@ export function createApp(deps: Deps): Hono<AppEnv> {
         t.device.fcm_token !== "" &&
         sealedDataBytes(payloadFor(t, base, extra)) > MAX_FCM_DATA_BYTES,
     );
-    if (tooLarge) fail(400, "title and body are too long once encoded for a phone (at most 4 KiB); shorten them");
+    if (tooLarge) fail(400, "title, body and links are too long once encoded for a phone (at most 4 KiB); shorten them");
     // Opened before publishing, so an answer that comes back at once finds it.
     await openBox?.();
     await openReceipts?.();

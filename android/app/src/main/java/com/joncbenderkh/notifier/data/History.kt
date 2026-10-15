@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package com.joncbenderkh.notifier.data
 
+import com.joncbenderkh.notifier.push.LinkAction
 import com.joncbenderkh.notifier.push.Payload
 import com.joncbenderkh.notifier.push.Reply
 import kotlinx.serialization.Serializable
@@ -24,6 +25,9 @@ data class HistoryEntry(
     val outcome: String? = null,
     /** Whether the sender asked to know when it is opened. */
     val receipts: Boolean = false,
+    /** The link it opens, and its buttons' links. */
+    val url: String? = null,
+    val actions: List<LinkAction> = emptyList(),
 ) {
     companion object {
         fun of(payload: Payload, receivedAt: Long) = HistoryEntry(
@@ -37,6 +41,8 @@ data class HistoryEntry(
             payload.channelId,
             payload.reply,
             receipts = payload.receipts,
+            url = payload.url,
+            actions = payload.actions,
         )
     }
 }
