@@ -33,6 +33,9 @@ type Payload struct {
 	// button opening its own.
 	URL     string            `json:"url,omitempty"`
 	Actions []histfile.Action `json:"actions,omitempty"`
+	// Key, if set, replaces the notification last shown with the same key
+	// from the same channel.
+	Key string `json:"key,omitempty"`
 }
 
 // openEnvelope decrypts envelope v1: AES-256-GCM with a 12-byte nonce, the
