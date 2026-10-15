@@ -1,6 +1,6 @@
 {
   "name": "notifier-server",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "description": "Authenticated, end-to-end encrypted push notifications to Android via an HTTP API.",
   "license": "GPL-3.0-or-later",
