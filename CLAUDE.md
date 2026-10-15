@@ -482,6 +482,43 @@ See `README.md` for the user-facing setup and API table.
   or refused the link; xdg-open's failure is logged. A service without
   actions, or an open question, gets the links in the body. Opening a
   link counts as opening a tracked message.
+- **Replaceable notifications (issue #30):** `POST /v1/notifications`
+  takes an optional `key` (1–64 of `[A-Za-z0-9._:-]`), copied into every
+  target's payload (additive). `notify send|ask --replace KEY` sets it
+  (`--key` is the API key). Clients scope it by `channel_id` (`direct`
+  when absent): only a channel's owner publishes to it and only the
+  user sends directly, so no one else can replace a notification. A
+  replacement alerts like any message; histories keep every message.
+  Only the API and CLI set keys (heartbeats and webhooks do not, yet).
+  Android posts a keyed message under the tag
+  `key:<device id>/<scope>/<key>` (`NotificationTag`, otherwise the
+  message ID; the device ID keeps a previous pairing's notification
+  apart), so it updates in place, and keeps the message ID in an extra:
+  `posted`, `expire`, `showOutcome` and `OpenedActivity`'s dismiss find
+  a notification by it (`active`), so an answer's outcome or expiry for
+  a replaced message touches nothing. Each lookup and the post after it
+  run under one lock, and `showing` remembers the message each keyed
+  tag last posted, since Android's active list lags its posts (only a
+  post to a channel the user lets show counts). An older message (by
+  `sent_at`, whole seconds; FCM may reorder) does not replace a newer
+  one; within a second the later arrival wins, unless it was already
+  replaced in this process (`replaced`, a repeated delivery). A message
+  whose key's notification is being answered (`Answers.isAnswering`)
+  is posted under its own ID instead, so the outcome keeps its place;
+  the expiry alarm is set only once a question is posted. A key the
+  server would refuse is ignored, so another server cannot make two
+  scopes' tags alike. notifyd
+  remembers the D-Bus ID per scope and key (`keyed`, at most 500), for
+  the owner and connection that showed it, and passes it as
+  `replaces_id`; a closed ID is forgotten, since a service may reuse it
+  for another program's notification. Action keys are indexes, so a
+  click on the replaced notification, still queued, would reach its
+  replacement, and its close, still queued, would take the
+  replacement's actions: when either offers actions (`pending`, or the
+  new one's), the old one is closed (`CloseNotification`) and the update
+  shown anew. One whose answer is on its way (`answering`, by
+  connection) is left for its outcome, which then holds the key unless
+  a newer message took it.
 - **Wire format (envelope v1):** FCM data `{"v":"1","n":<b64 nonce>,"c":<b64
   ciphertext>}`; AES-256-GCM, 12-byte nonce, 128-bit tag, per-device key,
   AAD = device ID. Plaintext is the JSON `Payload` (`server/src/app.ts`,
@@ -575,7 +612,7 @@ See `README.md` for the user-facing setup and API table.
   - `data/` — `PairingStore` and `HistoryStore` (both over
     `KeystoreCipher`), `ServerClient` (blocking; callers pick the thread),
     `NotifierLink`, `History` and `Links` (pure JVM, unit-tested).
-  - `push/` — `PushService` (FCM), `SealedMessage`, `Replies` and
+  - `push/` — `PushService` (FCM), `SealedMessage`, `Replies`, `NotificationTag` and
     `ChannelRoute` (pure JVM, unit-tested), `Notifications` (Android
     channels and groups), `Answers` and `ReplyReceiver` (answering
     questions), `Receipts` (reporting shown and opened; `ReceiptLedger`
