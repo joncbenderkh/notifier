@@ -302,6 +302,32 @@ receipts counts as opening it. Webhooks add a link where the tool sends
 one: an Alertmanager or Grafana alert's `generatorURL` (one alert) or
 `externalURL`, or `url` in the generic format.
 
+### Replacing a notification
+
+A message sent with a key replaces the notification last sent with the
+same key, on each device, instead of adding another:
+
+```sh
+notify send --replace disk-usage "Disk 91% full" "/var: 18 GB free"
+```
+
+A key is 1–64 letters, digits, `.`, `_`, `:` or `-`. It applies within
+the channel the message came through (direct sends count as one), so
+another channel's owner cannot replace yours. Send each update the same
+way: a device subscribed to both channels gets `-c a,b` through `a`,
+which `-c b,a` would not replace, and `--to phone` does not replace a
+channel's message either. The replacement alerts like any message, and
+the history keeps every message. Send times count in whole seconds, so
+of two updates sent within one second, the one that arrives last stays.
+On a desktop, notifyd passes the earlier notification's ID as
+`replaces_id`, until it is closed, notifyd or the notification service
+restarts, or it is among the oldest past 500 keys; then the update shows
+beside it. An update with buttons, or replacing one that still has
+some, is shown anew and the earlier one closed, so a click meant for one
+never reaches the other. On a phone or desktop, a question whose answer
+is on its way keeps its place for the outcome, and an update arriving
+meanwhile shows beside it.
+
 ### Receipts
 
 A script can wait until someone has seen a message, and escalate if not:
@@ -391,8 +417,9 @@ send flags:
                    24h); exits 4 if none does
   --link URL       http(s) link that tapping the notification opens
   --action L=URL   a button labelled L that opens URL; repeatable, at most 3
+  --replace KEY    replace the notification last sent with KEY on each device
 
-ask flags: --to, -c, --high and --link as for send, plus
+ask flags: --to, -c, --high, --link and --replace as for send, plus
   -o, --options A  the answers to offer, at most 3; repeatable or comma-separated
   --wait D         how long the question stays open (default 10m, 10s to 24h)
   --anyone         let other channel members' devices answer too
@@ -607,7 +634,7 @@ another user's device or key IDs answer 404.
 
 | Method & path                     | Auth                 | Body / notes |
 |-----------------------------------|----------------------|--------------|
-| `POST /v1/notifications`          | User or API key      | `{"title", "body"?, "priority"?: "default"\|"high", "channels"?: [names], "device_ids"?: [...]}` — reaches devices subscribed to the named channels (the caller's own) plus the listed devices, each once; with neither, the `default` channel. Returns per-device delivery status for the sender's own devices, and `members` (counts by status) for other members'. At most 60 a minute per user (429 after). An optional `"question": {"options": [1–3 answers], "key": <32 bytes, base64>, "expires_in"?: 10–86400 (600), "anyone"?: false}` asks for an answer: see [Replies](#replies). `"receipts": true` asks the devices to report when they show and open it, and adds `tracked`, how many devices that got it will. `"url"` (http or https, no credentials, ≤ 2048 bytes) is opened by a tap, and `"actions": [{"label" (1–40 characters), "url"}]` (1–3, not with a question) are buttons that open theirs: see [Links](#links). |
+| `POST /v1/notifications`          | User or API key      | `{"title", "body"?, "priority"?: "default"\|"high", "channels"?: [names], "device_ids"?: [...]}` — reaches devices subscribed to the named channels (the caller's own) plus the listed devices, each once; with neither, the `default` channel. Returns per-device delivery status for the sender's own devices, and `members` (counts by status) for other members'. At most 60 a minute per user (429 after). An optional `"question": {"options": [1–3 answers], "key": <32 bytes, base64>, "expires_in"?: 10–86400 (600), "anyone"?: false}` asks for an answer: see [Replies](#replies). `"receipts": true` asks the devices to report when they show and open it, and adds `tracked`, how many devices that got it will. `"url"` (http or https, no credentials, ≤ 2048 bytes) is opened by a tap, and `"actions": [{"label" (1–40 characters), "url"}]` (1–3, not with a question) are buttons that open theirs: see [Links](#links). `"key"` (1–64 of `A–Z a–z 0–9 . _ : -`) replaces the notification last sent with that key: see [Replacing a notification](#replacing-a-notification). |
 | `GET /v1/notifications/{message id}?wait=N` | User or API key | For a message sent with `receipts`, within a day: waits up to N seconds (0–50) until a device opens it; `{"id", "status": "pending"\|"opened", "devices": [{"device_id", "name", "shown_at"?, "opened_at"?}], "members": {"tracked", "shown", "opened"}}`, the sender's own devices listed and other members' counted |
 | `GET /v1/replies/{message id}?wait=N` | User or API key  | Waits up to N seconds (0–50) for the answer; `{"status": "pending"\|"expired"}` or `{"status": "answered", "by", "replied_at", "n", "c"}` |
 | `GET /v1/devices`                 | User or API key      | `transport` (`fcm` or `ws`); activity timestamps only with a user token |

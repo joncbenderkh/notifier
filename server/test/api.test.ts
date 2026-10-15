@@ -1561,6 +1561,42 @@ describe("questions", () => {
   });
 });
 
+describe("keys", () => {
+  const send = (body: object, wantStatus = 200) =>
+    call<NotifyResponse & { error: string }>("POST", "/v1/notifications", USER, { title: "Disk usage", ...body }, wantStatus);
+
+  it("puts the key in every payload", async () => {
+    const phone = await pair("phone", "fcm-phone");
+    await send({ key: "disk-usage:var" });
+    expect((await payloadFor(phone, 0)).key).toBe("disk-usage:var");
+    // Another member's device, through a channel, and one named directly get it too.
+    const homelab = await channel("homelab");
+    const bob = await signup("bob");
+    const bobPhone = await pair("phone", "fcm-bob", bob);
+    const { code } = await call<{ code: string }>("POST", `/v1/channels/${homelab}/invites`, USER, undefined, 201);
+    await call("POST", "/v1/device/memberships", bobPhone.device_token, { invite: code }, 201);
+    await send({ key: "disk", channels: ["homelab"], device_ids: [phone.device_id] });
+    for (const [reg, token] of [[phone, "fcm-phone"], [bobPhone, "fcm-bob"]] as const) {
+      const i = sender.sent.findLastIndex((m) => m.token === token);
+      expect((await payloadFor(reg, i)).key).toBe("disk");
+    }
+    await send({ key: "" });
+    expect((await payloadFor(phone, 3)).key).toBeUndefined();
+    const question = { options: ["yes"], key: toBase64(new Uint8Array(32)) };
+    await send({ key: "deploy", question, device_ids: [phone.device_id] });
+    expect((await payloadFor(phone, 4)).key).toBe("deploy");
+  });
+
+  it("refuses malformed keys", async () => {
+    await pair("phone", "fcm-phone");
+    for (const key of ["x".repeat(65), "disk usage", "a/b", "é", "a\nb", 7, ["a"]]) {
+      expect((await send({ key }, 400)).error).toMatch(/key must be 1 to 64/);
+    }
+    expect(sender.sent).toHaveLength(0);
+    await send({ key: "x".repeat(64) });
+  });
+});
+
 describe("links", () => {
   const send = (body: object, wantStatus = 200) =>
     call<NotifyResponse & { error: string }>("POST", "/v1/notifications", USER, { title: "Build failed", ...body }, wantStatus);

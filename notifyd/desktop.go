@@ -74,6 +74,31 @@ type question struct {
 	// it and may answer it; "" when a service was started to show it.
 	owner string
 	gen   uint64 // the connection it was shown over
+	// scope is its key's [keyScope], "" for none.
+	scope string
+}
+
+// keyedNote is the notification last shown for a key.
+type keyedNote struct {
+	nid   uint32
+	id    string // the message's
+	shown time.Time
+	owner string // as in [question]
+	gen   uint64
+}
+
+// keyScope names [p]'s key within its channel, since only a channel's
+// owner publishes to it and only the device's own user sends directly;
+// "" when it has none.
+func keyScope(p Payload) string {
+	if p.Key == "" {
+		return ""
+	}
+	channel := p.ChannelID
+	if channel == "" {
+		channel = "direct"
+	}
+	return channel + "/" + p.Key
 }
 
 // dbusDesktop calls org.freedesktop.Notifications on the session bus, which
@@ -105,13 +130,19 @@ type dbusDesktop struct {
 	owner     string
 	capsStale bool
 	pending   map[uint32]question // by notification ID
+	// keyed is what a keyed message replaces, by [keyScope].
+	keyed map[string]keyedNote
+	// answering holds the notifications whose answer is on its way: by
+	// ID, the connection they were shown over. The outcome takes their
+	// place, so a keyed message does not.
+	answering map[uint32]uint64
 	// gen counts connections; signals still queued from an earlier one
 	// would name owners and notification IDs a new bus may reuse.
 	gen uint64
 }
 
 func connectDesktop(ctx context.Context, answer AnswerFunc, receipt ReceiptFunc, open OpenFunc, sounds map[string]string) (Desktop, error) {
-	d := &dbusDesktop{answer: answer, receipt: receipt, open: open, now: time.Now, sounds: sounds, pending: map[uint32]question{}}
+	d := &dbusDesktop{answer: answer, receipt: receipt, open: open, now: time.Now, sounds: sounds, pending: map[uint32]question{}, keyed: map[string]keyedNote{}}
 	if err := d.connect(ctx); err != nil {
 		return nil, err
 	}
@@ -170,7 +201,10 @@ func (d *dbusDesktop) connect(ctx context.Context) error {
 	d.mu.Lock()
 	d.conn, d.object, d.nameOwner = conn, object, nameOwner
 	d.markup, d.actions, d.owner, d.capsStale = markup, actions, owner, true
-	clear(d.pending) // notification IDs of an earlier service mean nothing to this one
+	// Notification IDs of an earlier service mean nothing to this one.
+	clear(d.pending)
+	clear(d.keyed)
+	clear(d.answering)
 	d.gen++
 	gen := d.gen
 	d.mu.Unlock()
@@ -273,16 +307,46 @@ func (d *dbusDesktop) showOnce(ctx context.Context, p Payload) error {
 	if path, ok := d.sounds[sound(p, now)]; ok {
 		n.hints["sound-file"] = dbus.MakeVariant(path)
 	}
+	scope := keyScope(p)
+	var replaces, closing uint32
+	d.mu.Lock()
+	if k, ok := d.keyed[scope]; ok && scope != "" && k.owner == owner && k.gen == d.gen {
+		_, offers := d.pending[k.nid]
+		g, answering := d.answering[k.nid]
+		switch {
+		case answering && g == d.gen: // its outcome takes its place
+		case offers || len(n.actions) > 0:
+			// Actions are keyed by index alone, so a click on the old one
+			// still queued would reach this one in its place, and a close
+			// of the old one still queued would take this one's actions:
+			// it is closed instead, and this one shown anew.
+			closing = k.nid
+		default:
+			replaces = k.nid
+		}
+	}
+	d.mu.Unlock()
 	var id uint32
 	err := obj.CallWithContext(ctx, notificationsInterface+".Notify", 0,
-		"notifier", uint32(0), "", n.summary, n.body, n.actions, n.hints, n.timeout).Store(&id)
+		"notifier", replaces, "", n.summary, n.body, n.actions, n.hints, n.timeout).Store(&id)
 	if permanent(err) {
 		return fmt.Errorf("%w: %v", errRejected, err)
+	}
+	if err == nil && closing != 0 {
+		// Best effort: left showing, it is just one more notification.
+		obj.CallWithContext(ctx, notificationsInterface+".CloseNotification", 0, closing)
+	}
+	if err == nil && scope != "" {
+		d.mu.Lock()
+		// Not an earlier notification's, whose ID the service reused.
+		delete(d.pending, id)
+		d.rememberKeyed(scope, keyedNote{nid: id, id: p.ID, shown: now, owner: owner, gen: d.gen})
+		d.mu.Unlock()
 	}
 	if err == nil && len(n.actions) > 0 {
 		q := question{
 			id: p.ID, title: n.summary, receipts: p.Receipts, markable: slices.Contains(n.actions, openAction),
-			shown: now, owner: owner, gen: d.gen,
+			shown: now, owner: owner, gen: d.gen, scope: scope,
 		}
 		if webLink(p.URL) {
 			q.url = p.URL
@@ -333,6 +397,24 @@ func (d *dbusDesktop) evictUnanswerable(now time.Time) {
 	}
 }
 
+// rememberKeyed records [k] as what [scope]'s next message replaces,
+// keeping at most [maxPending]. d.mu is held.
+func (d *dbusDesktop) rememberKeyed(scope string, k keyedNote) {
+	if _, ok := d.keyed[scope]; !ok && len(d.keyed) >= maxPending {
+		oldest := ""
+		for s, o := range d.keyed {
+			if oldest == "" || o.shown.Before(d.keyed[oldest].shown) {
+				oldest = s
+			}
+		}
+		delete(d.keyed, oldest)
+	}
+	if d.keyed == nil {
+		d.keyed = map[string]keyedNote{}
+	}
+	d.keyed[scope] = k
+}
+
 // ownerChanged records that [owner] now holds the service: questions an
 // earlier one showed can no longer be answered, and what it supports is
 // asked again. d.mu is held.
@@ -349,6 +431,16 @@ func (d *dbusDesktop) ownerChanged(owner string) {
 		case owner:
 		default:
 			delete(d.pending, nid)
+		}
+	}
+	for scope, k := range d.keyed {
+		switch k.owner {
+		case "":
+			k.owner = owner
+			d.keyed[scope] = k
+		case owner:
+		default:
+			delete(d.keyed, scope)
 		}
 	}
 }
@@ -397,6 +489,15 @@ func (d *dbusDesktop) signal(gen uint64, sig *dbus.Signal) {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if !invoked && gen == d.gen {
+		// A closed ID may be reused for another notification, perhaps
+		// another program's, which a keyed message must not replace.
+		for scope, k := range d.keyed {
+			if k.nid == nid && k.owner == sig.Sender {
+				delete(d.keyed, scope)
+			}
+		}
+	}
 	q, found := d.pending[nid]
 	if gen != d.gen || !found || sig.Sender != q.owner {
 		return
@@ -434,6 +535,10 @@ func (d *dbusDesktop) signal(gen uint64, sig *dbus.Signal) {
 		return
 	}
 	delete(d.pending, nid)
+	if d.answering == nil {
+		d.answering = map[uint32]uint64{}
+	}
+	d.answering[nid] = q.gen
 	// The server counts an answer it takes as opening the message, but one
 	// that expired here never reaches it; reporting every answer is simpler
 	// than telling them apart, and the server ignores a repeat.
@@ -460,6 +565,13 @@ func (d *dbusDesktop) opened(q question, link string) {
 func (d *dbusDesktop) showOutcome(nid uint32, q question, outcome string) {
 	d.showMu.Lock()
 	defer d.showMu.Unlock()
+	defer func() {
+		d.mu.Lock()
+		if g, ok := d.answering[nid]; ok && g == q.gen {
+			delete(d.answering, nid)
+		}
+		d.mu.Unlock()
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), dbusTimeout)
 	defer cancel()
 	if err := d.outcomeOnce(ctx, nid, q, outcome); !departed(err) {
@@ -498,8 +610,17 @@ func (d *dbusDesktop) outcomeOnce(ctx context.Context, nid uint32, q question, o
 	}
 	// Quiet: it answers a click.
 	hints := map[string]dbus.Variant{"urgency": dbus.MakeVariant(urgencyNormal), "suppress-sound": dbus.MakeVariant(true)}
-	return obj.CallWithContext(ctx, notificationsInterface+".Notify", 0,
-		"notifier", replaces, "", dropNUL(outcome), body, []string{}, hints, int32(-1)).Err
+	var id uint32
+	err := obj.CallWithContext(ctx, notificationsInterface+".Notify", 0,
+		"notifier", replaces, "", dropNUL(outcome), body, []string{}, hints, int32(-1)).Store(&id)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	// The next message with its key replaces the outcome, unless one came
+	// since the question.
+	if k, ok := d.keyed[q.scope]; err == nil && q.scope != "" && (!ok || k.id == q.id) && gen == d.gen {
+		d.rememberKeyed(q.scope, keyedNote{nid: id, id: q.id, shown: d.now(), owner: owner, gen: gen})
+	}
+	return err
 }
 
 // permanent tells a message the service refused (or that cannot be

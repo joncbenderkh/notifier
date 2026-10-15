@@ -49,7 +49,7 @@ type Question struct {
 
 // askCmd sends [args] (QUESTION [BODY | -]) with [options], then waits up
 // to [wait] for the first answer and prints it.
-func (c *cli) askCmd(args, to, channels, options []string, high *bool, wait time.Duration, anyone bool, l links) int {
+func (c *cli) askCmd(args, to, channels, options []string, high *bool, wait time.Duration, anyone bool, l links, replace string) int {
 	if wait < minAskWait || wait > maxAskWait {
 		fmt.Fprintf(c.stderr, "notify: --wait must be %s to %s\n", minAskWait, maxAskWait)
 		return exitUsage
@@ -61,7 +61,7 @@ func (c *cli) askCmd(args, to, channels, options []string, high *bool, wait time
 	key := make([]byte, replyKeyBytes)
 	rand.Read(key)
 	n, to := c.notification(args[0], to, channels, high)
-	n.URL = l.url
+	n.URL, n.Key = l.url, replace
 	n.Question = &Question{
 		Options:   options,
 		Key:       base64.StdEncoding.EncodeToString(key),

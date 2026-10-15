@@ -23,6 +23,9 @@ object Answers {
     // than wait past its broadcast's deadline.
     private val answering = ConcurrentHashMap.newKeySet<String>()
 
+    /** Whether the question [id] is being answered: its outcome is about to take its notification's place. */
+    fun isAnswering(id: String) = id in answering
+
     // What this process has settled, in case the history could not keep it.
     private val settled = ConcurrentHashMap<String, String>()
 
