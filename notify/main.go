@@ -196,14 +196,14 @@ func (c *cli) resolve(f settingsFlags, loadFile bool) int {
 // sendCmd sends [args] (TITLE [BODY | -]); [high] is nil unless --high was
 // given, so the config file's priority applies otherwise, and [waitSeen]
 // is nil unless --wait-seen was given.
-func (c *cli) sendCmd(args, to, channels []string, high *bool, receipts bool, waitSeen *time.Duration, l links) int {
+func (c *cli) sendCmd(args, to, channels []string, high *bool, receipts bool, waitSeen *time.Duration, l links, replace string) int {
 	if waitSeen != nil && (*waitSeen < minAskWait || *waitSeen > maxAskWait) {
 		fmt.Fprintf(c.stderr, "notify: --wait-seen must be %s to %s\n", minAskWait, maxAskWait)
 		return exitUsage
 	}
 	n, to := c.notification(args[0], to, channels, high)
 	n.Receipts = receipts || waitSeen != nil
-	n.URL, n.Actions = l.url, l.actions
+	n.URL, n.Actions, n.Key = l.url, l.actions, replace
 	client, result, code := c.deliver(n, to, args[1:], c.stdout, true)
 	id := result.ID
 	if id == "" || !n.Receipts {
@@ -256,6 +256,18 @@ func (c *cli) links(link string, actions []string) (links, bool) {
 		l.actions = append(l.actions, Action{Label: label, URL: target})
 	}
 	return l, true
+}
+
+// notificationKey is what the server accepts as a notification key.
+var notificationKey = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,64}$`)
+
+// validKey checks --replace; empty means none.
+func (c *cli) validKey(key string) bool {
+	if key == "" || notificationKey.MatchString(key) {
+		return true
+	}
+	fmt.Fprintf(c.stderr, "notify: --replace %q must be 1 to 64 letters, digits, '.', '_', ':' or '-'\n", key)
+	return false
 }
 
 func webURL(s string) bool {

@@ -143,6 +143,34 @@ func TestRefusesBadLinks(t *testing.T) {
 	}
 }
 
+func TestSendsKey(t *testing.T) {
+	f := newFakeServer(t)
+	if code, _, stderr := f.run("", "send", "--replace", "disk-usage:var", "Disk 91% full"); code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	want := Notification{Title: "Disk 91% full", Key: "disk-usage:var"}
+	if len(f.got) != 1 || !equal(f.got[0], want) {
+		t.Fatalf("sent %+v, want %+v", f.got, want)
+	}
+}
+
+func TestRefusesBadKeys(t *testing.T) {
+	f := newFakeServer(t)
+	for _, args := range [][]string{
+		{"send", "--replace", "disk usage", "x"},
+		{"send", "--replace", "a/b", "x"},
+		{"send", "--replace", strings.Repeat("k", 65), "x"},
+		{"ask", "-o", "yes", "--replace", "é", "x"},
+	} {
+		if code, _, stderr := f.run("", args...); code != exitUsage || !strings.Contains(stderr, "--replace") {
+			t.Errorf("%v: exit %d, stderr %q", args, code, stderr)
+		}
+	}
+	if len(f.got) != 0 {
+		t.Fatalf("sent %+v", f.got)
+	}
+}
+
 func TestSendsToAllPhonesByDefault(t *testing.T) {
 	f := newFakeServer(t)
 	if code, _, stderr := f.run("", "send", "Hello"); code != 0 {

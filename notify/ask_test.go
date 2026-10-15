@@ -149,6 +149,16 @@ func TestAskPrintsTheAnswer(t *testing.T) {
 	}
 }
 
+func TestAskSendsItsKey(t *testing.T) {
+	s := newAskServer(t, "yes")
+	if code, _, stderr := s.run("ask", "-o", "yes", "--replace", "deploy", "Deploy?"); code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	if s.asked[0].Key != "deploy" {
+		t.Fatalf("key %q", s.asked[0].Key)
+	}
+}
+
 func TestAskExitsFourWhenUnanswered(t *testing.T) {
 	s := newAskServer(t, "yes")
 	s.expired = true

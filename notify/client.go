@@ -40,6 +40,7 @@ type Notification struct {
 	Receipts  bool      `json:"receipts,omitempty"`
 	URL       string    `json:"url,omitempty"`
 	Actions   []Action  `json:"actions,omitempty"`
+	Key       string    `json:"key,omitempty"`
 }
 
 // Action is a button that opens its URL.
