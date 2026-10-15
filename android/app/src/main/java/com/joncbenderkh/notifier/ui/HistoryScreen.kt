@@ -45,6 +45,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -65,6 +66,7 @@ fun HistoryScreen(
     onClear: () -> Unit,
     answering: Set<String>,
     onAnswer: (HistoryEntry, String) -> Unit,
+    onOpen: (HistoryEntry) -> Unit,
 ) {
     BackHandler(onBack = onBack)
     var confirmClear by rememberSaveable { mutableStateOf(false) }
@@ -131,7 +133,7 @@ fun HistoryScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
-                items(entries, key = { it.id }) { HistoryCard(it, onDelete, it.id in answering, onAnswer) }
+                items(entries, key = { it.id }) { HistoryCard(it, onDelete, it.id in answering, onAnswer, onOpen) }
             }
         }
     }
@@ -173,6 +175,7 @@ private fun HistoryCard(
     onDelete: (String) -> Unit,
     answering: Boolean,
     onAnswer: (HistoryEntry, String) -> Unit,
+    onOpen: (HistoryEntry) -> Unit,
 ) {
     var expanded by rememberSaveable(entry.id) { mutableStateOf(false) }
     var overflows by remember(entry.id) { mutableStateOf(false) }
@@ -183,8 +186,16 @@ private fun HistoryCard(
     val channel = entry.channel?.takeIf { entry.channelId?.let(ChannelRoute::isDefaultChannel) == false }
     val high = entry.priority == "high"
 
+    // Tapping a card reads it, as "Read message" does: it expands a long
+    // message, and tells a sender who asked for receipts it was opened.
     Card(
-        Modifier.fillMaxWidth(),
+        Modifier
+            .fillMaxWidth()
+            .clip(CardDefaults.shape)
+            .clickable(onClickLabel = if (expanded) "Collapse" else "Read message") {
+                if (!expanded) onOpen(entry)
+                if (expanded || overflows) expanded = !expanded
+            },
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLowest),
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
     ) {
@@ -243,7 +254,10 @@ private fun HistoryCard(
                         color = MaterialTheme.colorScheme.primary,
                         modifier = Modifier
                             .padding(top = 4.dp)
-                            .clickable(onClickLabel = if (expanded) "Collapse" else "Read message") { expanded = !expanded }
+                            .clickable(onClickLabel = if (expanded) "Collapse" else "Read message") {
+                                if (!expanded) onOpen(entry)
+                                expanded = !expanded
+                            }
                             .padding(vertical = 8.dp, horizontal = 0.dp),
                     )
                 }

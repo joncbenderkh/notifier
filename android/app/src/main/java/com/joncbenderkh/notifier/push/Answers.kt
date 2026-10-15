@@ -39,14 +39,15 @@ object Answers {
 
     /**
      * Answers the question [id] with [option], as [deviceId], and shows the
-     * outcome in place of its notification if that is still showing. Blocks;
-     * null if the question is being answered already.
+     * outcome in place of its notification if that is still showing.
+     * [receipts] if its sender asked for them. Blocks; null if the question
+     * is being answered already.
      */
-    fun send(context: Context, id: String, reply: Reply, option: String, deviceId: String): ReplyOutcome? {
+    fun send(context: Context, id: String, reply: Reply, option: String, deviceId: String, receipts: Boolean): ReplyOutcome? {
         if (!answering.add(id)) return null
         try {
             val known = settled(context, id)
-            val outcome = if (known != null) ReplyOutcome(known, true) else attempt(context, id, reply, option, deviceId)
+            val outcome = if (known != null) ReplyOutcome(known, true) else attempt(context, id, reply, option, deviceId, receipts)
             if (outcome.final && known == null) {
                 settled[id] = outcome.text
                 try {
@@ -55,16 +56,21 @@ object Answers {
                     Log.w(TAG, "could not record the answer in the history", e)
                 }
             }
-            Notifications.showOutcome(context, id, outcome.text, (reply to deviceId).takeUnless { outcome.final })
+            Notifications.showOutcome(context, id, outcome.text, (reply to deviceId).takeUnless { outcome.final }, receipts)
             return outcome
         } finally {
             answering.remove(id)
         }
     }
 
-    private fun attempt(context: Context, id: String, reply: Reply, option: String, deviceId: String): ReplyOutcome {
+    private fun attempt(context: Context, id: String, reply: Reply, option: String, deviceId: String, receipts: Boolean): ReplyOutcome {
         if (option !in reply.options) return ReplyOutcome.failed("\"$option\" is not one of the answers")
-        if (System.currentTimeMillis() / 1000 >= reply.expiresAt) return ReplyOutcome.EXPIRED
+        if (System.currentTimeMillis() / 1000 >= reply.expiresAt) {
+            // Too late to answer, but tapping an answer opened the message.
+            // Here, not later: this thread holds the broadcast open.
+            if (receipts) Receipts.report(context, id, Receipts.OPENED, deviceId)
+            return ReplyOutcome.EXPIRED
+        }
         val pairing = try {
             PairingStore(context).load()
         } catch (e: Exception) {

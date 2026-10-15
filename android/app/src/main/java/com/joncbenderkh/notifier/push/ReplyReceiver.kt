@@ -21,10 +21,11 @@ class ReplyReceiver : BroadcastReceiver() {
         val key = intent.getStringExtra(EXTRA_KEY) ?: return
         val deviceId = intent.getStringExtra(EXTRA_DEVICE_ID) ?: return
         val reply = Reply(options, key, intent.getLongExtra(EXTRA_EXPIRES_AT, 0))
+        val receipts = intent.getBooleanExtra(EXTRA_RECEIPTS, false)
         val result = goAsync()
         thread(name = "reply") {
             try {
-                Answers.send(context.applicationContext, id, reply, option, deviceId)
+                Answers.send(context.applicationContext, id, reply, option, deviceId, receipts)
             } finally {
                 result.finish()
             }
@@ -39,9 +40,13 @@ class ReplyReceiver : BroadcastReceiver() {
         private const val EXTRA_KEY = "key"
         private const val EXTRA_EXPIRES_AT = "expires_at"
         private const val EXTRA_DEVICE_ID = "device_id"
+        private const val EXTRA_RECEIPTS = "receipts"
 
-        /** The button for answer [index] to message [id]'s question, received as [deviceId]. */
-        fun intent(context: Context, id: String, reply: Reply, index: Int, deviceId: String): PendingIntent {
+        /**
+         * The button for answer [index] to message [id]'s question, received
+         * as [deviceId]; [receipts] if its sender asked for them.
+         */
+        fun intent(context: Context, id: String, reply: Reply, index: Int, deviceId: String, receipts: Boolean): PendingIntent {
             val intent = Intent(context, ReplyReceiver::class.java)
                 // Tells each message's buttons apart: Android matches cached
                 // intents by their data, not their extras.
@@ -52,6 +57,7 @@ class ReplyReceiver : BroadcastReceiver() {
                 .putExtra(EXTRA_KEY, reply.key)
                 .putExtra(EXTRA_EXPIRES_AT, reply.expiresAt)
                 .putExtra(EXTRA_DEVICE_ID, deviceId)
+                .putExtra(EXTRA_RECEIPTS, receipts)
             return PendingIntent.getBroadcast(
                 context,
                 index,

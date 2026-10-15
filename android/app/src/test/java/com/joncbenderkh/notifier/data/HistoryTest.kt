@@ -38,6 +38,14 @@ class HistoryTest {
     }
 
     @Test
+    fun remembersThatTheSenderAskedForReceipts() {
+        val tracked = HistoryEntry.of(Payload("msg_r", "Disk", sentAt = now, receipts = true), receivedAt = now)
+        assertEquals(true, tracked.receipts)
+        val history = History().add(tracked, now).add(entry("plain"), now)
+        assertEquals(listOf(false, true), History.decode(history.encode()).entries.map { it.receipts })
+    }
+
+    @Test
     fun recordsWhatBecameOfAnAnswer() {
         val reply = Reply(listOf("yes", "no"), "key", now + 600)
         val question = HistoryEntry.of(Payload("msg_q", "Deploy?", sentAt = now, reply = reply), receivedAt = now)

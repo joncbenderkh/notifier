@@ -22,6 +22,8 @@ data class HistoryEntry(
     val reply: Reply? = null,
     /** What became of this phone's answer ("Answered: yes", "Already answered"), once settled. */
     val outcome: String? = null,
+    /** Whether the sender asked to know when it is opened. */
+    val receipts: Boolean = false,
 ) {
     companion object {
         fun of(payload: Payload, receivedAt: Long) = HistoryEntry(
@@ -34,6 +36,7 @@ data class HistoryEntry(
             payload.channel,
             payload.channelId,
             payload.reply,
+            receipts = payload.receipts,
         )
     }
 }

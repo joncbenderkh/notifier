@@ -19,6 +19,7 @@ import com.joncbenderkh.notifier.data.ServerException
 import com.joncbenderkh.notifier.push.Answers
 import com.joncbenderkh.notifier.push.ChannelRoute
 import com.joncbenderkh.notifier.push.Notifications
+import com.joncbenderkh.notifier.push.Receipts
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -97,6 +98,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun clearHistory() = editHistory("History cleared.") { historyStore.clear() }
 
+    /** Tells the sender of [entry], if they asked for receipts, that it was opened. */
+    fun opened(entry: HistoryEntry) {
+        // The pairing it was received under: the history belongs to it.
+        val deviceId = _state.value.pairing?.deviceId ?: return
+        if (entry.receipts) Receipts.reportLater(getApplication(), entry.id, Receipts.OPENED, deviceId)
+    }
+
     /** Answers [entry]'s question with [option], and says what became of it. */
     fun answer(entry: HistoryEntry, option: String) {
         val reply = entry.reply ?: return
@@ -104,7 +112,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (entry.id in _state.value.answering) return
         _state.update { it.copy(answering = it.answering + entry.id) }
         viewModelScope.launch {
-            val outcome = withContext(Dispatchers.IO) { Answers.send(getApplication(), entry.id, reply, option, deviceId) }
+            val outcome = withContext(Dispatchers.IO) { Answers.send(getApplication(), entry.id, reply, option, deviceId, entry.receipts) }
             _state.update { it.copy(answering = it.answering - entry.id).say(outcome?.text) }
         }
     }

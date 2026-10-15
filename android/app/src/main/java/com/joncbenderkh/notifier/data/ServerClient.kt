@@ -42,6 +42,9 @@ private data class ErrorResponse(val error: String)
 data class DeviceChannel(val id: String, val name: String, val subscribed: Boolean = false)
 
 @Serializable
+private data class ReceiptRequest(@SerialName("message_id") val messageId: String, val state: String)
+
+@Serializable
 private data class SetChannelsRequest(@SerialName("channel_ids") val channelIds: List<String>)
 
 @Serializable
@@ -91,6 +94,12 @@ class ServerClient(private val http: OkHttpClient = sharedClient) {
     fun reply(pairing: Pairing, messageId: String, reply: SealedReply) {
         val body = json.encodeToString(reply).toRequestBody(jsonType)
         execute(authorized(pairing, "v1/replies", messageId).post(body))
+    }
+
+    /** Reports that this device showed or opened [messageId], sent with receipts. */
+    fun receipt(pairing: Pairing, messageId: String, state: String) {
+        val body = json.encodeToString(ReceiptRequest(messageId, state)).toRequestBody(jsonType)
+        execute(authorized(pairing, "v1/device/receipts").post(body))
     }
 
     private fun authorized(pairing: Pairing, path: String, segment: String? = null): Request.Builder =
