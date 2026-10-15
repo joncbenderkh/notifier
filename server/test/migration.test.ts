@@ -61,6 +61,9 @@ describe("0002_users", () => {
       replies: () => {
         throw new Error("no questions here");
       },
+      receipts: () => {
+        throw new Error("no receipts here");
+      },
       now: () => 1_790_000_000,
     });
     const req = (path: string, token: string, method = "GET") =>

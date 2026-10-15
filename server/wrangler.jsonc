@@ -27,15 +27,18 @@
   ],
   // DEVICE_STREAM: one per WebSocket-transport device (src/stream.ts), its
   // socket and queue. REPLY_BOX: one per question (src/replies.ts), its answer.
+  // RECEIPT_BOX: one per message sent with receipts (src/receipts.ts).
   "durable_objects": {
     "bindings": [
       { "name": "DEVICE_STREAM", "class_name": "DeviceStream" },
-      { "name": "REPLY_BOX", "class_name": "ReplyBox" }
+      { "name": "REPLY_BOX", "class_name": "ReplyBox" },
+      { "name": "RECEIPT_BOX", "class_name": "ReceiptBox" }
     ]
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["DeviceStream"] },
-    { "tag": "v2", "new_sqlite_classes": ["ReplyBox"] }
+    { "tag": "v2", "new_sqlite_classes": ["ReplyBox"] },
+    { "tag": "v3", "new_sqlite_classes": ["ReceiptBox"] }
   ],
   "d1_databases": [
     {

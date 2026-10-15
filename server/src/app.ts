@@ -40,6 +40,7 @@ import {
   sealedDataBytes,
 } from "./publish";
 import type { Target } from "./publish";
+import type { ReceiptBook, ReceiptState, Recipient } from "./receipts";
 import type { Replies, Responder } from "./replies";
 import type { Stream } from "./stream";
 import { newSealKey } from "./seal";
@@ -84,6 +85,8 @@ export interface Deps {
   stream: (env: Env, deviceId: string) => Stream;
   /** The Durable Object holding a question's answer. */
   replies: (env: Env, messageId: string) => Replies;
+  /** The Durable Object holding a tracked message's receipts. */
+  receipts: (env: Env, messageId: string) => ReceiptBook;
   /** Unix seconds. */
   now: () => number;
 }
@@ -114,6 +117,8 @@ export interface Payload {
   channel_id?: string;
   /** Present for the devices that may answer a question. */
   reply?: { options: string[]; key: string; expires_at: number };
+  /** Set when the sender asked for receipts: the device reports when it shows and opens the message. */
+  receipts?: true;
 }
 
 export interface Delivery {
@@ -214,6 +219,17 @@ const REPLY_TAG_BYTES = 16;
 const MAX_REPLY_CIPHERTEXT_BYTES = 1024;
 const MESSAGE_ID = /^msg_[a-z2-7]{16}$/;
 const MAX_REPLY_WAIT_SECONDS = 50;
+/** What GET /v1/notifications/<id> answers for a message without receipts (`notify status` keys on it). */
+export const NO_RECEIPTS = "no receipts for this message";
+
+const RECEIPT_STATES: readonly ReceiptState[] = ["shown", "opened"];
+
+/** The `wait` query of a long poll: 0 to [MAX_REPLY_WAIT_SECONDS] seconds. */
+function waitSeconds(raw: string | undefined): number {
+  const wait = /^\d{1,2}$/.test(raw ?? "0") ? Number(raw ?? "0") : NaN;
+  if (!(wait <= MAX_REPLY_WAIT_SECONDS)) fail(400, `wait must be 0 to ${MAX_REPLY_WAIT_SECONDS} seconds`);
+  return wait;
+}
 
 interface QuestionRequest {
   options: string[];
@@ -944,7 +960,8 @@ export function createApp(deps: Deps): Hono<AppEnv> {
       device_ids: string[];
       channels: string[];
       question: unknown;
-    }>(c, ["title", "body", "priority", "device_ids", "channels", "question"]);
+      receipts: boolean;
+    }>(c, ["title", "body", "priority", "device_ids", "channels", "question", "receipts"]);
     const title = typeof req.title === "string" ? req.title : "";
     const body = typeof req.body === "string" ? req.body : "";
     if (title.trim() === "") fail(400, "title is required");
@@ -957,6 +974,7 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     const priority =
       req.priority === undefined || req.priority === null || req.priority === "" ? "default" : req.priority;
     if (priority !== "default" && priority !== "high") fail(400, 'priority must be "default" or "high"');
+    if (req.receipts !== undefined && typeof req.receipts !== "boolean") fail(400, "receipts must be a boolean");
     const ids = stringList(req.device_ids, "device_ids");
     let names = channelNames(req.channels);
     const scope = c.get("keyScope");
@@ -982,6 +1000,15 @@ export function createApp(deps: Deps): Hono<AppEnv> {
 
     const base: Payload = { id: newId("msg_"), title, priority, sent_at: deps.now() };
     if (body !== "") base.body = body;
+    let openReceipts: (() => Promise<void>) | undefined;
+    if (req.receipts === true) {
+      base.receipts = true;
+      const recipients: Recipient[] = [...targets.values()].map(({ device: d }) =>
+        d.user_id === userId ? { device_id: d.id, name: d.name, own: true } : { device_id: d.id, own: false },
+      );
+      const tracked = { userId, expiresAt: deps.now() + MESSAGE_TTL_SECONDS, recipients };
+      openReceipts = () => deps.receipts(c.env, base.id).open(tracked, deps.now());
+    }
     let extra: ((t: Target) => Partial<Payload>) | undefined;
     let openBox: (() => Promise<void>) | undefined;
     const question = parseQuestion(req.question);
@@ -1013,6 +1040,7 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     if (tooLarge) fail(400, "title and body are too long once encoded for a phone (at most 4 KiB); shorten them");
     // Opened before publishing, so an answer that comes back at once finds it.
     await openBox?.();
+    await openReceipts?.();
     const { deliveries, members } = await publish(c.env, userId, targets.values(), base, extra);
     return c.json({ id: base.id, deliveries, ...(Object.keys(members).length > 0 ? { members } : {}) });
   });
@@ -1027,6 +1055,14 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     // At least the 16-byte tag and one byte, or a garbled answer could take the first slot.
     const ct = toBase64(base64Field(req.c, "c", REPLY_TAG_BYTES + 1, MAX_REPLY_CIPHERTEXT_BYTES));
     const result = await deps.replies(c.env, id).answer(c.get("device").id, n, ct, deps.now());
+    // Tapping an answer opens the message, even one answered already, or
+    // expired (its question's box may be gone, the receipts not yet). The
+    // receipt box takes only the message's recipients; a message sent
+    // without receipts has none.
+    await deps
+      .receipts(c.env, id)
+      .mark(c.get("device").id, "opened", deps.now())
+      .catch((err: unknown) => console.error("receipt after answer failed", id, err));
     if (result === "forbidden") fail(404, "not found");
     if (result === "answered") fail(409, "already answered");
     if (result === "expired") fail(410, "the question has expired");
@@ -1036,12 +1072,33 @@ export function createApp(deps: Deps): Hono<AppEnv> {
   // The asker long-polls for the answer, still sealed.
   app.get("/v1/replies/:id", userOrApiKey, async (c) => {
     const id = messageId(c.req.param("id"));
-    const raw = c.req.query("wait") ?? "0";
-    const wait = /^\d{1,2}$/.test(raw) ? Number(raw) : NaN;
-    if (!(wait <= MAX_REPLY_WAIT_SECONDS)) fail(400, `wait must be 0 to ${MAX_REPLY_WAIT_SECONDS} seconds`);
-    const state = await deps.replies(c.env, id).wait(c.get("userId"), wait, deps.now());
+    const state = await deps.replies(c.env, id).wait(c.get("userId"), waitSeconds(c.req.query("wait")), deps.now());
     if (state.status === "missing") fail(404, "not found");
     return c.json(state);
+  });
+
+  // --- receipts ---
+
+  // A device reports that it showed or opened a message sent with receipts.
+  app.post("/v1/device/receipts", device, async (c) => {
+    const req = await readJson<{ message_id: string; state: string }>(c, ["message_id", "state"]);
+    const id = messageId(typeof req.message_id === "string" ? req.message_id : "");
+    const state = RECEIPT_STATES.find((s) => s === req.state);
+    if (!state) fail(400, 'state must be "shown" or "opened"');
+    if (!(await deps.receipts(c.env, id).mark(c.get("device").id, state, deps.now()))) fail(404, "not found");
+    return c.body(null, 204);
+  });
+
+  // The sender reads a tracked message's receipts, waiting up to `wait` seconds for one to be opened.
+  app.get("/v1/notifications/:id", userOrApiKey, async (c) => {
+    const raw = c.req.param("id");
+    // A mistyped ID has no receipts either: the client explains NO_RECEIPTS.
+    if (!MESSAGE_ID.test(raw)) fail(404, NO_RECEIPTS);
+    const id = raw;
+    const receipts = await deps.receipts(c.env, id).wait(c.get("userId"), waitSeconds(c.req.query("wait")));
+    // Not the generic "not found", so a client can tell it from a missing route.
+    if (receipts.status === "missing") fail(404, NO_RECEIPTS);
+    return c.json({ id, ...receipts });
   });
 
   app.notFound((c) => c.json({ error: "not found" }, 404));
