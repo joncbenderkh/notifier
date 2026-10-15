@@ -28,6 +28,8 @@ data class Payload(
     val url: String? = null,
     /** Buttons, each opening its own link; never sent with a question. */
     val actions: List<LinkAction> = emptyList(),
+    /** Replaces the notification last shown with the same key from the same channel. */
+    val key: String? = null,
 )
 
 /** A button that opens [url]; one another server sends incomplete is skipped, not the message. */

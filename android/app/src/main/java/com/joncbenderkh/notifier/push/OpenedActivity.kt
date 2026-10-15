@@ -6,7 +6,6 @@ import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.os.Bundle
-import androidx.core.app.NotificationManagerCompat
 import androidx.core.net.toUri
 import com.joncbenderkh.notifier.MainActivity
 import com.joncbenderkh.notifier.data.Links
@@ -26,7 +25,7 @@ class OpenedActivity : Activity() {
         val deviceId = intent.getStringExtra(EXTRA_DEVICE_ID)
         if (id != null && deviceId != null) Receipts.reportLater(this, id, Receipts.OPENED, deviceId)
         // A button leaves its notification showing; the tap on it does not.
-        intent.getStringExtra(EXTRA_DISMISS)?.let { NotificationManagerCompat.from(this).cancel(it, 0) }
+        intent.getStringExtra(EXTRA_DISMISS)?.let { Notifications.cancel(this, it) }
         val link = intent.getStringExtra(EXTRA_URL)
         if (link == null || !view(this, link)) {
             startActivity(

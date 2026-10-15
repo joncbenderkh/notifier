@@ -31,6 +31,27 @@ object Notifications {
     /** The question's title, kept on its notification while the title shows an outcome. */
     private const val EXTRA_QUESTION = "com.joncbenderkh.notifier.QUESTION"
 
+    /** The message a notification shows, whose ID its tag is not when it has a key (see [NotificationTag]). */
+    private const val EXTRA_MESSAGE_ID = "com.joncbenderkh.notifier.SHOWN_MESSAGE_ID"
+
+    /** Guards each lookup of a notification and the post that follows it, and [showing]. */
+    private val lock = Any()
+
+    /**
+     * The message and send time each keyed tag last showed in this
+     * process: Android posts asynchronously, so its active list can still
+     * show the message just replaced.
+     */
+    private val showing = object : LinkedHashMap<String, Pair<String, Long>>() {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Pair<String, Long>>) = size > MAX_SHOWING
+    }
+    private const val MAX_SHOWING = 100
+
+    /** Keyed messages another replaced in this process: a repeated delivery of one must not return. */
+    private val replaced = object : LinkedHashMap<String, Unit>() {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Unit>) = size > MAX_SHOWING
+    }
+
     private const val POSTED_CHECKS = 10
     private const val POSTED_PAUSE_MS = 100L
 
@@ -52,7 +73,8 @@ object Notifications {
      * Shows [payload], received as [deviceId], with a button for each answer
      * it may give; once [outcome] settles the question, that outcome instead,
      * quietly, as [showOutcome] left it. False when the user does not let
-     * it show; Android can still drop it (see [posted]).
+     * it show, or a newer message with its key shows; Android can still
+     * drop it (see [posted]).
      */
     fun show(context: Context, payload: Payload, deviceId: String, outcome: String?): Boolean {
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
@@ -81,9 +103,14 @@ object Notifications {
             .setShowWhen(true)
             .setContentIntent(open(context, payload, deviceId, Links.web(payload.url), "notifier-open"))
             .setAutoCancel(true)
-            .addExtras(Bundle().apply { putString(EXTRA_QUESTION, payload.title) })
+            .addExtras(
+                Bundle().apply {
+                    putString(EXTRA_QUESTION, payload.title)
+                    putString(EXTRA_MESSAGE_ID, payload.id)
+                },
+            )
         val reply = payload.reply?.takeUnless { text.settled }
-        if (reply != null) addAnswers(context, builder, payload.id, reply, deviceId, payload.receipts)
+        val answers = reply != null && addAnswers(context, builder, payload.id, reply, deviceId, payload.receipts)
         // The server sends none with a question, whose answers are the buttons.
         if (payload.reply == null) {
             payload.actions.forEachIndexed { i, action ->
@@ -93,8 +120,32 @@ object Notifications {
                 builder.addAction(0, "${action.label} · ${Links.host(link)}", open(context, payload, deviceId, link, "notifier-link", "/$i"))
             }
         }
-        NotificationManagerCompat.from(context).notify(payload.id, 0, builder.build())
-        return allowed(context, channelId)
+        val manager = NotificationManagerCompat.from(context)
+        val shows = allowed(context, channelId)
+        var tag = NotificationTag.of(payload, deviceId)
+        synchronized(lock) {
+            if (tag != payload.id) {
+                val shown = manager.activeNotifications.firstOrNull { it.tag == tag && it.id == 0 }?.notification
+                val current = showing[tag]?.first ?: shown?.extras?.getString(EXTRA_MESSAGE_ID)
+                val shownAt = showing[tag]?.second ?: shown?.`when`
+                // FCM may deliver out of order, or twice: an older message
+                // keeps out of a newer one's place.
+                if (payload.id in replaced) return false
+                if (shownAt != null && NotificationTag.newer(shownAt, payload.sentAt)) return false
+                if (current != null && current != payload.id && Answers.isAnswering(current)) {
+                    // Its outcome is about to take its place: this one shows apart.
+                    tag = payload.id
+                } else if (shows) {
+                    // Android drops a post to a channel the user turned off,
+                    // and what shows under the tag stays the one to update.
+                    if (current != null && current != payload.id) replaced[current] = Unit
+                    showing[tag] = payload.id to payload.sentAt * 1000
+                }
+            }
+            manager.notify(tag, 0, builder.build())
+        }
+        if (answers && reply != null) expireAt(context, payload.id, reply)
+        return shows
     }
 
     /**
@@ -105,10 +156,26 @@ object Notifications {
     fun posted(context: Context, id: String): Boolean {
         val manager = NotificationManagerCompat.from(context)
         repeat(POSTED_CHECKS) {
-            if (manager.activeNotifications.any { it.tag == id && it.id == 0 }) return true
+            if (synchronized(lock) { active(manager, id) } != null) return true
             Thread.sleep(POSTED_PAUSE_MS)
         }
         return false
+    }
+
+    /**
+     * Message [id]'s notification, if showing: not once a message with the
+     * same key replaced it, even before Android lists the replacement.
+     * Called holding [lock].
+     */
+    private fun active(manager: NotificationManagerCompat, id: String) =
+        manager.activeNotifications.firstOrNull {
+            it.id == 0 && (it.notification.extras.getString(EXTRA_MESSAGE_ID) ?: it.tag) == id
+        }?.takeIf { showing[it.tag]?.first.let { shown -> shown == null || shown == id } }
+
+    /** Removes message [id]'s notification, if it is still showing. */
+    fun cancel(context: Context, id: String) {
+        val manager = NotificationManagerCompat.from(context)
+        synchronized(lock) { active(manager, id)?.let { manager.cancel(it.tag, 0) } }
     }
 
     /** Whether notifications in [channelId] reach the user: not turned off for the app, the channel or its group. */
@@ -121,12 +188,17 @@ object Notifications {
         return Build.VERSION.SDK_INT < Build.VERSION_CODES.P || manager.getNotificationChannelGroup(group)?.isBlocked != true
     }
 
-    /** Adds a button per answer, and has them removed when the question expires. */
-    private fun addAnswers(context: Context, builder: NotificationCompat.Builder, id: String, reply: Reply, deviceId: String, receipts: Boolean) {
-        if (System.currentTimeMillis() / 1000 >= reply.expiresAt) return
+    /** Adds a button per answer, unless the question has expired; true if it did. */
+    private fun addAnswers(context: Context, builder: NotificationCompat.Builder, id: String, reply: Reply, deviceId: String, receipts: Boolean): Boolean {
+        if (System.currentTimeMillis() / 1000 >= reply.expiresAt) return false
         reply.options.forEachIndexed { i, option ->
             builder.addAction(0, option, ReplyReceiver.intent(context, id, reply, i, deviceId, receipts))
         }
+        return true
+    }
+
+    /** Has the answer buttons of question [id], once posted, removed when it expires. */
+    private fun expireAt(context: Context, id: String, reply: Reply) {
         // Inexact: the buttons may outlive the question a little, and a tap
         // then says it expired.
         context.getSystemService(AlarmManager::class.java)
@@ -139,13 +211,15 @@ object Notifications {
             PackageManager.PERMISSION_GRANTED
         ) return
         val manager = NotificationManagerCompat.from(context)
-        val shown = manager.activeNotifications.firstOrNull { it.tag == id && it.id == 0 } ?: return
-        if (shown.notification.actions.isNullOrEmpty()) return
-        val notification = Notification.Builder.recoverBuilder(context, shown.notification)
-            .setActions()
-            .setOnlyAlertOnce(true)
-            .build()
-        manager.notify(id, 0, notification)
+        synchronized(lock) {
+            val shown = active(manager, id) ?: return
+            if (shown.notification.actions.isNullOrEmpty()) return
+            val notification = Notification.Builder.recoverBuilder(context, shown.notification)
+                .setActions()
+                .setOnlyAlertOnce(true)
+                .build()
+            manager.notify(shown.tag, 0, notification)
+        }
     }
 
     /**
@@ -159,23 +233,31 @@ object Notifications {
             PackageManager.PERMISSION_GRANTED
         ) return
         val manager = NotificationManagerCompat.from(context)
-        val shown = manager.activeNotifications.firstOrNull { it.tag == id && it.id == 0 } ?: return
-        val extras = shown.notification.extras
-        val question = extras.getString(EXTRA_QUESTION) ?: extras.getCharSequence(NotificationCompat.EXTRA_TITLE)?.toString()
-        val builder = NotificationCompat.Builder(context, shown.notification.channelId)
-            .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(outcome)
-            .setContentText(question)
-            .addExtras(Bundle().apply { putString(EXTRA_QUESTION, question) })
-            .setSubText(shown.notification.extras.getCharSequence(NotificationCompat.EXTRA_SUB_TEXT))
-            .setWhen(shown.notification.`when`)
-            .setShowWhen(true)
-            .setSilent(true)
-            // The tap still reports a message sent with receipts opened.
-            .setContentIntent(shown.notification.contentIntent ?: openHistory(context))
-            .setAutoCancel(true)
-        if (retry != null) addAnswers(context, builder, id, retry.first, retry.second, receipts)
-        manager.notify(id, 0, builder.build())
+        synchronized(lock) {
+            val shown = active(manager, id) ?: return
+            val extras = shown.notification.extras
+            val question = extras.getString(EXTRA_QUESTION) ?: extras.getCharSequence(NotificationCompat.EXTRA_TITLE)?.toString()
+            val builder = NotificationCompat.Builder(context, shown.notification.channelId)
+                .setSmallIcon(R.drawable.ic_notification)
+                .setContentTitle(outcome)
+                .setContentText(question)
+                .addExtras(
+                    Bundle().apply {
+                        putString(EXTRA_QUESTION, question)
+                        putString(EXTRA_MESSAGE_ID, id)
+                    },
+                )
+                .setSubText(shown.notification.extras.getCharSequence(NotificationCompat.EXTRA_SUB_TEXT))
+                .setWhen(shown.notification.`when`)
+                .setShowWhen(true)
+                .setSilent(true)
+                // The tap still reports a message sent with receipts opened.
+                .setContentIntent(shown.notification.contentIntent ?: openHistory(context))
+                .setAutoCancel(true)
+            val answers = retry != null && addAnswers(context, builder, id, retry.first, retry.second, receipts)
+            manager.notify(shown.tag, 0, builder.build())
+            if (answers && retry != null) expireAt(context, id, retry.first)
+        }
     }
 
     /**
