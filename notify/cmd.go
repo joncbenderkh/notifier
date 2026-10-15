@@ -69,6 +69,8 @@ func newRoot(c *cli) *cobra.Command {
 	var to, channels []string
 	var high, receipts bool
 	var waitSeen seenWait
+	var link string
+	var actions []string
 	send := &cobra.Command{
 		Use:   "send [flags] TITLE [BODY | -]",
 		Short: "Send a notification",
@@ -80,7 +82,8 @@ func newRoot(c *cli) *cobra.Command {
 			"starts with -.",
 		Example: "  notify send \"Backup done\" \"42 GB in 3 min\"\n" +
 			"  make 2>&1 | notify send --high -c builds \"Build failed\" -\n" +
-			"  notify send --high --wait-seen=5m \"Disk full\" || page-someone",
+			"  notify send --high --wait-seen=5m \"Disk full\" || page-someone\n" +
+			"  notify send --link \"$RUN_URL\" --action \"Logs=$RUN_URL/logs\" \"Build failed\"",
 		Args:        cobra.RangeArgs(1, 2),
 		Annotations: map[string]string{flagsEndAtArgs: "yes"},
 	}
@@ -99,7 +102,11 @@ func newRoot(c *cli) *cobra.Command {
 				return exitUsage
 			}
 		}
-		return c.sendCmd(args, splitList(to), splitList(channels), h, receipts, w)
+		l, ok := c.links(link, actions)
+		if !ok {
+			return exitUsage
+		}
+		return c.sendCmd(args, splitList(to), splitList(channels), h, receipts, w, l)
 	})
 	send.Flags().SetInterspersed(false)
 	send.Flags().StringArrayVar(&to, "to", nil, "device `name or ID` to notify; repeatable or comma-separated")
@@ -108,10 +115,13 @@ func newRoot(c *cli) *cobra.Command {
 	send.Flags().BoolVar(&receipts, "receipts", false, "ask devices to report when they show and open it, and print its ID for notify status")
 	send.Flags().Var(&waitSeen, "wait-seen", "wait up to `duration` (10s to 24h) until a device opens it, and exit 4 if none does; implies --receipts")
 	send.Flags().Lookup("wait-seen").NoOptDefVal = bareSeenWait
+	send.Flags().StringVar(&link, "link", "", "http(s) `URL` that tapping the notification opens (empty: none)")
+	send.Flags().StringArrayVar(&actions, "action", nil, "button that opens a link, as `LABEL=URL`; repeatable, at most 3")
 
 	var askTo, askChannels, options []string
 	var askHigh, anyone bool
 	var wait time.Duration
+	var askLink string
 	ask := &cobra.Command{
 		Use:   "ask [flags] QUESTION [BODY | -]",
 		Short: "Ask a question and print the answer",
@@ -131,7 +141,11 @@ func newRoot(c *cli) *cobra.Command {
 		if ask.Flags().Changed("high") {
 			h = &askHigh
 		}
-		return c.askCmd(args, splitList(askTo), splitList(askChannels), splitList(options), h, wait, anyone)
+		l, ok := c.links(askLink, nil)
+		if !ok {
+			return exitUsage
+		}
+		return c.askCmd(args, splitList(askTo), splitList(askChannels), splitList(options), h, wait, anyone, l)
 	})
 	ask.Flags().SetInterspersed(false)
 	ask.Flags().StringArrayVarP(&options, "options", "o", nil, "the `answers` to offer, at most 3; repeatable or comma-separated")
@@ -140,6 +154,7 @@ func newRoot(c *cli) *cobra.Command {
 	ask.Flags().StringArrayVar(&askTo, "to", nil, "device `name or ID` to ask; repeatable or comma-separated")
 	ask.Flags().StringArrayVarP(&askChannels, "channel", "c", nil, "own `channel` to ask in; repeatable or comma-separated (default: the config file's, else default)")
 	ask.Flags().BoolVar(&askHigh, "high", false, "send as high priority (heads-up, may wake the phone)")
+	ask.Flags().StringVar(&askLink, "link", "", "http(s) `URL` that tapping the notification opens; the buttons answer")
 	_ = ask.MarkFlagRequired("options")
 
 	var force bool

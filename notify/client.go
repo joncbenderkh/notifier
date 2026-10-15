@@ -38,6 +38,14 @@ type Notification struct {
 	DeviceIDs []string  `json:"device_ids,omitempty"`
 	Question  *Question `json:"question,omitempty"`
 	Receipts  bool      `json:"receipts,omitempty"`
+	URL       string    `json:"url,omitempty"`
+	Actions   []Action  `json:"actions,omitempty"`
+}
+
+// Action is a button that opens its URL.
+type Action struct {
+	Label string `json:"label"`
+	URL   string `json:"url"`
 }
 
 type Delivery struct {

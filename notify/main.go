@@ -196,13 +196,14 @@ func (c *cli) resolve(f settingsFlags, loadFile bool) int {
 // sendCmd sends [args] (TITLE [BODY | -]); [high] is nil unless --high was
 // given, so the config file's priority applies otherwise, and [waitSeen]
 // is nil unless --wait-seen was given.
-func (c *cli) sendCmd(args, to, channels []string, high *bool, receipts bool, waitSeen *time.Duration) int {
+func (c *cli) sendCmd(args, to, channels []string, high *bool, receipts bool, waitSeen *time.Duration, l links) int {
 	if waitSeen != nil && (*waitSeen < minAskWait || *waitSeen > maxAskWait) {
 		fmt.Fprintf(c.stderr, "notify: --wait-seen must be %s to %s\n", minAskWait, maxAskWait)
 		return exitUsage
 	}
 	n, to := c.notification(args[0], to, channels, high)
 	n.Receipts = receipts || waitSeen != nil
+	n.URL, n.Actions = l.url, l.actions
 	client, result, code := c.deliver(n, to, args[1:], c.stdout, true)
 	id := result.ID
 	if id == "" || !n.Receipts {
@@ -223,6 +224,43 @@ func (c *cli) sendCmd(args, to, channels []string, high *bool, receipts bool, wa
 	// Whether it was seen is what the caller waits for, even when some
 	// devices could not be reached.
 	return c.awaitSeen(client, id, *waitSeen)
+}
+
+const maxActions = 3
+
+// links is what --link and --action add to a message.
+type links struct {
+	url     string
+	actions []Action
+}
+
+// links checks --link and each --action (LABEL=URL) and reports what is
+// wrong; the server checks the rest.
+func (c *cli) links(link string, actions []string) (links, bool) {
+	l := links{url: link}
+	if link != "" && !webURL(link) {
+		fmt.Fprintf(c.stderr, "notify: --link %q is not an http or https URL\n", link)
+		return l, false
+	}
+	if len(actions) > maxActions {
+		fmt.Fprintf(c.stderr, "notify: at most %d --action buttons\n", maxActions)
+		return l, false
+	}
+	for _, a := range actions {
+		label, target, found := strings.Cut(a, "=")
+		label, target = strings.TrimSpace(label), strings.TrimSpace(target)
+		if !found || label == "" || !webURL(target) {
+			fmt.Fprintf(c.stderr, "notify: --action %q must be LABEL=URL, with an http or https URL\n", a)
+			return l, false
+		}
+		l.actions = append(l.actions, Action{Label: label, URL: target})
+	}
+	return l, true
+}
+
+func webURL(s string) bool {
+	u, err := url.Parse(s)
+	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
 }
 
 // notification builds a message titled [title] and returns the devices to
