@@ -45,6 +45,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -65,6 +66,7 @@ fun HistoryScreen(
     onClear: () -> Unit,
     answering: Set<String>,
     onAnswer: (HistoryEntry, String) -> Unit,
+    onOpen: (HistoryEntry) -> Unit,
 ) {
     BackHandler(onBack = onBack)
     var confirmClear by rememberSaveable { mutableStateOf(false) }
@@ -131,7 +133,7 @@ fun HistoryScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
-                items(entries, key = { it.id }) { HistoryCard(it, onDelete, it.id in answering, onAnswer) }
+                items(entries, key = { it.id }) { HistoryCard(it, onDelete, it.id in answering, onAnswer, onOpen) }
             }
         }
     }
@@ -162,9 +164,38 @@ private fun roughly(seconds: Long): String = when {
     else -> "${seconds / 86400} d"
 }
 
+/** A small text button, as a card's "Read message". */
+@Composable
+private fun Link(text: String, onClick: () -> Unit) {
+    Text(
+        text,
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.primary,
+        modifier = Modifier
+            .padding(top = 4.dp)
+            .clickable(onClickLabel = text, onClick = onClick)
+            .padding(vertical = 8.dp, horizontal = 0.dp),
+    )
+}
+
+@Composable
+private fun Badge(text: String) {
+    Text(
+        text,
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onPrimaryContainer,
+        maxLines = 1,
+        modifier = Modifier
+            .background(MaterialTheme.colorScheme.primaryContainer, RoundedCornerShape(4.dp))
+            .padding(horizontal = 6.dp, vertical = 2.dp),
+    )
+}
+
 /**
  * One notification: its body collapses to two lines, it can be deleted, and
- * a question it asks can be answered until it expires.
+ * a question it asks can be answered until it expires. When its sender asked
+ * for receipts, only "Mark seen" (or answering) tells them it was opened, so
+ * a tap that misses another control never does.
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -173,6 +204,7 @@ private fun HistoryCard(
     onDelete: (String) -> Unit,
     answering: Boolean,
     onAnswer: (HistoryEntry, String) -> Unit,
+    onOpen: (HistoryEntry) -> Unit,
 ) {
     var expanded by rememberSaveable(entry.id) { mutableStateOf(false) }
     var overflows by remember(entry.id) { mutableStateOf(false) }
@@ -183,8 +215,15 @@ private fun HistoryCard(
     val channel = entry.channel?.takeIf { entry.channelId?.let(ChannelRoute::isDefaultChannel) == false }
     val high = entry.priority == "high"
 
+    // Tapping a long message's card expands it, as "Read message" does.
     Card(
-        Modifier.fillMaxWidth(),
+        Modifier
+            .fillMaxWidth()
+            .clip(CardDefaults.shape)
+            .then(
+                if (!expanded && !overflows) Modifier
+                else Modifier.clickable(onClickLabel = if (expanded) "Collapse" else "Read message") { expanded = !expanded },
+            ),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLowest),
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
     ) {
@@ -201,16 +240,9 @@ private fun HistoryCard(
                             // Shrinks before the badge does.
                             modifier = Modifier.weight(1f, fill = false),
                         )
-                        if (high) {
-                            Text(
-                                "High priority",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onPrimaryContainer,
-                                modifier = Modifier
-                                    .background(MaterialTheme.colorScheme.primaryContainer, RoundedCornerShape(4.dp))
-                                    .padding(horizontal = 6.dp, vertical = 2.dp),
-                            )
-                        }
+                        if (high) Badge("High priority")
+                        // Opening it tells the sender.
+                        if (entry.receipts) Badge("Read receipt")
                     }
                     Text(entry.title, style = MaterialTheme.typography.titleMedium)
                     // Queued or delayed on the way: say how much earlier it was sent.
@@ -236,16 +268,11 @@ private fun HistoryCard(
                     onTextLayout = { if (!expanded) overflows = it.hasVisualOverflow },
                     modifier = Modifier.padding(top = 8.dp, end = 12.dp),
                 )
-                if (expanded || overflows) {
-                    Text(
-                        if (expanded) "Collapse" else "Read message",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier
-                            .padding(top = 4.dp)
-                            .clickable(onClickLabel = if (expanded) "Collapse" else "Read message") { expanded = !expanded }
-                            .padding(vertical = 8.dp, horizontal = 0.dp),
-                    )
+                Row(horizontalArrangement = Arrangement.spacedBy(24.dp)) {
+                    if (expanded || overflows) {
+                        Link(if (expanded) "Collapse" else "Read message") { expanded = !expanded }
+                    }
+                    if (entry.receipts) Link("Mark seen") { onOpen(entry) }
                 }
             }
             val reply = entry.reply

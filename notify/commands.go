@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -212,9 +213,9 @@ func (c *cli) channels() int {
 	if err != nil {
 		return fail(c.stderr, err, "user token")
 	}
-	w := table(c.stdout, "ID\tNAME\tOWNED\tMEMBERS")
+	w := table(c.stdout, "ID\tNAME\tOWNED\tMEMBERS\tRECEIPTS")
 	for _, ch := range channels {
-		fmt.Fprintf(w, "%s\t%s\t%t\t%d\n", ch.ID, ch.Name, ch.Owned, ch.Members)
+		fmt.Fprintf(w, "%s\t%s\t%t\t%d\t%s\n", ch.ID, ch.Name, ch.Owned, ch.Members, receiptsLabel(ch))
 	}
 	w.Flush()
 	return 0
@@ -301,6 +302,67 @@ func (c *cli) channel(action string, args []string) int {
 				fmt.Fprintf(c.stdout, "Removed %s from %s\n", matches[0].Name, ch.Name)
 			}
 		}
+	}
+	if err != nil {
+		return fail(c.stderr, err, "user token")
+	}
+	return 0
+}
+
+// receiptsLabel says whether other members' devices report receipts on
+// [ch], and on an optional one whether this member turned them on.
+func receiptsLabel(ch Channel) string {
+	switch {
+	case ch.Owned || ch.Receipts != "optional":
+		return ch.Receipts
+	case ch.ReceiptsAccepted:
+		return "optional, yours on"
+	default:
+		return "optional, yours off"
+	}
+}
+
+// channelReceipts runs `notify channel receipts NAME [SETTING]`: the owner
+// sets off, optional (or on) or required; a member turns them on or off
+// where the owner made them optional.
+func (c *cli) channelReceipts(args []string) int {
+	client, ok := c.userClient()
+	if !ok {
+		return exitUsage
+	}
+	ctx, cancel := c.context()
+	defer cancel()
+	ch, code := c.findChannel(ctx, client, args[0], false)
+	if code != 0 {
+		return code
+	}
+	if len(args) == 1 {
+		fmt.Fprintf(c.stdout, "%s: receipts %s\n", ch.Name, receiptsLabel(ch))
+		return 0
+	}
+	setting := args[1]
+	var err error
+	switch {
+	case ch.Owned:
+		if setting == "on" {
+			setting = "optional"
+		}
+		if !slices.Contains([]string{"off", "optional", "required"}, setting) {
+			fmt.Fprintln(c.stderr, "notify: as the owner, set receipts off, optional (or on) or required")
+			return exitUsage
+		}
+		if err = client.SetChannelReceipts(ctx, ch.ID, setting); err == nil {
+			fmt.Fprintf(c.stdout, "%s: receipts %s\n", ch.Name, setting)
+		}
+	case setting == "on" || setting == "off":
+		var got Channel
+		if got, err = client.AcceptReceipts(ctx, ch.ID, setting == "on"); err == nil {
+			ch.Receipts, ch.ReceiptsAccepted = got.Receipts, got.ReceiptsAccepted
+			fmt.Fprintf(c.stdout, "%s: receipts %s\n", ch.Name, receiptsLabel(ch))
+		}
+	default:
+		fmt.Fprintln(c.stderr, "notify: as a member, turn receipts on or off")
+		return exitUsage
 	}
 	if err != nil {
 		return fail(c.stderr, err, "user token")

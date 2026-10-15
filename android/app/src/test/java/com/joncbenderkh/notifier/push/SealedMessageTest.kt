@@ -2,8 +2,12 @@
 package com.joncbenderkh.notifier.push
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.Base64
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
 /** Pins the wire format against the vector in server/test/seal.test.ts. */
 class SealedMessageTest {
@@ -19,6 +23,20 @@ class SealedMessageTest {
     fun opensServerVector() {
         val payload = SealedMessage.open(key, "dev_test", vector)
         assertEquals(Payload("msg_test", "Hello", "From the test vector", "high", 1791590400), payload)
+    }
+
+    @Test
+    fun readsTheReceiptsFlagTheServerSets() {
+        // As server/src/app.ts names it: a rename would silently stop every receipt.
+        val nonce = ByteArray(12)
+        val sealed = Cipher.getInstance("AES/GCM/NoPadding").run {
+            init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, nonce))
+            updateAAD("dev_test".toByteArray())
+            doFinal("""{"id":"msg_r","title":"Disk full","sent_at":1,"receipts":true}""".toByteArray())
+        }
+        val b64 = Base64.getEncoder()
+        val data = mapOf("v" to "1", "n" to b64.encodeToString(nonce), "c" to b64.encodeToString(sealed))
+        assertTrue(SealedMessage.open(key, "dev_test", data).receipts)
     }
 
     @Test(expected = SealedMessage.InvalidMessage::class)

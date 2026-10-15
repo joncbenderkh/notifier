@@ -19,6 +19,7 @@ import com.joncbenderkh.notifier.data.ServerException
 import com.joncbenderkh.notifier.push.Answers
 import com.joncbenderkh.notifier.push.ChannelRoute
 import com.joncbenderkh.notifier.push.Notifications
+import com.joncbenderkh.notifier.push.Receipts
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -97,6 +98,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun clearHistory() = editHistory("History cleared.") { historyStore.clear() }
 
+    /** Tells the sender of [entry], if they asked for receipts, that it was opened. */
+    fun opened(entry: HistoryEntry) {
+        // The pairing it was received under: the history belongs to it.
+        val deviceId = _state.value.pairing?.deviceId ?: return
+        if (!entry.receipts) return
+        Receipts.reportLater(getApplication(), entry.id, Receipts.OPENED, deviceId)
+        _state.update { it.say("The sender can see you opened it.") }
+    }
+
     /** Answers [entry]'s question with [option], and says what became of it. */
     fun answer(entry: HistoryEntry, option: String) {
         val reply = entry.reply ?: return
@@ -104,7 +114,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (entry.id in _state.value.answering) return
         _state.update { it.copy(answering = it.answering + entry.id) }
         viewModelScope.launch {
-            val outcome = withContext(Dispatchers.IO) { Answers.send(getApplication(), entry.id, reply, option, deviceId) }
+            val outcome = withContext(Dispatchers.IO) { Answers.send(getApplication(), entry.id, reply, option, deviceId, entry.receipts) }
             _state.update { it.copy(answering = it.answering - entry.id).say(outcome?.text) }
         }
     }
@@ -251,6 +261,29 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 throw e
             }
             if (generation == channelsGeneration) _state.update { it.copy(channels = updated) }
+        }
+    }
+
+    /** Sends this user's receipts on a channel they joined, where the owner offers them, or stops. */
+    fun setSendsReceipts(channelId: String, sends: Boolean) {
+        val pairing = _state.value.pairing ?: return
+        val name = _state.value.channels?.firstOrNull { it.id == channelId }?.name ?: return
+        run(if (sends) "Sending receipts on $name." else "No receipts on $name.") {
+            val generation = ++channelsGeneration
+            val got = try {
+                withContext(Dispatchers.IO) { client.acceptReceipts(pairing, channelId, sends) }
+            } catch (e: ServerException) {
+                // The owner may have changed the setting meanwhile.
+                runCatching { loadChannels(pairing) }
+                throw e
+            }
+            if (generation == channelsGeneration) {
+                _state.update { s ->
+                    s.copy(channels = s.channels?.map {
+                        if (it.id == channelId) it.copy(receipts = got.receipts, receiptsAccepted = got.receiptsAccepted) else it
+                    })
+                }
+            }
         }
     }
 

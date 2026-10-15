@@ -58,6 +58,8 @@ export interface Published {
   deliveries: Delivery[];
   /** Other members' devices are theirs to know: only counts by status. */
   members: Partial<Record<Delivery["status"], number>>;
+  /** Every device that has the message or will get it. */
+  reached: Set<string>;
 }
 
 export function publisher(deps: Deps) {
@@ -119,10 +121,12 @@ export function publisher(deps: Deps) {
     );
     const deliveries = all.filter((x) => x.own).map((x) => x.delivery);
     const members: Published["members"] = {};
+    const reached = new Set<string>();
     for (const { own, delivery } of all) {
       if (!own) members[delivery.status] = (members[delivery.status] ?? 0) + 1;
+      if (delivery.status === "sent" || delivery.status === "queued") reached.add(delivery.device_id);
     }
-    return { deliveries, members };
+    return { deliveries, members, reached };
   }
 
   /**

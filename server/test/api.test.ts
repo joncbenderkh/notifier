@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { env } from "cloudflare:test";
+import { env, runDurableObjectAlarm } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   createApp,
@@ -14,7 +14,7 @@ import {
   MAX_PENDING_PAIRINGS_PER_USER,
   PAIRING_TTL_SECONDS,
 } from "../src/app";
-import type { Delivery, Payload } from "../src/app";
+import { NO_RECEIPTS, type Delivery, type Payload } from "../src/app";
 import { fromBase64, toBase64 } from "../src/encoding";
 import { heartbeatAlerts, MAX_HEARTBEATS_PER_USER } from "../src/heartbeats";
 import { MAX_HOOKS_PER_USER } from "../src/hooks";
@@ -28,6 +28,7 @@ const ADMIN = env.ADMIN_TOKEN;
 
 /** The real question boxes: they take the app's clock, so the fake one works. */
 const replies = (e: Env, id: string) => e.REPLY_BOX.get(e.REPLY_BOX.idFromName(id));
+const receipts = (e: Env, id: string) => e.RECEIPT_BOX.get(e.RECEIPT_BOX.idFromName(id));
 
 class FakeSender implements Sender {
   sent: PushMessage[] = [];
@@ -71,6 +72,7 @@ interface Registration {
 interface NotifyResponse {
   id: string;
   deliveries: Delivery[];
+  tracked?: number;
 }
 
 let USER: string;
@@ -93,7 +95,7 @@ beforeEach(async () => {
   sender = new FakeSender();
   streams = new FakeStreams();
   now = 1_790_000_000;
-  app = createApp({ sender: () => sender, stream: (_, id) => streams.for(id), replies, now: () => now });
+  app = createApp({ sender: () => sender, stream: (_, id) => streams.for(id), replies, receipts, now: () => now });
   USER = await signup("alice");
 });
 
@@ -202,6 +204,7 @@ describe("notifications", () => {
       },
       stream: (_, id) => streams.for(id),
       replies,
+      receipts,
       now: () => now,
     });
     const resp = await call<NotifyResponse>("POST", "/v1/notifications", key, { title: "hi" }, 200);
@@ -689,7 +692,9 @@ describe("channels", () => {
   it("subscribes new devices to the user's default channel", async () => {
     const reg = await pair("phone", "fcm-phone");
     const channels = await call<ChannelView[]>("GET", "/v1/device/channels", reg.device_token, undefined, 200);
-    expect(channels).toEqual([{ id: expect.stringMatching(/^ch_default_/) as string, name: "default", subscribed: true }]);
+    expect(channels).toEqual([
+      { id: expect.stringMatching(/^ch_default_/) as string, name: "default", subscribed: true, owned: true, receipts: "off" },
+    ]);
 
     await call("POST", "/v1/notifications", USER, { title: "hi" }, 200);
     expect((await payloadFor(reg, 0)).channel).toBe("default");
@@ -879,7 +884,7 @@ describe("heartbeats", () => {
   }
 
   const create = (body: object, status = 201) => call<Created>("POST", "/v1/heartbeats", USER, body, status);
-  const check = () => heartbeatAlerts({ sender: () => sender, stream: (_, id) => streams.for(id), replies, now: () => now }).check(env);
+  const check = () => heartbeatAlerts({ sender: () => sender, stream: (_, id) => streams.for(id), replies, receipts, now: () => now }).check(env);
 
   async function ping(url: string, suffix = "", body?: string, wantStatus = 200): Promise<void> {
     const res = await app.request(new URL(url).pathname + suffix, { method: body === undefined ? "GET" : "POST", body }, env);
@@ -999,7 +1004,7 @@ describe("heartbeats", () => {
     await create({ name: "backup", interval: 3600 });
     now += 3600 + 300;
     const failing: Sender = { send: () => Promise.reject(new Error("FCM down")) };
-    await heartbeatAlerts({ sender: () => failing, stream: (_, id) => streams.for(id), replies, now: () => now }).check(env);
+    await heartbeatAlerts({ sender: () => failing, stream: (_, id) => streams.for(id), replies, receipts, now: () => now }).check(env);
     let list = await call<Listed[]>("GET", "/v1/heartbeats", USER, undefined, 200);
     expect(list[0]!.state).toBe("up");
     // Retried behind heartbeats that went overdue earlier.
@@ -1018,7 +1023,7 @@ describe("heartbeats", () => {
     now += 3600 + 300;
     await check();
     const failing: Sender = { send: () => Promise.reject(new Error("FCM down")) };
-    const downApp = createApp({ sender: () => failing, stream: (_, id) => streams.for(id), replies, now: () => now });
+    const downApp = createApp({ sender: () => failing, stream: (_, id) => streams.for(id), replies, receipts, now: () => now });
     now += 600;
     const res = await downApp.request(new URL(hb.ping_url).pathname, {}, env);
     expect(res.status).toBe(200);
@@ -1037,7 +1042,7 @@ describe("heartbeats", () => {
     now += 3600 + 300;
     await check();
     const failing: Sender = { send: () => Promise.reject(new Error("FCM down")) };
-    const downApp = createApp({ sender: () => failing, stream: (_, id) => streams.for(id), replies, now: () => now });
+    const downApp = createApp({ sender: () => failing, stream: (_, id) => streams.for(id), replies, receipts, now: () => now });
     await downApp.request(new URL(hb.ping_url).pathname, {}, env); // recovery kept pending
     await ping(hb.ping_url, "/fail"); // delivered, replacing it
     now += 600;
@@ -1061,7 +1066,7 @@ describe("heartbeats", () => {
   }
 
   const titles = (phone: Registration) => Promise.all(sender.sent.map((_, i) => payloadFor(phone, i).then((p) => p.title)));
-  const depsWith = (s: Sender) => ({ sender: () => s, stream: (_: Env, id: string) => streams.for(id), replies, now: () => now });
+  const depsWith = (s: Sender) => ({ sender: () => s, stream: (_: Env, id: string) => streams.for(id), replies, receipts, now: () => now });
 
   it("drops a recovery notice that a failure overtook", async () => {
     const phone = await pair("phone", "fcm-phone");
@@ -1202,7 +1207,7 @@ describe("heartbeats", () => {
     const phone = await pair("phone", "fcm-phone");
     const hb = await create({ name: "build", interval: 3600 });
     const failing: Sender = { send: () => Promise.reject(new Error("FCM down")) };
-    const deps = { sender: () => failing, stream: (_: Env, id: string) => streams.for(id), replies, now: () => now };
+    const deps = { sender: () => failing, stream: (_: Env, id: string) => streams.for(id), replies, receipts, now: () => now };
     await createApp(deps).request(new URL(hb.ping_url).pathname + "/fail", { method: "POST", body: "the log" }, env);
     now += 3600 + 300;
     await heartbeatAlerts(deps).check(env); // missed alert fails and is undone
@@ -1360,7 +1365,7 @@ describe("inbound webhooks", () => {
     const reg = await pair("phone", "fcm-phone");
     const hook = await create({ name: "am", format: "alertmanager" });
     const failing = { send: () => Promise.reject(new Error("FCM down")) };
-    app = createApp({ sender: () => failing, stream: (_, id) => streams.for(id), replies, now: () => now });
+    app = createApp({ sender: () => failing, stream: (_, id) => streams.for(id), replies, receipts, now: () => now });
     await post(hook.url, firing, 503);
     // Nobody listening is not worth a retry.
     await call("DELETE", `/v1/devices/${reg.device_id}`, USER, undefined, 204);
@@ -1542,6 +1547,191 @@ describe("questions", () => {
     expect(await poll(id)).toEqual({ status: "pending" });
     await poll(id, 51, USER, 400);
     await call("GET", `/v1/replies/${id}?wait=-1`, USER, undefined, 400);
+  });
+});
+
+describe("receipts", () => {
+  type Receipts = {
+    id: string;
+    status: string;
+    devices: { device_id: string; name: string; shown_at?: number; opened_at?: number }[];
+    members: { tracked: number; shown: number; opened: number };
+  };
+
+  const send = (body: object = {}, token = USER) =>
+    call<NotifyResponse>("POST", "/v1/notifications", token, { title: "Disk full", receipts: true, ...body }, 200);
+  const mark = (reg: Registration, id: string, state: string, wantStatus = 204) =>
+    call("POST", "/v1/device/receipts", reg.device_token, { message_id: id, state }, wantStatus);
+  const read = (id: string, wait = 0, token = USER, wantStatus = 200) =>
+    call<Receipts>("GET", `/v1/notifications/${id}?wait=${wait}`, token, undefined, wantStatus);
+
+  it("tracks only messages sent with receipts", async () => {
+    const phone = await pair("phone", "fcm-phone");
+    const { id, tracked } = await send();
+    expect(tracked).toBe(1);
+    expect((await payloadFor(phone, 0)).receipts).toBe(true);
+    const plain = await call<NotifyResponse>("POST", "/v1/notifications", USER, { title: "hi" }, 200);
+    expect(plain.tracked).toBeUndefined();
+    expect((await payloadFor(phone, 1)).receipts).toBeUndefined();
+    await mark(phone, plain.id, "shown", 404);
+    expect(await read(plain.id, 0, USER, 404)).toEqual({ error: NO_RECEIPTS });
+    expect(await read("msg_typo", 0, USER, 404)).toEqual({ error: NO_RECEIPTS });
+    expect(await read(id)).toEqual({
+      id,
+      status: "pending",
+      devices: [{ device_id: phone.device_id, name: "phone" }],
+      members: { tracked: 0, shown: 0, opened: 0 },
+    });
+    // A device the message never reached does not count.
+    sender.unregistered.add("fcm-phone");
+    expect((await send()).tracked).toBe(0);
+  });
+
+  it("keeps the first time of each state, and opening implies showing", async () => {
+    const phone = await pair("phone", "fcm-phone");
+    const laptop = await pair("laptop", "fcm-laptop");
+    const { id } = await send();
+    await mark(phone, id, "shown");
+    now += 5;
+    await mark(phone, id, "opened");
+    now += 5;
+    await mark(phone, id, "shown");
+    await mark(phone, id, "opened");
+    await mark(laptop, id, "opened");
+    const got = await read(id, 0, await apiKey());
+    expect(got.status).toBe("opened");
+    expect(got.devices).toEqual(
+      expect.arrayContaining([
+        { device_id: phone.device_id, name: "phone", shown_at: now - 10, opened_at: now - 5 },
+        { device_id: laptop.device_id, name: "laptop", shown_at: now, opened_at: now },
+      ]),
+    );
+  });
+
+  it("wakes a waiting poll when a device opens the message, not when it shows it", async () => {
+    const phone = await pair("phone", "fcm-phone");
+    const { id } = await send();
+    let settled = false;
+    const waiting = read(id, 30).then((r) => ((settled = true), r));
+    await new Promise((r) => setTimeout(r, 50));
+    await mark(phone, id, "shown");
+    await new Promise((r) => setTimeout(r, 50));
+    expect(settled).toBe(false);
+    await mark(phone, id, "opened");
+    expect(await waiting).toMatchObject({ status: "opened" });
+  });
+
+  it("counts other members' devices without naming them", async () => {
+    const bob = await signup("bob");
+    const homelab = await channel("homelab");
+    const bobPhone = await pair("phone", "fcm-bob", bob);
+    const { code } = await call<{ code: string }>("POST", `/v1/channels/${homelab}/invites`, USER, undefined, 201);
+    await call("POST", "/v1/device/memberships", bobPhone.device_token, { invite: code }, 201);
+    // Nothing reports: the channel's receipts are off, and none of the sender's devices get it.
+    expect((await send({ channels: ["homelab"] })).tracked).toBe(0);
+    await call("PATCH", `/v1/channels/${homelab}`, USER, { receipts: "required" }, 200);
+    const { id, tracked } = await send({ channels: ["homelab"] });
+    expect(tracked).toBe(1);
+    expect((await payloadFor(bobPhone, sender.sent.length - 1)).receipts).toBe(true);
+    await mark(bobPhone, id, "opened");
+    expect(await read(id)).toEqual({ id, status: "opened", devices: [], members: { tracked: 1, shown: 1, opened: 1 } });
+    await read(id, 0, bob, 404);
+  });
+
+  it("asks members' devices only as their channel's owner and the member choose", async () => {
+    const bob = await signup("bob");
+    const homelab = await channel("homelab");
+    const phone = await pair("phone", "fcm-phone");
+    const bobPhone = await pair("phone", "fcm-bob", bob);
+    const { code } = await call<{ code: string }>("POST", `/v1/channels/${homelab}/invites`, USER, undefined, 201);
+    await call("POST", "/v1/device/memberships", bobPhone.device_token, { invite: code }, 201);
+    const own = (await call<{ id: string; name: string }[]>("GET", "/v1/channels", USER, undefined, 200)).find(
+      (ch) => ch.name === "default",
+    );
+    await call("PUT", `/v1/devices/${phone.device_id}/channels`, USER, { channel_ids: [own?.id, homelab] }, 200);
+    const asked = async () => {
+      const { id } = await send({ channels: ["homelab"] });
+      const last = (token: string) => sender.sent.findLastIndex((m) => m.token === token);
+      const payloads = await Promise.all([payloadFor(phone, last("fcm-phone")), payloadFor(bobPhone, last("fcm-bob"))]);
+      await mark(bobPhone, id, "shown", payloads[1].receipts ? 204 : 404);
+      expect(payloads[0].receipts).toBe(true);
+      return payloads[1].receipts === true;
+    };
+    const accept = (accepted: boolean, status = 200, token = bob) =>
+      call("PATCH", `/v1/memberships/${homelab}`, token, { receipts_accepted: accepted }, status);
+
+    // Off until the owner offers receipts; the sender's own devices still report.
+    expect(await asked()).toBe(false);
+    // Consent only where offered.
+    await accept(true, 409);
+    await accept(false);
+    // Optional: only members who turn them on.
+    await call("PATCH", `/v1/channels/${homelab}`, USER, { receipts: "optional" }, 200);
+    expect(await asked()).toBe(false);
+    await accept(true);
+    expect(await call("GET", "/v1/channels", bob, undefined, 200)).toContainEqual(
+      expect.objectContaining({ id: homelab, receipts: "optional", receipts_accepted: true }),
+    );
+    expect(await asked()).toBe(true);
+    await call("PATCH", `/v1/device/memberships/${homelab}`, bobPhone.device_token, { receipts_accepted: false }, 200);
+    expect(await asked()).toBe(false);
+    // Required overrides the member's choice, which they cannot turn off while it holds.
+    await call("PATCH", `/v1/channels/${homelab}`, USER, { receipts: "required" }, 200);
+    expect(await asked()).toBe(true);
+    await accept(false, 409);
+    await accept(true, 409);
+    // Being required is no consent once it is optional again.
+    await call("PATCH", `/v1/channels/${homelab}`, USER, { receipts: "optional" }, 200);
+    expect(await asked()).toBe(false);
+
+    await call("PATCH", `/v1/channels/${homelab}`, bob, { receipts: "off" }, 404);
+    await call("PATCH", `/v1/channels/${homelab}`, USER, { receipts: "on" }, 400);
+    await call("PATCH", `/v1/channels/${own?.id}`, USER, { receipts: "required" }, 400);
+    await accept(true, 400, USER);
+    await call("PATCH", "/v1/memberships/ch_missing", bob, { receipts_accepted: true }, 404);
+  });
+
+  it("counts a late answer, after the question is gone, as opening it", async () => {
+    const KEY = toBase64(new Uint8Array(32).fill(7));
+    const phone = await pair("phone", "fcm-phone");
+    const { id } = await send({ question: { options: ["ok"], key: KEY, expires_in: 10 } });
+    expect(await runDurableObjectAlarm(replies(env, id))).toBe(true);
+    const sealed = await seal(fromBase64(KEY), `reply:${id}`, new TextEncoder().encode(JSON.stringify({ answer: "ok" })));
+    await call("POST", `/v1/replies/${id}`, phone.device_token, { n: toBase64(sealed.nonce), c: toBase64(sealed.ciphertext) }, 404);
+    expect((await read(id)).status).toBe("opened");
+  });
+
+  it("refuses devices the message did not reach, and bad requests", async () => {
+    const phone = await pair("phone", "fcm-phone");
+    const bob = await signup("bob");
+    const bobPhone = await pair("phone", "fcm-bob", bob);
+    const { id } = await send();
+    await mark(bobPhone, id, "opened", 404);
+    await mark(phone, id, "read", 400);
+    await mark(phone, "msg_bad", "shown", 404);
+    await call("POST", "/v1/device/receipts", phone.device_token, { message_id: id, state: "shown", extra: 1 }, 400);
+    await call("POST", "/v1/device/receipts", USER, { message_id: id, state: "shown" }, 401);
+    await call("POST", "/v1/notifications", USER, { title: "x", receipts: "yes" }, 400);
+    await read(id, 51, USER, 400);
+    expect((await read(id)).status).toBe("pending");
+  });
+
+  it("counts answering a question as opening it, even when another answered first", async () => {
+    const KEY = toBase64(new Uint8Array(32).fill(7));
+    const phone = await pair("phone", "fcm-phone");
+    const laptop = await pair("laptop", "fcm-laptop");
+    const { id } = await send({ question: { options: ["ok"], key: KEY } });
+    const sealed = await seal(fromBase64(KEY), `reply:${id}`, new TextEncoder().encode(JSON.stringify({ answer: "ok" })));
+    const body = { n: toBase64(sealed.nonce), c: toBase64(sealed.ciphertext) };
+    await call("POST", `/v1/replies/${id}`, phone.device_token, body, 201);
+    now += 5;
+    await call("POST", `/v1/replies/${id}`, laptop.device_token, body, 409);
+    expect((await read(id)).devices).toEqual(
+      expect.arrayContaining([
+        { device_id: phone.device_id, name: "phone", shown_at: now - 5, opened_at: now - 5 },
+        { device_id: laptop.device_id, name: "laptop", shown_at: now, opened_at: now },
+      ]),
+    );
   });
 });
 

@@ -103,3 +103,15 @@ func (a *app) reply(id, option string) int {
 	fmt.Fprintln(a.stdout, outcome)
 	return 0
 }
+
+// maxReceiptPosts bounds the shown receipts posted at once.
+const maxReceiptPosts = 4
+
+// receipt reports that this desktop showed or opened the message [id],
+// which asked for receipts. A failure only costs the sender a receipt.
+func (a *app) receipt(st State, id, state string) {
+	body := map[string]string{"message_id": id, "state": state}
+	if err := a.call(http.MethodPost, st.URL+"/v1/device/receipts", st.DeviceToken, body, nil); err != nil {
+		a.logf("could not report message %s as %s: %v", id, state, err)
+	}
+}

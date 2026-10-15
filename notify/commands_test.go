@@ -281,6 +281,43 @@ func TestChannelCommandsResolveNames(t *testing.T) {
 	}
 }
 
+func TestChannelReceipts(t *testing.T) {
+	f := newFakeAPI(t, map[string]any{
+		"GET /v1/channels": []Channel{
+			{ID: "ch_home", Name: "homelab", Owned: true, Members: 2, Receipts: "off"},
+			{ID: "ch_alice", Name: "alice/alerts", Members: 3, Receipts: "optional"},
+		},
+		"PATCH /v1/channels/ch_home":     map[string]string{"id": "ch_home", "receipts": "optional"},
+		"PATCH /v1/memberships/ch_alice": map[string]any{"id": "ch_alice", "receipts": "optional", "receipts_accepted": true},
+	})
+	run := func(args ...string) (int, string, string) {
+		return f.run(append([]string{"--token", testToken, "channel", "receipts"}, args...)...)
+	}
+	if code, stdout, _ := run("alice/alerts"); code != 0 || stdout != "alice/alerts: receipts optional, yours off\n" {
+		t.Fatalf("show: exit %d, stdout %q", code, stdout)
+	}
+	if code, _, stderr := run("homelab", "on"); code != 0 {
+		t.Fatalf("owner: exit %d, %s", code, stderr)
+	}
+	if got := f.got[len(f.got)-1]; got.Route != "PATCH /v1/channels/ch_home" || got.Body["receipts"] != "optional" {
+		t.Fatalf("owner sent %+v", got)
+	}
+	if code, stdout, stderr := run("alice/alerts", "on"); code != 0 || stdout != "alice/alerts: receipts optional, yours on\n" {
+		t.Fatalf("member: exit %d, stdout %q, stderr %s", code, stdout, stderr)
+	}
+	if got := f.got[len(f.got)-1]; got.Route != "PATCH /v1/memberships/ch_alice" || got.Body["receipts_accepted"] != true {
+		t.Fatalf("member sent %+v", got)
+	}
+	for _, bad := range [][]string{{"homelab", "sometimes"}, {"alice/alerts", "required"}} {
+		if code, _, _ := run(bad...); code != exitUsage {
+			t.Errorf("%v: exit %d", bad, code)
+		}
+	}
+	if code, stdout, _ := f.run("--token", testToken, "channels"); code != 0 || !strings.Contains(stdout, "optional, yours off") {
+		t.Errorf("channels: exit %d, stdout %q", code, stdout)
+	}
+}
+
 func TestSubcommandsNeedTheUserToken(t *testing.T) {
 	f := newFakeAPI(t, nil)
 	for _, args := range [][]string{{"invite"}, {"channels"}, {"keys"}, {"channel", "create", "ci"}} {

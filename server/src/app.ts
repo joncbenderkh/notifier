@@ -40,12 +40,13 @@ import {
   sealedDataBytes,
 } from "./publish";
 import type { Target } from "./publish";
+import type { ReceiptBook, ReceiptState, Recipient } from "./receipts";
 import type { Replies, Responder } from "./replies";
 import type { Stream } from "./stream";
 import { newSealKey } from "./seal";
 import { cleanTail, MAX_BODY_BYTES, MAX_TITLE_BYTES, UNSAFE_IN_NAME, UNSAFE_IN_TEXT, utf8Length } from "./text";
 import * as store from "./store";
-import type { Channel, Device, User } from "./store";
+import type { Channel, Device, ReceiptPolicy, User } from "./store";
 import {
   API_KEY_PREFIX,
   DEVICE_TOKEN_PREFIX,
@@ -84,6 +85,8 @@ export interface Deps {
   stream: (env: Env, deviceId: string) => Stream;
   /** The Durable Object holding a question's answer. */
   replies: (env: Env, messageId: string) => Replies;
+  /** The Durable Object holding a tracked message's receipts. */
+  receipts: (env: Env, messageId: string) => ReceiptBook;
   /** Unix seconds. */
   now: () => number;
 }
@@ -114,6 +117,8 @@ export interface Payload {
   channel_id?: string;
   /** Present for the devices that may answer a question. */
   reply?: { options: string[]; key: string; expires_at: number };
+  /** Set when the sender asked for receipts: the device reports when it shows and opens the message. */
+  receipts?: true;
 }
 
 export interface Delivery {
@@ -214,6 +219,17 @@ const REPLY_TAG_BYTES = 16;
 const MAX_REPLY_CIPHERTEXT_BYTES = 1024;
 const MESSAGE_ID = /^msg_[a-z2-7]{16}$/;
 const MAX_REPLY_WAIT_SECONDS = 50;
+/** What GET /v1/notifications/<id> answers for a message without receipts (`notify status` keys on it). */
+export const NO_RECEIPTS = "no receipts for this message";
+
+const RECEIPT_STATES: readonly ReceiptState[] = ["shown", "opened"];
+
+/** The `wait` query of a long poll: 0 to [MAX_REPLY_WAIT_SECONDS] seconds. */
+function waitSeconds(raw: string | undefined): number {
+  const wait = /^\d{1,2}$/.test(raw ?? "0") ? Number(raw ?? "0") : NaN;
+  if (!(wait <= MAX_REPLY_WAIT_SECONDS)) fail(400, `wait must be 0 to ${MAX_REPLY_WAIT_SECONDS} seconds`);
+  return wait;
+}
 
 interface QuestionRequest {
   options: string[];
@@ -356,12 +372,39 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     return ids;
   }
 
+  /** A membership's receipt setting, as [userId] sees it: the owner's, and whether they accepted it. */
+  function membershipReceipts(ch: store.Membership, userId: string) {
+    return {
+      receipts: ch.receipts,
+      ...(ch.owner_id === userId ? {} : { receipts_accepted: ch.receipts_accepted === 1 }),
+    };
+  }
+
+  /**
+   * Which targets of a send by [userId] to [channels] report receipts: the
+   * sender's own devices, and other members' where the channel they get it
+   * through requires receipts, or offers them and the member turned them on.
+   */
+  async function receiptTracker(db: D1Database, userId: string, channels: readonly Channel[]) {
+    const accepted = await store.receiptsAccepted(
+      db,
+      channels.filter((ch) => ch.receipts === "optional").map((ch) => ch.id),
+    );
+    return ({ device: d, channel: ch }: Target): boolean => {
+      if (d.user_id === userId) return true;
+      if (!ch || ch.receipts === "off") return false;
+      return ch.receipts === "required" || (ch.receipts === "optional" && accepted.has(`${ch.id}/${d.user_id}`));
+    };
+  }
+
   async function deviceChannels(db: D1Database, d: Device) {
     const subscribed = new Set(await store.deviceSubscriptions(db, d.id));
     return (await store.memberships(db, d.user_id)).map((ch) => ({
       id: ch.id,
       name: channelLabel(ch, d.user_id),
       subscribed: subscribed.has(ch.id),
+      owned: ch.owner_id === d.user_id,
+      ...membershipReceipts(ch, d.user_id),
     }));
   }
 
@@ -585,8 +628,21 @@ export function createApp(deps: Deps): Hono<AppEnv> {
         name: channelLabel(ch, userId),
         owned: ch.owner_id === userId,
         members: ch.members,
+        ...membershipReceipts(ch, userId),
       })),
     );
+  });
+
+  // The owner sets whether other members' devices report receipts.
+  app.patch("/v1/channels/:id", user, async (c) => {
+    const req = await readJson<{ receipts: ReceiptPolicy }>(c, ["receipts"]);
+    const policy = store.RECEIPT_POLICIES.find((p) => p === req.receipts);
+    if (policy === undefined) fail(400, `receipts must be one of ${store.RECEIPT_POLICIES.join(", ")}`);
+    const userId = c.get("userId");
+    const id = c.req.param("id");
+    if (id === store.defaultChannelId(userId)) fail(400, "the default channel has no other members");
+    if (!(await store.setChannelReceipts(c.env.DB, userId, id, policy))) fail(404, "not found");
+    return c.json({ id, receipts: policy });
   });
 
   app.delete("/v1/channels/:id", user, async (c) => {
@@ -628,6 +684,24 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     if (result === "channel full") fail(403, `at most ${MAX_MEMBERS_PER_CHANNEL} members per channel`);
     return result.channel;
   }
+
+  /** Records whether [userId] accepts receipts on channel [id], which they joined. */
+  async function acceptReceipts(c: Context<AppEnv>, userId: string, id: string) {
+    const req = await readJson<{ receipts_accepted: boolean }>(c, ["receipts_accepted"]);
+    if (typeof req.receipts_accepted !== "boolean") fail(400, "receipts_accepted must be a boolean");
+    const ch = (await store.memberships(c.env.DB, userId)).find((m) => m.id === id);
+    if (!ch) fail(404, "not found");
+    if (ch.owner_id === userId) fail(400, "you own this channel; set its receipts with PATCH /v1/channels/<id>");
+    if (!req.receipts_accepted && ch.receipts === "required") fail(409, "the channel's owner requires receipts");
+    // Consent is given for receipts the owner offers, not stored ahead of them.
+    if (req.receipts_accepted && ch.receipts !== "optional") {
+      fail(409, ch.receipts === "required" ? "the channel's owner requires receipts already" : "the channel's owner does not offer receipts");
+    }
+    if (!(await store.acceptReceipts(c.env.DB, id, userId, req.receipts_accepted))) fail(404, "not found");
+    return c.json({ id, receipts: ch.receipts, receipts_accepted: req.receipts_accepted });
+  }
+
+  app.patch("/v1/memberships/:id", user, (c) => acceptReceipts(c, c.get("userId"), c.req.param("id")));
 
   app.post("/v1/memberships", user, async (c) => {
     const req = await readJson<{ invite: string }>(c, ["invite"]);
@@ -681,6 +755,8 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     await store.subscribe(c.env.DB, d.id, ch.id);
     return c.json({ id: ch.id, name: channelLabel(ch, d.user_id) }, 201);
   });
+
+  app.patch("/v1/device/memberships/:id", device, (c) => acceptReceipts(c, c.get("device").user_id, c.req.param("id")));
 
   app.post("/v1/devices", async (c) => {
     const req = await readJson<{ code: string; name: string; fcm_token: string; transport: string }>(c, [
@@ -944,7 +1020,8 @@ export function createApp(deps: Deps): Hono<AppEnv> {
       device_ids: string[];
       channels: string[];
       question: unknown;
-    }>(c, ["title", "body", "priority", "device_ids", "channels", "question"]);
+      receipts: boolean;
+    }>(c, ["title", "body", "priority", "device_ids", "channels", "question", "receipts"]);
     const title = typeof req.title === "string" ? req.title : "";
     const body = typeof req.body === "string" ? req.body : "";
     if (title.trim() === "") fail(400, "title is required");
@@ -957,6 +1034,7 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     const priority =
       req.priority === undefined || req.priority === null || req.priority === "" ? "default" : req.priority;
     if (priority !== "default" && priority !== "high") fail(400, 'priority must be "default" or "high"');
+    if (req.receipts !== undefined && typeof req.receipts !== "boolean") fail(400, "receipts must be a boolean");
     const ids = stringList(req.device_ids, "device_ids");
     let names = channelNames(req.channels);
     const scope = c.get("keyScope");
@@ -982,7 +1060,21 @@ export function createApp(deps: Deps): Hono<AppEnv> {
 
     const base: Payload = { id: newId("msg_"), title, priority, sent_at: deps.now() };
     if (body !== "") base.body = body;
-    let extra: ((t: Target) => Partial<Payload>) | undefined;
+    let openReceipts: (() => Promise<void>) | undefined;
+    let tracked: Set<string> | undefined;
+    if (req.receipts === true) {
+      const tracks = await receiptTracker(c.env.DB, userId, channels);
+      const recipients: Recipient[] = [...targets.values()]
+        // A phone without a token is skipped at delivery: it can never report.
+        .filter((t) => tracks(t) && !(t.device.transport === "fcm" && t.device.fcm_token === ""))
+        .map(({ device: d }) =>
+          d.user_id === userId ? { device_id: d.id, name: d.name, own: true } : { device_id: d.id, own: false },
+        );
+      tracked = new Set(recipients.map((r) => r.device_id));
+      const box = { userId, expiresAt: deps.now() + MESSAGE_TTL_SECONDS, recipients };
+      openReceipts = () => deps.receipts(c.env, base.id).open(box, deps.now());
+    }
+    let questionExtra: ((t: Target) => Partial<Payload>) | undefined;
     let openBox: (() => Promise<void>) | undefined;
     const question = parseQuestion(req.question);
     if (question) {
@@ -1000,8 +1092,12 @@ export function createApp(deps: Deps): Hono<AppEnv> {
       openBox = () => deps.replies(c.env, base.id).open({ userId, expiresAt, responders }, deps.now());
       const reply = { options: question.options, key: question.key, expires_at: expiresAt };
       const allowed = new Set(responders.map((r) => r.device_id));
-      extra = (t) => (allowed.has(t.device.id) ? { reply } : {});
+      questionExtra = (t) => (allowed.has(t.device.id) ? { reply } : {});
     }
+    const extra = (t: Target): Partial<Payload> => ({
+      ...questionExtra?.(t),
+      ...(tracked?.has(t.device.id) ? { receipts: true as const } : {}),
+    });
     // Escaping can grow text that fits the limits past what FCM carries.
     // A phone without a token is skipped at delivery, so it cannot refuse.
     const tooLarge = [...targets.values()].some(
@@ -1013,8 +1109,15 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     if (tooLarge) fail(400, "title and body are too long once encoded for a phone (at most 4 KiB); shorten them");
     // Opened before publishing, so an answer that comes back at once finds it.
     await openBox?.();
-    const { deliveries, members } = await publish(c.env, userId, targets.values(), base, extra);
-    return c.json({ id: base.id, deliveries, ...(Object.keys(members).length > 0 ? { members } : {}) });
+    await openReceipts?.();
+    const { deliveries, members, reached } = await publish(c.env, userId, targets.values(), base, extra);
+    return c.json({
+      id: base.id,
+      deliveries,
+      ...(Object.keys(members).length > 0 ? { members } : {}),
+      // How many devices that got it report receipts: none means nobody will.
+      ...(tracked ? { tracked: [...tracked].filter((id) => reached.has(id)).length } : {}),
+    });
   });
 
   // --- replies ---
@@ -1027,6 +1130,14 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     // At least the 16-byte tag and one byte, or a garbled answer could take the first slot.
     const ct = toBase64(base64Field(req.c, "c", REPLY_TAG_BYTES + 1, MAX_REPLY_CIPHERTEXT_BYTES));
     const result = await deps.replies(c.env, id).answer(c.get("device").id, n, ct, deps.now());
+    // Tapping an answer opens the message, even one answered already, or
+    // expired (its question's box may be gone, the receipts not yet). The
+    // receipt box takes only the message's recipients; a message sent
+    // without receipts has none.
+    await deps
+      .receipts(c.env, id)
+      .mark(c.get("device").id, "opened", deps.now())
+      .catch((err: unknown) => console.error("receipt after answer failed", id, err));
     if (result === "forbidden") fail(404, "not found");
     if (result === "answered") fail(409, "already answered");
     if (result === "expired") fail(410, "the question has expired");
@@ -1036,12 +1147,33 @@ export function createApp(deps: Deps): Hono<AppEnv> {
   // The asker long-polls for the answer, still sealed.
   app.get("/v1/replies/:id", userOrApiKey, async (c) => {
     const id = messageId(c.req.param("id"));
-    const raw = c.req.query("wait") ?? "0";
-    const wait = /^\d{1,2}$/.test(raw) ? Number(raw) : NaN;
-    if (!(wait <= MAX_REPLY_WAIT_SECONDS)) fail(400, `wait must be 0 to ${MAX_REPLY_WAIT_SECONDS} seconds`);
-    const state = await deps.replies(c.env, id).wait(c.get("userId"), wait, deps.now());
+    const state = await deps.replies(c.env, id).wait(c.get("userId"), waitSeconds(c.req.query("wait")), deps.now());
     if (state.status === "missing") fail(404, "not found");
     return c.json(state);
+  });
+
+  // --- receipts ---
+
+  // A device reports that it showed or opened a message sent with receipts.
+  app.post("/v1/device/receipts", device, async (c) => {
+    const req = await readJson<{ message_id: string; state: string }>(c, ["message_id", "state"]);
+    const id = messageId(typeof req.message_id === "string" ? req.message_id : "");
+    const state = RECEIPT_STATES.find((s) => s === req.state);
+    if (!state) fail(400, 'state must be "shown" or "opened"');
+    if (!(await deps.receipts(c.env, id).mark(c.get("device").id, state, deps.now()))) fail(404, "not found");
+    return c.body(null, 204);
+  });
+
+  // The sender reads a tracked message's receipts, waiting up to `wait` seconds for one to be opened.
+  app.get("/v1/notifications/:id", userOrApiKey, async (c) => {
+    const raw = c.req.param("id");
+    // A mistyped ID has no receipts either: the client explains NO_RECEIPTS.
+    if (!MESSAGE_ID.test(raw)) fail(404, NO_RECEIPTS);
+    const id = raw;
+    const receipts = await deps.receipts(c.env, id).wait(c.get("userId"), waitSeconds(c.req.query("wait")));
+    // Not the generic "not found", so a client can tell it from a missing route.
+    if (receipts.status === "missing") fail(404, NO_RECEIPTS);
+    return c.json({ id, ...receipts });
   });
 
   app.notFound((c) => c.json({ error: "not found" }, 404));

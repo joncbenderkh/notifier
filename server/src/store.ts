@@ -295,24 +295,31 @@ export async function deleteApiKey(db: D1Database, userId: string, id: string): 
 
 // --- channels ---
 
+/** Whether other members' devices report receipts on a channel. */
+export type ReceiptPolicy = "off" | "optional" | "required";
+export const RECEIPT_POLICIES: readonly ReceiptPolicy[] = ["off", "optional", "required"];
+
 export interface Channel {
   id: string;
   owner_id: string;
   owner_name: string;
   name: string;
   created_at: number;
+  receipts: ReceiptPolicy;
 }
 
 /** A channel as one of its members sees it. */
 export interface Membership extends Channel {
   members: number;
+  /** 1 when this member turned receipts on (they apply regardless where required). */
+  receipts_accepted: number;
 }
 
 // The Android app recognizes a default channel by this prefix (ChannelRoute.kt);
 // newId("ch_") cannot produce it, since its base32 has no "_".
 export const defaultChannelId = (userId: string) => `ch_default_${userId}`;
 
-const CHANNEL_COLUMNS = "c.id, c.owner_id, o.name AS owner_name, c.name, c.created_at";
+const CHANNEL_COLUMNS = "c.id, c.owner_id, o.name AS owner_name, c.name, c.created_at, c.receipts";
 
 /**
  * Creates a channel and makes its owner a member, unless the owner already
@@ -363,11 +370,46 @@ export async function ownedChannel(db: D1Database, ownerId: string, id: string):
     .first<Channel>();
 }
 
+/** Sets whether other members' devices report receipts on the owner's channel [id]; never default. */
+export async function setChannelReceipts(db: D1Database, ownerId: string, id: string, policy: ReceiptPolicy): Promise<boolean> {
+  const r = await db
+    .prepare("UPDATE channels SET receipts = ? WHERE id = ? AND owner_id = ? AND name != 'default'")
+    .bind(policy, id, ownerId)
+    .run();
+  return r.meta.changes > 0;
+}
+
+/** Records whether member [userId], not the owner, accepts receipts on channel [id]. */
+export async function acceptReceipts(db: D1Database, id: string, userId: string, accepted: boolean): Promise<boolean> {
+  const r = await db
+    .prepare(
+      `UPDATE channel_members SET receipts_accepted = ?
+       WHERE channel_id = ? AND user_id = ? AND user_id != (SELECT owner_id FROM channels WHERE id = ?)`,
+    )
+    .bind(accepted ? 1 : 0, id, userId, id)
+    .run();
+  return r.meta.changes > 0;
+}
+
+/** The members of [channelIds] who accepted receipts, as "<channel id>/<user id>". */
+export async function receiptsAccepted(db: D1Database, channelIds: readonly string[]): Promise<Set<string>> {
+  if (channelIds.length === 0) return new Set();
+  const { results } = await db
+    .prepare(
+      `SELECT channel_id, user_id FROM channel_members
+       WHERE receipts_accepted = 1 AND channel_id IN (${channelIds.map(() => "?").join(", ")})`,
+    )
+    .bind(...channelIds)
+    .all<{ channel_id: string; user_id: string }>();
+  return new Set(results.map((r) => `${r.channel_id}/${r.user_id}`));
+}
+
 /** Channels the user belongs to, owned or joined, in the order they joined. */
 export async function memberships(db: D1Database, userId: string): Promise<Membership[]> {
   const { results } = await db
     .prepare(
-      `SELECT ${CHANNEL_COLUMNS}, (SELECT count(*) FROM channel_members WHERE channel_id = c.id) AS members
+      `SELECT ${CHANNEL_COLUMNS}, (SELECT count(*) FROM channel_members WHERE channel_id = c.id) AS members,
+              m.receipts_accepted
        FROM channel_members m
        JOIN channels c ON c.id = m.channel_id
        JOIN users o ON o.id = c.owner_id

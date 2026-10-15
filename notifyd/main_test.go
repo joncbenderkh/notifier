@@ -166,9 +166,11 @@ func newTestApp(t *testing.T) (*app, *bytes.Buffer, *bytes.Buffer) {
 		historyPath: filepath.Join(dir, "state", "notifyd-history.jsonl"),
 		now:         func() time.Time { return time.Unix(testNow, 0) },
 		http:        &http.Client{CheckRedirect: refuseRedirect},
-		desktop:     func(context.Context, AnswerFunc, map[string]string) (Desktop, error) { return newFakeDesktop(), nil },
-		hostname:    func() (string, error) { return "workstation", nil },
-		signals:     func() (context.Context, context.CancelFunc) { return context.WithCancel(context.Background()) },
+		desktop: func(context.Context, AnswerFunc, ReceiptFunc, map[string]string) (Desktop, error) {
+			return newFakeDesktop(), nil
+		},
+		hostname: func() (string, error) { return "workstation", nil },
+		signals:  func() (context.Context, context.CancelFunc) { return context.WithCancel(context.Background()) },
 	}, &stdout, &stderr
 }
 
@@ -317,6 +319,26 @@ func TestRunExitsWhenUnpaired(t *testing.T) {
 		t.Fatalf("run kept its lock: %v", err)
 	}
 	release()
+}
+
+func TestRunReportsReceiptsAsItsDevice(t *testing.T) {
+	api := newFakeAPI(t) // its 404 to the stream's connection ends the run
+	api.status["POST /v1/device/receipts"] = http.StatusNoContent
+	a, _, stderr := newTestApp(t)
+	var receipt ReceiptFunc
+	a.desktop = func(_ context.Context, _ AnswerFunc, r ReceiptFunc, _ map[string]string) (Desktop, error) {
+		receipt = r
+		return newFakeDesktop(), nil
+	}
+	saveState(a.statePath, State{URL: api.URL, DeviceID: testDevice, DeviceToken: "nd_1", SealKey: testKey})
+	if code := a.run([]string{"run"}); code != exitUnpaired {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	receipt("msg_r", receiptOpened)
+	last := len(api.requests) - 1
+	if api.requests[last] != "POST /v1/device/receipts Bearer nd_1" || api.bodies[last]["message_id"] != "msg_r" || api.bodies[last]["state"] != "opened" {
+		t.Fatalf("requests %q, bodies %v", api.requests, api.bodies)
+	}
 }
 
 func TestRunRefusesASecondDaemon(t *testing.T) {

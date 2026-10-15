@@ -22,6 +22,8 @@ data class Payload(
     @SerialName("channel_id") val channelId: String? = null,
     /** Set when this device may answer the message's question. */
     val reply: Reply? = null,
+    /** Set when the sender asked to know when this device shows and opens it. */
+    val receipts: Boolean = false,
 )
 
 /** A question's answers, the one-time key to seal one under, and when it expires (Unix seconds). */

@@ -14,6 +14,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import androidx.core.app.NotificationCompat
@@ -28,6 +29,9 @@ object Notifications {
 
     /** The question's title, kept on its notification while the title shows an outcome. */
     private const val EXTRA_QUESTION = "com.joncbenderkh.notifier.QUESTION"
+
+    private const val POSTED_CHECKS = 10
+    private const val POSTED_PAUSE_MS = 100L
 
     private val SOUND = AudioAttributes.Builder()
         .setUsage(AudioAttributes.USAGE_NOTIFICATION)
@@ -46,40 +50,72 @@ object Notifications {
     /**
      * Shows [payload], received as [deviceId], with a button for each answer
      * it may give; once [outcome] settles the question, that outcome instead,
-     * quietly, as [showOutcome] left it.
+     * quietly, as [showOutcome] left it. False when the user does not let
+     * it show; Android can still drop it (see [posted]).
      */
-    fun show(context: Context, payload: Payload, deviceId: String, outcome: String?) {
+    fun show(context: Context, payload: Payload, deviceId: String, outcome: String?): Boolean {
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
             PackageManager.PERMISSION_GRANTED
-        ) return
+        ) return false
 
         val high = payload.priority == "high"
         val route = ChannelRoute.of(payload)
         if (route.groupId != null) createGroup(context, route.groupId, route.groupName ?: route.groupId)
         val text = NotificationText.of(payload, outcome)
-        val builder = NotificationCompat.Builder(context, channelFor(context, route))
+        val channelId = channelFor(context, route)
+        val builder = NotificationCompat.Builder(context, channelId)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(text.title)
             .setContentText(text.text)
-            .setSubText(payload.channel?.takeIf { route.groupId != null })
+            // Tells the user that opening it tells the sender.
+            .setSubText(
+                listOfNotNull(payload.channel?.takeIf { route.groupId != null }, "read receipt".takeIf { payload.receipts })
+                    .joinToString(" · ")
+                    .ifEmpty { null },
+            )
             .setStyle(NotificationCompat.BigTextStyle().bigText(text.text))
             .setSilent(text.settled)
             .setPriority(if (high) NotificationCompat.PRIORITY_HIGH else NotificationCompat.PRIORITY_DEFAULT)
             .setWhen(payload.sentAt * 1000)
             .setShowWhen(true)
-            .setContentIntent(openHistory(context))
+            .setContentIntent(openHistory(context, (payload.id to deviceId).takeIf { payload.receipts }))
             .setAutoCancel(true)
             .addExtras(Bundle().apply { putString(EXTRA_QUESTION, payload.title) })
         val reply = payload.reply?.takeUnless { text.settled }
-        if (reply != null) addAnswers(context, builder, payload.id, reply, deviceId)
+        if (reply != null) addAnswers(context, builder, payload.id, reply, deviceId, payload.receipts)
         NotificationManagerCompat.from(context).notify(payload.id, 0, builder.build())
+        return allowed(context, channelId)
+    }
+
+    /**
+     * Whether message [id]'s notification is showing: Android drops one when
+     * too many show or the app posts too often. It posts asynchronously, so
+     * this blocks for up to a second.
+     */
+    fun posted(context: Context, id: String): Boolean {
+        val manager = NotificationManagerCompat.from(context)
+        repeat(POSTED_CHECKS) {
+            if (manager.activeNotifications.any { it.tag == id && it.id == 0 }) return true
+            Thread.sleep(POSTED_PAUSE_MS)
+        }
+        return false
+    }
+
+    /** Whether notifications in [channelId] reach the user: not turned off for the app, the channel or its group. */
+    private fun allowed(context: Context, channelId: String): Boolean {
+        val manager = context.getSystemService(NotificationManager::class.java)
+        if (!manager.areNotificationsEnabled()) return false
+        val channel = manager.getNotificationChannel(channelId) ?: return false
+        if (channel.importance == NotificationManager.IMPORTANCE_NONE) return false
+        val group = channel.group ?: return true
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.P || manager.getNotificationChannelGroup(group)?.isBlocked != true
     }
 
     /** Adds a button per answer, and has them removed when the question expires. */
-    private fun addAnswers(context: Context, builder: NotificationCompat.Builder, id: String, reply: Reply, deviceId: String) {
+    private fun addAnswers(context: Context, builder: NotificationCompat.Builder, id: String, reply: Reply, deviceId: String, receipts: Boolean) {
         if (System.currentTimeMillis() / 1000 >= reply.expiresAt) return
         reply.options.forEachIndexed { i, option ->
-            builder.addAction(0, option, ReplyReceiver.intent(context, id, reply, i, deviceId))
+            builder.addAction(0, option, ReplyReceiver.intent(context, id, reply, i, deviceId, receipts))
         }
         // Inexact: the buttons may outlive the question a little, and a tap
         // then says it expired.
@@ -105,9 +141,10 @@ object Notifications {
     /**
      * Shows [outcome] in place of message [id]'s notification, with its
      * question below, if it is still showing; quietly, since it answers a
-     * tap. [retry], for an outcome that may still change, keeps the buttons.
+     * tap. [retry], for an outcome that may still change, keeps the buttons
+     * ([receipts] if the sender asked for them).
      */
-    fun showOutcome(context: Context, id: String, outcome: String, retry: Pair<Reply, String>? = null) {
+    fun showOutcome(context: Context, id: String, outcome: String, retry: Pair<Reply, String>? = null, receipts: Boolean = false) {
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
             PackageManager.PERMISSION_GRANTED
         ) return
@@ -124,19 +161,31 @@ object Notifications {
             .setWhen(shown.notification.`when`)
             .setShowWhen(true)
             .setSilent(true)
-            .setContentIntent(openHistory(context))
+            // The tap still reports a message sent with receipts opened.
+            .setContentIntent(shown.notification.contentIntent ?: openHistory(context))
             .setAutoCancel(true)
-        if (retry != null) addAnswers(context, builder, id, retry.first, retry.second)
+        if (retry != null) addAnswers(context, builder, id, retry.first, retry.second, receipts)
         manager.notify(id, 0, builder.build())
     }
 
-    private fun openHistory(context: Context) = PendingIntent.getActivity(
-        context,
-        0,
-        Intent(context, MainActivity::class.java).putExtra(EXTRA_OPEN_HISTORY, true),
-        // UPDATE_CURRENT: an intent cached without the extra must not be reused.
-        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-    )
+    /**
+     * Opens the history; for [tracked], a message ID and the device that
+     * received it, through [OpenedActivity], which also reports the message
+     * opened. Each tracked message gets its own intent (by its data), since
+     * Android matches cached intents ignoring extras.
+     */
+    private fun openHistory(context: Context, tracked: Pair<String, String>? = null): PendingIntent {
+        val intent = if (tracked == null) {
+            Intent(context, MainActivity::class.java).putExtra(EXTRA_OPEN_HISTORY, true)
+        } else {
+            Intent(context, OpenedActivity::class.java)
+                .setData(Uri.fromParts("notifier-open", tracked.first, null))
+                .putExtra(OpenedActivity.EXTRA_MESSAGE_ID, tracked.first)
+                .putExtra(OpenedActivity.EXTRA_DEVICE_ID, tracked.second)
+        }
+        // UPDATE_CURRENT: an intent cached without the extras must not be reused.
+        return PendingIntent.getActivity(context, 0, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+    }
 
     /** Creates (or renames) a Notifier channel's group and its channels. */
     private fun createGroup(context: Context, groupId: String, name: String) {

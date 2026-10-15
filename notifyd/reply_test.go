@@ -7,6 +7,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"encoding/base64"
+	"errors"
 	"net/http"
 	"slices"
 	"strings"
@@ -164,6 +165,7 @@ type fakeBus struct {
 	calls chan []any
 	next  uint32
 	caps  []string
+	err   error // what Notify fails with, if set
 }
 
 func (b *fakeBus) CallWithContext(_ context.Context, method string, _ dbus.Flags, args ...any) *dbus.Call {
@@ -174,6 +176,9 @@ func (b *fakeBus) CallWithContext(_ context.Context, method string, _ dbus.Flags
 	}
 	b.next++
 	b.calls <- args
+	if b.err != nil {
+		return &dbus.Call{Err: b.err}
+	}
 	return &dbus.Call{Body: []any{b.next}}
 }
 
@@ -566,5 +571,144 @@ func TestPicksASoundAndKeepsOutcomesQuiet(t *testing.T) {
 	}
 	if hints := bus.call(t)[6].(map[string]dbus.Variant); hints["sound-file"].Value() != nil {
 		t.Fatalf("a sound without sound files: %v", hints)
+	}
+}
+
+func TestReportsReceiptsWhenAsked(t *testing.T) {
+	bus := &fakeBus{calls: make(chan []any, 10)}
+	receipts := make(chan string, 10)
+	d := &dbusDesktop{
+		object:  func(string) dbus.BusObject { return bus },
+		actions: true,
+		owner:   ":1.5",
+		now:     func() time.Time { return time.Unix(testNow, 0) },
+		pending: map[uint32]question{},
+		receipt: func(id, state string) { receipts <- id + "=" + state },
+		answer:  func(string, histfile.Reply, string) string { return "The question has expired" },
+	}
+	show := func(p Payload) []any {
+		t.Helper()
+		if err := d.show(context.Background(), p); err != nil {
+			t.Fatal(err)
+		}
+		return bus.call(t)
+	}
+	click := func(nid uint32) {
+		d.signal(0, &dbus.Signal{Sender: ":1.5", Name: notificationsInterface + ".ActionInvoked", Body: []any{nid, openAction}})
+	}
+	next := func() string {
+		t.Helper()
+		select {
+		case r := <-receipts:
+			return r
+		case <-time.After(5 * time.Second):
+			t.Fatal("no receipt")
+			return ""
+		}
+	}
+
+	if args := show(Payload{ID: "msg_plain", Title: "hi"}); len(args[5].([]string)) != 0 {
+		t.Fatalf("actions %v without receipts", args[5])
+	}
+	click(1)
+	if args := show(Payload{ID: "msg_r", Title: "Disk full", Receipts: true}); !slices.Equal(args[5].([]string), []string{openAction, "Mark seen"}) {
+		t.Fatalf("actions %v", args[5])
+	}
+	if r := next(); r != "msg_r=shown" {
+		t.Fatalf("receipt %q", r)
+	}
+	click(2)
+	click(2) // once is enough
+	if r := next(); r != "msg_r=opened" {
+		t.Fatalf("receipt %q", r)
+	}
+	q := testQuestion
+	args := show(Payload{ID: "msg_q", Title: "Deploy?", Reply: &q, Receipts: true})
+	// Its answers report the opening; an Open action would replace dunst's menu of them.
+	if !slices.Equal(args[5].([]string), []string{"0", "yes", "1", "no"}) {
+		t.Fatalf("actions %v", args[5])
+	}
+	next() // shown
+	// A click the service sends unoffered neither reports nor drops the question.
+	click(3)
+	// Expired, the answer never reaches the server, which would count it.
+	d.signal(0, &dbus.Signal{Sender: ":1.5", Name: notificationsInterface + ".ActionInvoked", Body: []any{uint32(3), "0"}})
+	if r := next(); r != "msg_q=opened" {
+		t.Fatalf("receipt %q", r)
+	}
+	bus.call(t) // the outcome
+	select {
+	case r := <-receipts:
+		t.Fatalf("extra receipt %q", r)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestReportsShownWithoutActionsButNotWhenRefused(t *testing.T) {
+	bus := &fakeBus{calls: make(chan []any, 10)}
+	receipts := make(chan string, 10)
+	d := &dbusDesktop{
+		object:  func(string) dbus.BusObject { return bus },
+		owner:   ":1.5",
+		now:     func() time.Time { return time.Unix(testNow, 0) },
+		pending: map[uint32]question{},
+		receipt: func(id, state string) { receipts <- id + "=" + state },
+	}
+	if err := d.show(context.Background(), Payload{ID: "msg_r", Title: "Disk full", Receipts: true}); err != nil {
+		t.Fatal(err)
+	}
+	if args := bus.call(t); len(args[5].([]string)) != 0 {
+		t.Fatalf("actions %v without the actions capability", args[5])
+	}
+	select {
+	case r := <-receipts:
+		if r != "msg_r=shown" {
+			t.Fatalf("receipt %q", r)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no shown receipt")
+	}
+	bus.err = dbus.Error{Name: "org.freedesktop.DBus.Error.InvalidArgs"}
+	if err := d.show(context.Background(), Payload{ID: "msg_x", Title: "Refused", Receipts: true}); !errors.Is(err, errRejected) {
+		t.Fatalf("err %v", err)
+	}
+	bus.call(t)
+	select {
+	case r := <-receipts:
+		t.Fatalf("receipt %q for a refused message", r)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestKeepsBoundedNotificationsForActions(t *testing.T) {
+	now := time.Unix(testNow, 0)
+	d := &dbusDesktop{pending: map[uint32]question{}}
+	open := histfile.Reply{Options: []string{"yes"}, ExpiresAt: testNow + 60}
+	d.pending[1] = question{id: "msg_q", reply: open, shown: now.Add(-time.Hour)}
+	for i := range maxPending - 1 {
+		d.pending[uint32(i+2)] = question{id: "msg_r", receipts: true, shown: now.Add(time.Duration(i) * time.Second)}
+	}
+	d.evictUnanswerable(now)
+	if _, ok := d.pending[1]; !ok || len(d.pending) != maxPending-1 {
+		t.Fatalf("kept %d, the open question: %v", len(d.pending), ok)
+	}
+	if _, ok := d.pending[2]; ok {
+		t.Fatal("the oldest message without answers stayed")
+	}
+}
+
+func TestPostsAReceipt(t *testing.T) {
+	api := newFakeAPI(t)
+	a, _, stderr := newTestApp(t)
+	st := State{URL: api.URL, DeviceID: "dev_new", DeviceToken: "nd_new", SealKey: testKey}
+	api.status["POST /v1/device/receipts"] = http.StatusNoContent
+	a.receipt(st, "msg_r", receiptOpened)
+	if api.requests[0] != "POST /v1/device/receipts Bearer nd_new" || api.bodies[0]["message_id"] != "msg_r" || api.bodies[0]["state"] != "opened" {
+		t.Fatalf("requests %q, bodies %v", api.requests, api.bodies)
+	}
+	api.status["POST /v1/device/receipts"] = http.StatusNotFound
+	a.receipt(st, "msg_r", receiptShown)
+	if !strings.Contains(stderr.String(), "could not report message msg_r as shown") {
+		t.Fatalf("stderr %q", stderr.String())
 	}
 }

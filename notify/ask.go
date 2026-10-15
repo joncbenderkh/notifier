@@ -69,7 +69,8 @@ func (c *cli) askCmd(args, to, channels, options []string, high *bool, wait time
 	}
 	// Standard output is kept for the answer. Other members' devices count
 	// only when they may answer.
-	client, id, code := c.deliver(n, to, args[1:], c.stderr, anyone)
+	client, result, code := c.deliver(n, to, args[1:], c.stderr, anyone)
+	id := result.ID
 	if id == "" {
 		if code == exitUndelivered {
 			fmt.Fprintln(c.stderr, "notify: no device that may answer got the question")
@@ -82,46 +83,33 @@ func (c *cli) askCmd(args, to, channels, options []string, high *bool, wait time
 // await polls for the answer to [id] until the server reports one or the
 // question expires.
 func (c *cli) await(client *Client, id string, key []byte, options []string, wait time.Duration) int {
-	// The server's clock decides; this one only stops a server that never does.
-	giveUp := time.Now().Add(giveUpAfter(wait))
-	var lastErr error
-	for failures := 0; time.Now().Before(giveUp); {
-		ctx, cancel := context.WithTimeout(context.Background(), maxPollSeconds*time.Second+c.timeout)
+	code, settled, lastErr := c.longPoll(wait, func(ctx context.Context) (int, bool, error) {
 		r, err := client.Reply(ctx, id, maxPollSeconds)
-		cancel()
-		lastErr = err
-		var apiErr *APIError
-		if errors.As(err, &apiErr) && apiErr.Status < 500 && apiErr.Status != http.StatusTooManyRequests {
-			return fail(c.stderr, err, c.sendCredName)
-		}
 		if err != nil {
-			// A dropped connection or a server hiccup; the answer waits on
-			// the server.
-			if failures++; failures == 1 {
-				fmt.Fprintln(c.stderr, "notify: still waiting:", err)
-			}
-			time.Sleep(min(time.Duration(failures)*retryPause, 30*time.Second))
-			continue
+			return 0, false, err
 		}
-		failures = 0
 		switch r.Status {
 		case "answered":
 			answer, err := openReply(key, id, r.N, r.C)
 			if err != nil {
 				fmt.Fprintln(c.stderr, "notify: unreadable answer:", err)
-				return exitError
+				return exitError, true, nil
 			}
 			if !slices.Contains(options, answer) {
 				fmt.Fprintf(c.stderr, "notify: the answer %q is not one of the options\n", clean(answer))
-				return exitError
+				return exitError, true, nil
 			}
 			fmt.Fprintln(c.stderr, "answered by", clean(r.By))
 			fmt.Fprintln(c.stdout, answer)
-			return 0
+			return 0, true, nil
 		case "expired":
 			fmt.Fprintf(c.stderr, "notify: no answer within %s\n", wait)
-			return exitNoAnswer
+			return exitNoAnswer, true, nil
 		}
+		return 0, false, nil
+	})
+	if settled {
+		return code
 	}
 	if lastErr != nil {
 		// It may have been answered; only the server can say.
@@ -130,6 +118,40 @@ func (c *cli) await(client *Client, id string, key []byte, options []string, wai
 	}
 	fmt.Fprintf(c.stderr, "notify: no answer within %s\n", wait)
 	return exitNoAnswer
+}
+
+// longPoll calls [once] with a context good for one long poll until it
+// settles, retrying dropped connections and server errors, for at most
+// giveUpAfter([wait]): the server's clock decides, this one only stops a
+// server that never does. It returns the exit code [once] settled with, or,
+// when it never settled, the last poll's error.
+func (c *cli) longPoll(wait time.Duration, once func(context.Context) (code int, settled bool, err error)) (int, bool, error) {
+	giveUp := time.Now().Add(giveUpAfter(wait))
+	var lastErr error
+	for failures := 0; time.Now().Before(giveUp); {
+		ctx, cancel := context.WithTimeout(context.Background(), maxPollSeconds*time.Second+c.timeout)
+		code, settled, err := once(ctx)
+		cancel()
+		lastErr = err
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && apiErr.Status < 500 && apiErr.Status != http.StatusTooManyRequests {
+			return fail(c.stderr, err, c.sendCredName), true, nil
+		}
+		if err != nil {
+			// A dropped connection or a server hiccup; the state waits on
+			// the server.
+			if failures++; failures == 1 {
+				fmt.Fprintln(c.stderr, "notify: still waiting:", err)
+			}
+			time.Sleep(min(time.Duration(failures)*retryPause, 30*time.Second))
+			continue
+		}
+		failures = 0
+		if settled {
+			return code, true, nil
+		}
+	}
+	return 0, false, lastErr
 }
 
 // openReply opens a device's sealed answer to the question [id].

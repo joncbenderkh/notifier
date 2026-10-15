@@ -37,6 +37,7 @@ type Notification struct {
 	Channels  []string  `json:"channels,omitempty"`
 	DeviceIDs []string  `json:"device_ids,omitempty"`
 	Question  *Question `json:"question,omitempty"`
+	Receipts  bool      `json:"receipts,omitempty"`
 }
 
 type Delivery struct {
@@ -51,6 +52,8 @@ type NotifyResult struct {
 	ID         string         `json:"id"`
 	Deliveries []Delivery     `json:"deliveries"`
 	Members    map[string]int `json:"members,omitempty"`
+	// Tracked counts the devices that report receipts, when asked for.
+	Tracked *int `json:"tracked,omitempty"`
 }
 
 // APIError is a non-2xx response, carrying the server's error message.
@@ -95,6 +98,35 @@ type ReplyState struct {
 func (c *Client) Reply(ctx context.Context, id string, wait int) (ReplyState, error) {
 	var r ReplyState
 	path := fmt.Sprintf("/v1/replies/%s?wait=%d", url.PathEscape(id), wait)
+	return r, c.do(ctx, http.MethodGet, path, nil, &r)
+}
+
+// Receipts says which devices showed and opened a message sent with
+// receipts; other members' devices only as counts.
+type Receipts struct {
+	Status  string          `json:"status"`
+	Devices []DeviceReceipt `json:"devices"`
+	// Members counts other members' devices: how many report, and did.
+	Members struct {
+		Tracked int `json:"tracked"`
+		Shown   int `json:"shown"`
+		Opened  int `json:"opened"`
+	} `json:"members"`
+}
+
+// DeviceReceipt holds when one of the sender's devices showed and opened a
+// message, in Unix seconds; zero when it has not.
+type DeviceReceipt struct {
+	DeviceID string `json:"device_id"`
+	Name     string `json:"name"`
+	ShownAt  int64  `json:"shown_at"`
+	OpenedAt int64  `json:"opened_at"`
+}
+
+// Receipts waits up to [wait] seconds for a device to open the message [id].
+func (c *Client) Receipts(ctx context.Context, id string, wait int) (Receipts, error) {
+	var r Receipts
+	path := fmt.Sprintf("/v1/notifications/%s?wait=%d", url.PathEscape(id), wait)
 	return r, c.do(ctx, http.MethodGet, path, nil, &r)
 }
 
@@ -164,6 +196,11 @@ type Channel struct {
 	Name    string `json:"name"`
 	Owned   bool   `json:"owned"`
 	Members int    `json:"members"`
+	// Receipts is whether other members' devices report receipts: off,
+	// optional or required; ReceiptsAccepted, whether this member turned
+	// them on.
+	Receipts         string `json:"receipts"`
+	ReceiptsAccepted bool   `json:"receipts_accepted"`
 }
 
 func (c *Client) Channels(ctx context.Context) ([]Channel, error) {
@@ -174,6 +211,19 @@ func (c *Client) Channels(ctx context.Context) ([]Channel, error) {
 func (c *Client) CreateChannel(ctx context.Context, name string) (Channel, error) {
 	var ch Channel
 	return ch, c.do(ctx, http.MethodPost, "/v1/channels", map[string]string{"name": name}, &ch)
+}
+
+// SetChannelReceipts sets whether other members' devices report receipts
+// on the caller's channel [id]: off, optional or required.
+func (c *Client) SetChannelReceipts(ctx context.Context, id, policy string) error {
+	return c.do(ctx, http.MethodPatch, "/v1/channels/"+url.PathEscape(id), map[string]string{"receipts": policy}, nil)
+}
+
+// AcceptReceipts records whether the caller, a member of channel [id],
+// accepts receipts there, and returns the channel's receipt settings.
+func (c *Client) AcceptReceipts(ctx context.Context, id string, accepted bool) (Channel, error) {
+	var ch Channel
+	return ch, c.do(ctx, http.MethodPatch, "/v1/memberships/"+url.PathEscape(id), map[string]bool{"receipts_accepted": accepted}, &ch)
 }
 
 func (c *Client) DeleteChannel(ctx context.Context, id string) error {

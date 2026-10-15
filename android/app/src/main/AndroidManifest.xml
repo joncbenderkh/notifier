@@ -46,6 +46,16 @@
             android:name="com.google.mlkit.vision.DEPENDENCIES"
             android:value="barcode_ui" />
 
+        <!-- A tap on a message sent with receipts: reports it opened, then
+             opens MainActivity. Not exported, so no other app can report. -->
+        <activity
+            android:name=".push.OpenedActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.NoDisplay" />
+
         <receiver
             android:name=".push.ReplyReceiver"
             android:exported="false" />
