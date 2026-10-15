@@ -274,6 +274,34 @@ question in its history until it expires; either way, the notification
 then says what became of the answer. notifyd shows them too (see
 [notifyd](#linux-desktop-notifyd)).
 
+### Links
+
+A message can open a web page when tapped, and carry up to three buttons
+that each open their own:
+
+```sh
+notify send --link "$RUN_URL" --action "Logs=$RUN_URL/logs" \
+  --action "Re-run=$RUN_URL/rerun" "Build failed" "main, job test"
+```
+
+Links are only opened, in your browser, when you tap one: a button
+never sends a request in the background. Still, tapping a message with
+a link opens the sender's URL, whatever it is, so on a channel you
+joined, treat a link as you would one in an email: it may lead into
+your own network (`http://192.168.1.1/...`), with your browser's
+cookies. Only `http` and `https` links are accepted, and the server
+sends each in the form a browser opens (a non-ASCII host in punycode),
+so the host shown is the one visited. Android buttons and history cards
+name each link's host ("Logs · ci.example"). On a desktop, the click
+(dunst: middle-click) opens `--link`, and the buttons are actions
+(dunst: its context menu); a service without actions lists the links in
+the body, and `notifyd history`, the history window and the i3blocks
+viewer show them. A question's buttons are its answers, so `notify ask`
+takes `--link` but no `--action`. Opening a link of a message sent with
+receipts counts as opening it. Webhooks add a link where the tool sends
+one: an Alertmanager or Grafana alert's `generatorURL` (one alert) or
+`externalURL`, or `url` in the generic format.
+
 ### Receipts
 
 A script can wait until someone has seen a message, and escalate if not:
@@ -361,8 +389,10 @@ send flags:
                    its ID for `notify status`
   --wait-seen[=D]  then wait until a device opens it (default 10m, 10s to
                    24h); exits 4 if none does
+  --link URL       http(s) link that tapping the notification opens
+  --action L=URL   a button labelled L that opens URL; repeatable, at most 3
 
-ask flags: those of send, plus
+ask flags: --to, -c, --high and --link as for send, plus
   -o, --options A  the answers to offer, at most 3; repeatable or comma-separated
   --wait D         how long the question stays open (default 10m, 10s to 24h)
   --anyone         let other channel members' devices answer too
@@ -577,7 +607,7 @@ another user's device or key IDs answer 404.
 
 | Method & path                     | Auth                 | Body / notes |
 |-----------------------------------|----------------------|--------------|
-| `POST /v1/notifications`          | User or API key      | `{"title", "body"?, "priority"?: "default"\|"high", "channels"?: [names], "device_ids"?: [...]}` — reaches devices subscribed to the named channels (the caller's own) plus the listed devices, each once; with neither, the `default` channel. Returns per-device delivery status for the sender's own devices, and `members` (counts by status) for other members'. At most 60 a minute per user (429 after). An optional `"question": {"options": [1–3 answers], "key": <32 bytes, base64>, "expires_in"?: 10–86400 (600), "anyone"?: false}` asks for an answer: see [Replies](#replies). `"receipts": true` asks the devices to report when they show and open it, and adds `tracked`, how many devices that got it will. |
+| `POST /v1/notifications`          | User or API key      | `{"title", "body"?, "priority"?: "default"\|"high", "channels"?: [names], "device_ids"?: [...]}` — reaches devices subscribed to the named channels (the caller's own) plus the listed devices, each once; with neither, the `default` channel. Returns per-device delivery status for the sender's own devices, and `members` (counts by status) for other members'. At most 60 a minute per user (429 after). An optional `"question": {"options": [1–3 answers], "key": <32 bytes, base64>, "expires_in"?: 10–86400 (600), "anyone"?: false}` asks for an answer: see [Replies](#replies). `"receipts": true` asks the devices to report when they show and open it, and adds `tracked`, how many devices that got it will. `"url"` (http or https, no credentials, ≤ 2048 bytes) is opened by a tap, and `"actions": [{"label" (1–40 characters), "url"}]` (1–3, not with a question) are buttons that open theirs: see [Links](#links). |
 | `GET /v1/notifications/{message id}?wait=N` | User or API key | For a message sent with `receipts`, within a day: waits up to N seconds (0–50) until a device opens it; `{"id", "status": "pending"\|"opened", "devices": [{"device_id", "name", "shown_at"?, "opened_at"?}], "members": {"tracked", "shown", "opened"}}`, the sender's own devices listed and other members' counted |
 | `GET /v1/replies/{message id}?wait=N` | User or API key  | Waits up to N seconds (0–50) for the answer; `{"status": "pending"\|"expired"}` or `{"status": "answered", "by", "replied_at", "n", "c"}` |
 | `GET /v1/devices`                 | User or API key      | `transport` (`fcm` or `ws`); activity timestamps only with a user token |
