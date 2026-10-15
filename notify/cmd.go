@@ -67,7 +67,8 @@ func newRoot(c *cli) *cobra.Command {
 	pf.DurationVar(&sf.timeout, "timeout", 30*time.Second, "request timeout, counted from when the request starts")
 
 	var to, channels []string
-	var high bool
+	var high, receipts bool
+	var waitSeen seenWait
 	send := &cobra.Command{
 		Use:   "send [flags] TITLE [BODY | -]",
 		Short: "Send a notification",
@@ -78,7 +79,8 @@ func newRoot(c *cli) *cobra.Command {
 			"body from a variable can never act as a flag. Put -- before a TITLE that\n" +
 			"starts with -.",
 		Example: "  notify send \"Backup done\" \"42 GB in 3 min\"\n" +
-			"  make 2>&1 | notify send --high -c builds \"Build failed\" -",
+			"  make 2>&1 | notify send --high -c builds \"Build failed\" -\n" +
+			"  notify send --high --wait-seen=5m \"Disk full\" || page-someone",
 		Args:        cobra.RangeArgs(1, 2),
 		Annotations: map[string]string{flagsEndAtArgs: "yes"},
 	}
@@ -87,12 +89,25 @@ func newRoot(c *cli) *cobra.Command {
 		if send.Flags().Changed("high") {
 			h = &high
 		}
-		return c.sendCmd(args, splitList(to), splitList(channels), h)
+		var w *time.Duration
+		if send.Flags().Changed("wait-seen") {
+			w = &waitSeen.d
+			// The duration is optional, so "--wait-seen 5m TITLE" reads 5m as
+			// the title.
+			if waitSeen.bare && send.ArgsLenAtDash() != 0 && looksLikeDuration(args[0]) {
+				fmt.Fprintln(c.stderr, "notify: --wait-seen takes its duration after =, as in --wait-seen=5m; put -- before a title that looks like a duration")
+				return exitUsage
+			}
+		}
+		return c.sendCmd(args, splitList(to), splitList(channels), h, receipts, w)
 	})
 	send.Flags().SetInterspersed(false)
 	send.Flags().StringArrayVar(&to, "to", nil, "device `name or ID` to notify; repeatable or comma-separated")
 	send.Flags().StringArrayVarP(&channels, "channel", "c", nil, "own `channel` to publish to; repeatable or comma-separated (default: the config file's, else default)")
 	send.Flags().BoolVar(&high, "high", false, "send as high priority (heads-up, may wake the phone)")
+	send.Flags().BoolVar(&receipts, "receipts", false, "ask devices to report when they show and open it, and print its ID for notify status")
+	send.Flags().Var(&waitSeen, "wait-seen", "wait up to `duration` (10s to 24h) until a device opens it, and exit 4 if none does; implies --receipts")
+	send.Flags().Lookup("wait-seen").NoOptDefVal = bareSeenWait
 
 	var askTo, askChannels, options []string
 	var askHigh, anyone bool
@@ -199,6 +214,9 @@ func newRoot(c *cli) *cobra.Command {
 	root.AddCommand(
 		send,
 		ask,
+		leaf("status ID", "Show when devices showed and opened a message sent with receipts", cobra.ExactArgs(1), func(args []string) int {
+			return c.status(args[0])
+		}),
 		&cobra.Command{
 			Use:   "version",
 			Short: "Print the version",

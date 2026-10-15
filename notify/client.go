@@ -37,6 +37,7 @@ type Notification struct {
 	Channels  []string  `json:"channels,omitempty"`
 	DeviceIDs []string  `json:"device_ids,omitempty"`
 	Question  *Question `json:"question,omitempty"`
+	Receipts  bool      `json:"receipts,omitempty"`
 }
 
 type Delivery struct {
@@ -95,6 +96,33 @@ type ReplyState struct {
 func (c *Client) Reply(ctx context.Context, id string, wait int) (ReplyState, error) {
 	var r ReplyState
 	path := fmt.Sprintf("/v1/replies/%s?wait=%d", url.PathEscape(id), wait)
+	return r, c.do(ctx, http.MethodGet, path, nil, &r)
+}
+
+// Receipts says which devices showed and opened a message sent with
+// receipts; other members' devices only as counts.
+type Receipts struct {
+	Status  string          `json:"status"`
+	Devices []DeviceReceipt `json:"devices"`
+	Members struct {
+		Shown  int `json:"shown"`
+		Opened int `json:"opened"`
+	} `json:"members"`
+}
+
+// DeviceReceipt holds when one of the sender's devices showed and opened a
+// message, in Unix seconds; zero when it has not.
+type DeviceReceipt struct {
+	DeviceID string `json:"device_id"`
+	Name     string `json:"name"`
+	ShownAt  int64  `json:"shown_at"`
+	OpenedAt int64  `json:"opened_at"`
+}
+
+// Receipts waits up to [wait] seconds for a device to open the message [id].
+func (c *Client) Receipts(ctx context.Context, id string, wait int) (Receipts, error) {
+	var r Receipts
+	path := fmt.Sprintf("/v1/notifications/%s?wait=%d", url.PathEscape(id), wait)
 	return r, c.do(ctx, http.MethodGet, path, nil, &r)
 }
 

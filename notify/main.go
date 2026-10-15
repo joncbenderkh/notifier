@@ -46,6 +46,7 @@ const (
 	exitUsage       = 2
 	exitUndelivered = 3
 	// exitNoAnswer (4), in ask.go: a question expired unanswered.
+	// exitNotSeen (4), in receipts.go: no device opened the message in time.
 
 	// maxTitleBytes and maxBodyBytes mirror the server's limits.
 	maxTitleBytes = 256
@@ -191,11 +192,27 @@ func (c *cli) resolve(f settingsFlags, loadFile bool) int {
 }
 
 // sendCmd sends [args] (TITLE [BODY | -]); [high] is nil unless --high was
-// given, so the config file's priority applies otherwise.
-func (c *cli) sendCmd(args, to, channels []string, high *bool) int {
+// given, so the config file's priority applies otherwise, and [waitSeen]
+// is nil unless --wait-seen was given.
+func (c *cli) sendCmd(args, to, channels []string, high *bool, receipts bool, waitSeen *time.Duration) int {
+	if waitSeen != nil && (*waitSeen < minAskWait || *waitSeen > maxAskWait) {
+		fmt.Fprintf(c.stderr, "notify: --wait-seen must be %s to %s\n", minAskWait, maxAskWait)
+		return exitUsage
+	}
 	n, to := c.notification(args[0], to, channels, high)
-	_, _, code := c.deliver(n, to, args[1:], c.stdout, true)
-	return code
+	n.Receipts = receipts || waitSeen != nil
+	client, id, code := c.deliver(n, to, args[1:], c.stdout, true)
+	if id == "" || !n.Receipts {
+		return code
+	}
+	// For notify status, even while waiting: it may end undecided.
+	fmt.Fprintln(c.stdout, "id:", id)
+	if waitSeen == nil {
+		return code
+	}
+	// Whether it was seen is what the caller waits for, even when some
+	// devices could not be reached.
+	return c.awaitSeen(client, id, *waitSeen)
 }
 
 // notification builds a message titled [title] and returns the devices to
