@@ -132,6 +132,8 @@ export interface Payload {
   url?: string;
   /** Buttons, each opening its own URL; never sent with a question, whose answers are the buttons. */
   actions?: LinkAction[];
+  /** Replaces the sender's earlier notification with the same key on each device. */
+  key?: string;
 }
 
 export interface LinkAction {
@@ -259,6 +261,17 @@ function linkUrl(raw: unknown, field: string): string {
     webLink(raw) ??
     fail(400, `${field} must be an http or https URL of at most ${MAX_LINK_BYTES} bytes, without credentials`)
   );
+}
+
+const NOTIFICATION_KEY = /^[A-Za-z0-9._:-]{1,64}$/;
+
+/** A notification key, or undefined for none: empty means none, as for body and priority. */
+function notificationKey(raw: unknown): string | undefined {
+  if (raw === undefined || raw === null || raw === "") return undefined;
+  if (typeof raw !== "string" || !NOTIFICATION_KEY.test(raw)) {
+    fail(400, "key must be 1 to 64 letters, digits, '.', '_', ':' or '-'");
+  }
+  return raw;
 }
 
 function parseActions(raw: unknown): LinkAction[] {
@@ -1074,7 +1087,8 @@ export function createApp(deps: Deps): Hono<AppEnv> {
       receipts: boolean;
       url: string;
       actions: unknown;
-    }>(c, ["title", "body", "priority", "device_ids", "channels", "question", "receipts", "url", "actions"]);
+      key: string;
+    }>(c, ["title", "body", "priority", "device_ids", "channels", "question", "receipts", "url", "actions", "key"]);
     const title = typeof req.title === "string" ? req.title : "";
     const body = typeof req.body === "string" ? req.body : "";
     if (title.trim() === "") fail(400, "title is required");
@@ -1091,6 +1105,7 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     // Empty means none, as for body and priority.
     const url = req.url === undefined || req.url === null || req.url === "" ? undefined : linkUrl(req.url, "url");
     const actions = parseActions(req.actions);
+    const key = notificationKey(req.key);
     if (actions.length > 0 && req.question !== undefined && req.question !== null) {
       fail(400, "actions cannot go with a question: its answers are the buttons");
     }
@@ -1121,6 +1136,7 @@ export function createApp(deps: Deps): Hono<AppEnv> {
     if (body !== "") base.body = body;
     if (url !== undefined) base.url = url;
     if (actions.length > 0) base.actions = actions;
+    if (key !== undefined) base.key = key;
     let openReceipts: (() => Promise<void>) | undefined;
     let tracked: Set<string> | undefined;
     if (req.receipts === true) {
@@ -1167,7 +1183,7 @@ export function createApp(deps: Deps): Hono<AppEnv> {
         t.device.fcm_token !== "" &&
         sealedDataBytes(payloadFor(t, base, extra)) > MAX_FCM_DATA_BYTES,
     );
-    if (tooLarge) fail(400, "title, body and links are too long once encoded for a phone (at most 4 KiB); shorten them");
+    if (tooLarge) fail(400, "title, body, links and key are too long once encoded for a phone (at most 4 KiB); shorten them");
     // Opened before publishing, so an answer that comes back at once finds it.
     await openBox?.();
     await openReceipts?.();
