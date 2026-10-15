@@ -1346,6 +1346,17 @@ describe("inbound webhooks", () => {
 
     await post(hook.url, { ...firing, status: "resolved", alerts: [{ ...firing.alerts[0], status: "resolved" }] });
     expect(await payloadFor(phone, 1)).toMatchObject({ title: "[RESOLVED] DiskFull", priority: "default" });
+
+    // The alert's link comes along, unless it would push the alert past what FCM carries.
+    const linked = { ...firing, alerts: [{ ...firing.alerts[0], generatorURL: "http://prometheus:9090/graph" }] };
+    await post(hook.url, linked);
+    expect((await payloadFor(phone, 2)).url).toBe("http://prometheus:9090/graph");
+    const long = "http://prometheus:9090/graph?" + "&".repeat(2000);
+    const big = { ...linked, alerts: [{ ...linked.alerts[0], generatorURL: long, annotations: { summary: '"'.repeat(500) } }] };
+    await post(hook.url, big);
+    const p = await payloadFor(phone, 3);
+    expect(p.url).toBeUndefined();
+    expect(p.body).toContain('""');
   });
 
   it("checks the format in the path and the payload", async () => {
@@ -1547,6 +1558,79 @@ describe("questions", () => {
     expect(await poll(id)).toEqual({ status: "pending" });
     await poll(id, 51, USER, 400);
     await call("GET", `/v1/replies/${id}?wait=-1`, USER, undefined, 400);
+  });
+});
+
+describe("links", () => {
+  const send = (body: object, wantStatus = 200) =>
+    call<NotifyResponse & { error: string }>("POST", "/v1/notifications", USER, { title: "Build failed", ...body }, wantStatus);
+
+  it("puts the URL and actions in every payload", async () => {
+    const phone = await pair("phone", "fcm-phone");
+    const actions = [
+      { label: "Logs", url: "https://ci.example/run/7/logs" },
+      { label: " Retry ", url: "http://ci.example/run/7?retry=1" },
+    ];
+    await send({ url: "https://ci.example/run/7", actions });
+    const p = await payloadFor(phone, 0);
+    expect(p.url).toBe("https://ci.example/run/7");
+    expect(p.actions).toEqual([actions[0], { label: "Retry", url: actions[1]!.url }]);
+    await send({ url: "" });
+    const plain = await payloadFor(phone, 1);
+    expect(plain.url).toBeUndefined();
+    expect(plain.actions).toBeUndefined();
+  });
+
+  it("sends each link in the form a browser would open", async () => {
+    const phone = await pair("phone", "fcm-phone");
+    await send({ url: "https://\u0430pple.com/login", actions: [{ label: "Go", url: "https:ci.example" }] });
+    const p = await payloadFor(phone, 0);
+    expect(p.url).toBe("https://xn--pple-43d.com/login");
+    expect(p.actions).toEqual([{ label: "Go", url: "https://ci.example/" }]);
+  });
+
+  it("refuses links a device should not open", async () => {
+    await pair("phone", "fcm-phone");
+    for (const url of [
+      "javascript:alert(1)",
+      "file:///etc/passwd",
+      "intent://x#Intent;end",
+      "https://user:pw@ci.example/",
+      "https://ci.example/a b",
+      "https://ci.example/\u202e",
+      "ci.example",
+      "https://ci.example/" + "x".repeat(2048),
+      42,
+    ]) {
+      expect((await send({ url }, 400)).error).toMatch(/url must be an http or https URL/);
+    }
+    expect((await send({ actions: [{ label: "Go", url: "ftp://x" }] }, 400)).error).toMatch(/actions\[0\]\.url/);
+    expect(sender.sent).toHaveLength(0);
+  });
+
+  it("refuses malformed actions", async () => {
+    await pair("phone", "fcm-phone");
+    const ok = { label: "Go", url: "https://x.example" };
+    expect((await send({ actions: [] }, 400)).error).toMatch(/1 to 3 buttons/);
+    expect((await send({ actions: [ok, ok, ok, ok] }, 400)).error).toMatch(/1 to 3 buttons/);
+    expect((await send({ actions: ok }, 400)).error).toMatch(/1 to 3 buttons/);
+    expect((await send({ actions: ["Go"] }, 400)).error).toMatch(/must be an object/);
+    expect((await send({ actions: [{ ...ok, method: "POST" }] }, 400)).error).toMatch(/unknown field "method"/);
+    for (const label of ["", "  ", "x".repeat(41), "a\nb", 1]) {
+      expect((await send({ actions: [{ ...ok, label }] }, 400)).error).toMatch(/label must be 1 to 40/);
+    }
+    const question = { options: ["yes"], key: toBase64(new Uint8Array(32)) };
+    expect((await send({ actions: [ok], question }, 400)).error).toMatch(/cannot go with a question/);
+    expect(sender.sent).toHaveLength(0);
+    // A link may go with a question: the tap opens it, the buttons answer.
+    await send({ url: ok.url, question });
+  });
+
+  it("counts links toward the FCM size limit", async () => {
+    await pair("phone", "fcm-phone");
+    const url = "https://x.example/" + "&".repeat(2000);
+    const actions = [1, 2, 3].map((i) => ({ label: `a${i}`, url }));
+    expect((await send({ body: "x".repeat(1000), url, actions }, 400)).error).toMatch(/too long once encoded/);
   });
 });
 

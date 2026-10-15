@@ -7,7 +7,7 @@
 // sender cannot be told to fix it.
 
 import type { Payload } from "./app";
-import { cleanText, MAX_BODY_BYTES, MAX_TITLE_BYTES, utf8Length } from "./text";
+import { cleanText, MAX_BODY_BYTES, MAX_TITLE_BYTES, utf8Length, webLink } from "./text";
 
 export const HOOK_SECRET_PREFIX = "nw_";
 export const MAX_HOOKS_PER_USER = 20;
@@ -17,6 +17,8 @@ export interface Message {
   title: string;
   body: string;
   priority: Payload["priority"];
+  /** Where to look: dropped, not refused, when it is no web link. */
+  url?: string;
 }
 
 /** A payload its format cannot read; answered with 400. */
@@ -90,10 +92,14 @@ function alertmanager(json: unknown): Message {
   });
   const truncated = typeof json.truncatedAlerts === "number" && json.truncatedAlerts > 0 ? json.truncatedAlerts : 0;
   const urgent = firing.some((a) => URGENT.has(text(field(a, "labels").severity)?.toLowerCase() ?? ""));
+  // One alert's own source (its rule or graph), else Alertmanager's page for the group.
+  const single = alerts.length === 1 ? alerts[0] : firing.length === 1 ? firing[0] : undefined;
+  const url = webLink(single?.generatorURL) ?? webLink(json.externalURL);
   return {
     title: titleOf(resolved ? `[RESOLVED] ${name}` : `[FIRING:${firing.length + truncated}] ${name}`),
     body: bodyOf(lines, truncated),
     priority: !resolved && urgent ? "high" : "default",
+    ...(url !== undefined ? { url } : {}),
   };
 }
 
@@ -104,14 +110,15 @@ function grafana(json: unknown): Message {
   return title ? { ...m, title: titleOf(title) } : m;
 }
 
-/** {"title": "…", "body": "…", "priority": "default" | "high"}, for anything else. */
+/** {"title": "…", "body": "…", "priority": "default" | "high", "url": "…"}, for anything else. */
 function generic(json: unknown): Message {
   const title = isObject(json) ? text(json.title) : undefined;
   if (!isObject(json) || !title) throw new PayloadError("expected a JSON object with a title");
   const priority = json.priority ?? "default";
   if (priority !== "default" && priority !== "high") throw new PayloadError('priority must be "default" or "high"');
   const body = typeof json.body === "string" ? cleanText(json.body, MAX_BODY_BYTES, "head") : "";
-  return { title: titleOf(title), body, priority };
+  const url = webLink(json.url);
+  return { title: titleOf(title), body, priority, ...(url !== undefined ? { url } : {}) };
 }
 
 /** Each format's parser, by the name in the hook's URL. */
