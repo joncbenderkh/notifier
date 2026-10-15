@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package com.joncbenderkh.notifier.data
 
+import com.joncbenderkh.notifier.push.LinkAction
 import com.joncbenderkh.notifier.push.Payload
 import com.joncbenderkh.notifier.push.Reply
 import org.junit.Assert.assertEquals
@@ -43,6 +44,18 @@ class HistoryTest {
         assertEquals(true, tracked.receipts)
         val history = History().add(tracked, now).add(entry("plain"), now)
         assertEquals(listOf(false, true), History.decode(history.encode()).entries.map { it.receipts })
+    }
+
+    @Test
+    fun keepsTheLinks() {
+        val actions = listOf(LinkAction("Logs", "https://ci.example/7/logs"))
+        val linked = HistoryEntry.of(
+            Payload("msg_l", "Build", sentAt = now, url = "https://ci.example/7", actions = actions),
+            receivedAt = now,
+        )
+        val decoded = History.decode(History().add(linked, now).add(entry("plain"), now).encode()).entries
+        assertEquals(listOf(null, "https://ci.example/7"), decoded.map { it.url })
+        assertEquals(listOf(emptyList(), actions), decoded.map { it.actions })
     }
 
     @Test

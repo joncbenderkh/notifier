@@ -116,6 +116,7 @@ fun NotifierScreen(viewModel: MainViewModel = viewModel()) {
                 answering = state.answering,
                 onAnswer = viewModel::answer,
                 onOpen = viewModel::opened,
+                onLink = viewModel::openLink,
             )
         }
         return

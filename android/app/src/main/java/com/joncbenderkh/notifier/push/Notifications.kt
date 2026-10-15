@@ -22,6 +22,7 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import com.joncbenderkh.notifier.MainActivity
 import com.joncbenderkh.notifier.R
+import com.joncbenderkh.notifier.data.Links
 
 object Notifications {
     /** Set on the intent a tapped notification opens: show the history. */
@@ -78,11 +79,20 @@ object Notifications {
             .setPriority(if (high) NotificationCompat.PRIORITY_HIGH else NotificationCompat.PRIORITY_DEFAULT)
             .setWhen(payload.sentAt * 1000)
             .setShowWhen(true)
-            .setContentIntent(openHistory(context, (payload.id to deviceId).takeIf { payload.receipts }))
+            .setContentIntent(open(context, payload, deviceId, Links.web(payload.url), "notifier-open"))
             .setAutoCancel(true)
             .addExtras(Bundle().apply { putString(EXTRA_QUESTION, payload.title) })
         val reply = payload.reply?.takeUnless { text.settled }
         if (reply != null) addAnswers(context, builder, payload.id, reply, deviceId, payload.receipts)
+        // The server sends none with a question, whose answers are the buttons.
+        if (payload.reply == null) {
+            payload.actions.forEachIndexed { i, action ->
+                val link = Links.web(action.url) ?: return@forEachIndexed
+                if (action.label.isBlank()) return@forEachIndexed
+                // Where it leads, as the history shows it: the sender chose both.
+                builder.addAction(0, "${action.label} · ${Links.host(link)}", open(context, payload, deviceId, link, "notifier-link", "/$i"))
+            }
+        }
         NotificationManagerCompat.from(context).notify(payload.id, 0, builder.build())
         return allowed(context, channelId)
     }
@@ -166,6 +176,25 @@ object Notifications {
             .setAutoCancel(true)
         if (retry != null) addAnswers(context, builder, id, retry.first, retry.second, receipts)
         manager.notify(id, 0, builder.build())
+    }
+
+    /**
+     * Opens [link], or the history when it is null, through [OpenedActivity],
+     * which also reports the message opened if its sender asked; for a
+     * message with neither, just the history. Each message and button gets
+     * its own intent, by its data ([scheme]:<id>[part]), since Android
+     * matches cached intents ignoring extras.
+     */
+    private fun open(context: Context, payload: Payload, deviceId: String, link: String?, scheme: String, part: String = ""): PendingIntent {
+        if (link == null) return openHistory(context, (payload.id to deviceId).takeIf { payload.receipts })
+        val intent = Intent(context, OpenedActivity::class.java)
+            .setData(Uri.fromParts(scheme, payload.id + part, null))
+            .putExtra(OpenedActivity.EXTRA_URL, link)
+        if (payload.receipts) {
+            intent.putExtra(OpenedActivity.EXTRA_MESSAGE_ID, payload.id).putExtra(OpenedActivity.EXTRA_DEVICE_ID, deviceId)
+        }
+        if (part.isNotEmpty()) intent.putExtra(OpenedActivity.EXTRA_DISMISS, payload.id)
+        return PendingIntent.getActivity(context, 0, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
     }
 
     /**

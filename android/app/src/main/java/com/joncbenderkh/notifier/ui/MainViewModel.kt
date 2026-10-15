@@ -19,6 +19,7 @@ import com.joncbenderkh.notifier.data.ServerException
 import com.joncbenderkh.notifier.push.Answers
 import com.joncbenderkh.notifier.push.ChannelRoute
 import com.joncbenderkh.notifier.push.Notifications
+import com.joncbenderkh.notifier.push.OpenedActivity
 import com.joncbenderkh.notifier.push.Receipts
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -105,6 +106,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (!entry.receipts) return
         Receipts.reportLater(getApplication(), entry.id, Receipts.OPENED, deviceId)
         _state.update { it.say("The sender can see you opened it.") }
+    }
+
+    /** Opens [url], one of [entry]'s links, and tells its sender, if they asked for receipts. */
+    fun openLink(entry: HistoryEntry, url: String) {
+        if (OpenedActivity.view(getApplication(), url)) {
+            opened(entry)
+        } else {
+            _state.update { it.say("No app on this phone opens that link.") }
+        }
     }
 
     /** Answers [entry]'s question with [option], and says what became of it. */
