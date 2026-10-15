@@ -42,11 +42,28 @@ const notificationsInterface = "org.freedesktop.Notifications"
 // what became of it, to show in place of the question.
 type AnswerFunc func(id string, q histfile.Reply, option string) string
 
-// question is a shown notification whose buttons answer a question.
+// ReceiptFunc reports that the message [id] was shown or opened (see
+// [receiptShown], [receiptOpened]). It is called off the signal loop.
+type ReceiptFunc func(id, state string)
+
+const (
+	receiptShown  = "shown"
+	receiptOpened = "opened"
+	// openAction is the action a click on the notification invokes.
+	openAction = "default"
+)
+
+// question is a shown notification with actions: buttons that answer its
+// question, if it asks one, and a click that opens it, if its sender asked
+// for receipts.
 type question struct {
-	id    string
-	title string
-	reply histfile.Reply
+	id       string
+	title    string
+	reply    histfile.Reply
+	receipts bool
+	// markable: it was offered [openAction].
+	markable bool
+	shown    time.Time
 	// owner is the service instance that showed it, which alone numbers
 	// it and may answer it; "" when a service was started to show it.
 	owner string
@@ -57,8 +74,9 @@ type question struct {
 // dunst, mako, GNOME, KDE and others implement. A question's answers become
 // actions (buttons) when the service supports them.
 type dbusDesktop struct {
-	answer AnswerFunc
-	now    func() time.Time
+	answer  AnswerFunc
+	receipt ReceiptFunc
+	now     func() time.Time
 	// sounds are the sound files by name (see [sound]); none, no sound hint.
 	sounds map[string]string
 
@@ -85,8 +103,8 @@ type dbusDesktop struct {
 	gen uint64
 }
 
-func connectDesktop(ctx context.Context, answer AnswerFunc, sounds map[string]string) (Desktop, error) {
-	d := &dbusDesktop{answer: answer, now: time.Now, sounds: sounds, pending: map[uint32]question{}}
+func connectDesktop(ctx context.Context, answer AnswerFunc, receipt ReceiptFunc, sounds map[string]string) (Desktop, error) {
+	d := &dbusDesktop{answer: answer, receipt: receipt, now: time.Now, sounds: sounds, pending: map[uint32]question{}}
 	if err := d.connect(ctx); err != nil {
 		return nil, err
 	}
@@ -255,11 +273,47 @@ func (d *dbusDesktop) showOnce(ctx context.Context, p Payload) error {
 		return fmt.Errorf("%w: %v", errRejected, err)
 	}
 	if err == nil && len(n.actions) > 0 {
+		q := question{
+			id: p.ID, title: n.summary, receipts: p.Receipts, markable: slices.Contains(n.actions, openAction),
+			shown: now, owner: owner, gen: d.gen,
+		}
+		if p.Reply != nil {
+			q.reply = *p.Reply
+		}
 		d.mu.Lock()
-		d.pending[id] = question{id: p.ID, title: n.summary, reply: *p.Reply, owner: owner, gen: d.gen}
+		d.evictUnanswerable(now)
+		d.pending[id] = q
 		d.mu.Unlock()
 	}
+	if err == nil && p.Receipts && d.receipt != nil {
+		go d.receipt(p.ID, receiptShown)
+	}
 	return err
+}
+
+// maxPending bounds the notifications kept for their actions: a service
+// may keep a message without answers in a tray, never closing it.
+const maxPending = 500
+
+// evictUnanswerable makes room for one more notification, dropping the
+// oldest whose question is closed or that has none. d.mu is held.
+func (d *dbusDesktop) evictUnanswerable(now time.Time) {
+	if len(d.pending) < maxPending {
+		return
+	}
+	var oldest uint32
+	found := false
+	for nid, q := range d.pending {
+		if len(q.reply.Options) > 0 && now.Unix() < q.reply.ExpiresAt {
+			continue
+		}
+		if !found || q.shown.Before(d.pending[oldest].shown) {
+			oldest, found = nid, true
+		}
+	}
+	if found {
+		delete(d.pending, oldest)
+	}
 }
 
 // ownerChanged records that [owner] now holds the service: questions an
@@ -291,7 +345,8 @@ func (d *dbusDesktop) target(owner string) dbus.BusObject {
 }
 
 // signal handles signals: from the service, an invoked action answers its
-// question, and a closed notification can no longer be answered; from the
+// question or, for a click, reports the message opened, and a closed
+// notification can no longer be answered; from the
 // bus, a new owner of the service makes the questions an earlier one
 // showed unanswerable (its notification IDs are its own) and may support
 // other things. Any other client could send the same signals, so the
@@ -334,11 +389,30 @@ func (d *dbusDesktop) signal(gen uint64, sig *dbus.Signal) {
 		return
 	}
 	key, _ := sig.Body[1].(string)
+	if key == openAction {
+		// Some services send it on a click whether offered or not; an
+		// open question, which is not offered it, still awaits its answer.
+		if !q.markable {
+			return
+		}
+		// Offered only without answers, so nothing is left to act on.
+		delete(d.pending, nid)
+		if q.receipts && d.receipt != nil {
+			go d.receipt(q.id, receiptOpened)
+		}
+		return
+	}
 	i, err := strconv.Atoi(key)
 	if err != nil || i < 0 || i >= len(q.reply.Options) {
 		return
 	}
 	delete(d.pending, nid)
+	// The server counts an answer it takes as opening the message, but one
+	// that expired here never reaches it; reporting every answer is simpler
+	// than telling them apart, and the server ignores a repeat.
+	if q.receipts && d.receipt != nil {
+		go d.receipt(q.id, receiptOpened)
+	}
 	// Off the signal loop: answering is a network call.
 	go func() { d.showOutcome(nid, q, d.answer(q.id, q.reply, q.reply.Options[i])) }()
 }
@@ -439,7 +513,15 @@ func notification(p Payload, markup, actions bool, now time.Time) notifyArgs {
 	if p.Channel != "" {
 		n.hints["category"] = dbus.MakeVariant("notifier." + dropNUL(p.Channel))
 	}
-	if q := p.Reply; q != nil && len(q.Options) > 0 && now.Unix() < q.ExpiresAt {
+	q := p.Reply
+	open := q != nil && len(q.Options) > 0 && now.Unix() < q.ExpiresAt
+	// An open question's answers report the opening (the server records
+	// it), and a default action would take the place of dunst's menu of them.
+	if p.Receipts && actions && !open {
+		// Clicking it is what counts; it opens nothing.
+		n.actions = append(n.actions, openAction, "Mark seen")
+	}
+	if open {
 		if actions {
 			for i, o := range q.Options {
 				n.actions = append(n.actions, strconv.Itoa(i), dropNUL(o))

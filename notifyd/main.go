@@ -45,7 +45,7 @@ type app struct {
 	historyPath    string
 	now            func() time.Time
 	http           *http.Client
-	desktop        func(context.Context, AnswerFunc, map[string]string) (Desktop, error)
+	desktop        func(context.Context, AnswerFunc, ReceiptFunc, map[string]string) (Desktop, error)
 	hostname       func() (string, error)
 	signals        func() (context.Context, context.CancelFunc)
 	// noSound keeps run from giving notifications a sound.
@@ -225,9 +225,18 @@ func (a *app) listen() int {
 	defer release()
 	ctx, stop := a.signals()
 	defer stop()
+	posting := make(chan struct{}, maxReceiptPosts)
 	desktop, err := a.desktop(ctx, func(id string, q histfile.Reply, option string) string {
 		outcome, _ := a.answer(st, id, q, option)
 		return outcome
+	}, func(id, state string) {
+		// A backlog of queued messages must not open a connection each;
+		// a click, at human pace, need not wait behind them.
+		if state == receiptShown {
+			posting <- struct{}{}
+			defer func() { <-posting }()
+		}
+		a.receipt(st, id, state)
 	}, a.sounds())
 	if err != nil {
 		return a.fail(fmt.Errorf("cannot reach the desktop's notification service: %w", err))

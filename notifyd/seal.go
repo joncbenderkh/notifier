@@ -26,6 +26,9 @@ type Payload struct {
 	ChannelID string `json:"channel_id,omitempty"`
 	// Reply is set when this device may answer the message's question.
 	Reply *histfile.Reply `json:"reply,omitempty"`
+	// Receipts is set when the sender asked to know when it is shown and
+	// opened.
+	Receipts bool `json:"receipts,omitempty"`
 }
 
 // openEnvelope decrypts envelope v1: AES-256-GCM with a 12-byte nonce, the
