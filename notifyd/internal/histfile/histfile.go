@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -39,6 +40,26 @@ type Entry struct {
 	Channel    string `json:"channel,omitempty"`
 	ChannelID  string `json:"channel_id,omitempty"`
 	Reply      *Reply `json:"reply,omitempty"`
+	// URL is the link a tap on the message opens; Actions its buttons.
+	URL     string   `json:"url,omitempty"`
+	Actions []Action `json:"actions,omitempty"`
+}
+
+// Action is a button that opens its link.
+type Action struct {
+	Label string `json:"label"`
+	URL   string `json:"url"`
+}
+
+// WebLink reports whether link is one a message may open: http or https,
+// with a host and no credentials. The server accepts no other, but other
+// servers and old history may hold one. host is where it leads, to show.
+func WebLink(link string) (host string, ok bool) {
+	u, err := url.Parse(link)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
+		return "", false
+	}
+	return u.Hostname(), true
 }
 
 // Reply is a question's answers, the one-time key to seal one under, and

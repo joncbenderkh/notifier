@@ -41,6 +41,8 @@ while :; do
 			(if .channel and ((.channel_id // "") | startswith("ch_default_") | not) then ", channel " + (.channel | gsub($re; "")) else "" end) +
 			(if .priority == "high" then ", high priority" else "" end),
 		"",
-		((.body // "") | split("\n") | map(gsub($re; "")) | join("\n"))' <<<"$json" |
+		((.body // "") | split("\n") | map(gsub($re; "")) | join("\n")),
+		(if .url then "\nLink: " + (.url | gsub($re; "")) else empty end),
+		((.actions // [])[] | (.label | gsub($re; "")) + ": " + (.url | gsub($re; "")))' <<<"$json" |
 		zenity --text-info --title "$TITLE" --width 800 --height 500 2>/dev/null
 done

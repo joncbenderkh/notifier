@@ -76,6 +76,25 @@ func Duration(d time.Duration) string {
 func Title(e histfile.Entry) string { return histfile.Printable(e.Title, false) }
 func Body(e histfile.Entry) string  { return histfile.Printable(e.Body, true) }
 
+// Link is one of a message's links, labelled with where it leads, since
+// its sender chose it.
+type Link struct{ Label, URL string }
+
+// Links are e's web links: its own ("Open <host>"), then its buttons'
+// ("<label> · <host>").
+func Links(e histfile.Entry) []Link {
+	var links []Link
+	if host, ok := histfile.WebLink(e.URL); ok {
+		links = append(links, Link{"Open " + histfile.Printable(host, false), e.URL})
+	}
+	for _, a := range e.Actions {
+		if host, ok := histfile.WebLink(a.URL); ok {
+			links = append(links, Link{histfile.Printable(a.Label, false) + " · " + histfile.Printable(host, false), a.URL})
+		}
+	}
+	return links
+}
+
 // Channel is e's channel label, or "" for the default channel.
 func Channel(e histfile.Entry) string {
 	if e.OnDefaultChannel() {

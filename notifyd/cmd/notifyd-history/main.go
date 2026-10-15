@@ -65,17 +65,19 @@ type window struct {
 
 	detail                           *gtk.Stack // message, none
 	dTitle, dTiming, dBody, dChannel *gtk.Label
-	dHigh                            *gtk.Label
-	historyPath, seenPath            string
-	monitor                          gio.FileMonitorrer
-	reloadPending                    bool
-	unread, pending                  map[string]bool // pending: deleted, undo still possible
-	seen                             map[string]bool // listed, for the i3blocks block
-	seenDirty                        bool            // the last write failed
-	settingChannels                  bool            // the dropdown changes are not the user's
-	entries                          []histfile.Entry
-	selected                         string
-	deleteAction, copyAction         *gio.SimpleAction
+	// dLinks holds a button per link of the message shown.
+	dLinks                   *gtk.FlowBox
+	dHigh                    *gtk.Label
+	historyPath, seenPath    string
+	monitor                  gio.FileMonitorrer
+	reloadPending            bool
+	unread, pending          map[string]bool // pending: deleted, undo still possible
+	seen                     map[string]bool // listed, for the i3blocks block
+	seenDirty                bool            // the last write failed
+	settingChannels          bool            // the dropdown changes are not the user's
+	entries                  []histfile.Entry
+	selected                 string
+	deleteAction, copyAction *gio.SimpleAction
 }
 
 func newWindow(app *adw.Application) *window {
@@ -245,6 +247,9 @@ func (w *window) content() gtk.Widgetter {
 	box.Append(w.dTiming)
 	box.Append(gtk.NewSeparator(gtk.OrientationHorizontal))
 	box.Append(w.dBody)
+	w.dLinks = gtk.NewFlowBox()
+	w.dLinks.SetSelectionMode(gtk.SelectionNone)
+	box.Append(w.dLinks)
 	clamp := adw.NewClamp()
 	clamp.SetMaximumSize(820)
 	clamp.SetChild(box)
@@ -501,6 +506,15 @@ func (w *window) show(r *row) {
 	} else {
 		w.dBody.RemoveCSSClass("monospace")
 	}
+	for child := w.dLinks.FirstChild(); child != nil; child = w.dLinks.FirstChild() {
+		w.dLinks.Remove(child)
+	}
+	links := histview.Links(e)
+	for _, l := range links {
+		// Opens through the desktop's launcher (the portal where one runs).
+		w.dLinks.Append(gtk.NewLinkButtonWithLabel(l.URL, l.Label))
+	}
+	w.dLinks.SetVisible(len(links) > 0)
 	c := histview.Channel(e)
 	w.dChannel.SetText(c)
 	w.dChannel.SetVisible(c != "")

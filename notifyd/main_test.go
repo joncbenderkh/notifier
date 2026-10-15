@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -26,7 +27,7 @@ func TestOpensTheSharedVector(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := Payload{ID: "msg_test", Title: "Hello", Body: "From the test vector", Priority: "high", SentAt: 1791590400}
-	if p != want {
+	if !reflect.DeepEqual(p, want) {
 		t.Fatalf("got %+v", p)
 	}
 	if _, err := openEnvelope(testKey, "dev_other", "MDEyMzQ1Njc4OWFi", "TDM7F3Qdq2rkWAzPzRj+L2fQcGZjs92a"); err == nil {
@@ -166,7 +167,7 @@ func newTestApp(t *testing.T) (*app, *bytes.Buffer, *bytes.Buffer) {
 		historyPath: filepath.Join(dir, "state", "notifyd-history.jsonl"),
 		now:         func() time.Time { return time.Unix(testNow, 0) },
 		http:        &http.Client{CheckRedirect: refuseRedirect},
-		desktop: func(context.Context, AnswerFunc, ReceiptFunc, map[string]string) (Desktop, error) {
+		desktop: func(context.Context, AnswerFunc, ReceiptFunc, OpenFunc, map[string]string) (Desktop, error) {
 			return newFakeDesktop(), nil
 		},
 		hostname: func() (string, error) { return "workstation", nil },
@@ -326,7 +327,7 @@ func TestRunReportsReceiptsAsItsDevice(t *testing.T) {
 	api.status["POST /v1/device/receipts"] = http.StatusNoContent
 	a, _, stderr := newTestApp(t)
 	var receipt ReceiptFunc
-	a.desktop = func(_ context.Context, _ AnswerFunc, r ReceiptFunc, _ map[string]string) (Desktop, error) {
+	a.desktop = func(_ context.Context, _ AnswerFunc, r ReceiptFunc, _ OpenFunc, _ map[string]string) (Desktop, error) {
 		receipt = r
 		return newFakeDesktop(), nil
 	}

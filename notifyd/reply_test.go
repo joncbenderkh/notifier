@@ -644,6 +644,127 @@ func TestReportsReceiptsWhenAsked(t *testing.T) {
 	}
 }
 
+func TestOpensLinks(t *testing.T) {
+	bus := &fakeBus{calls: make(chan []any, 10)}
+	events := make(chan string, 10)
+	d := &dbusDesktop{
+		object:  func(string) dbus.BusObject { return bus },
+		actions: true,
+		owner:   ":1.5",
+		now:     func() time.Time { return time.Unix(testNow, 0) },
+		pending: map[uint32]question{},
+		receipt: func(id, state string) {
+			if state == receiptOpened {
+				events <- id + "=" + state
+			}
+		},
+		open: func(link string) { events <- "open " + link },
+	}
+	click := func(nid uint32, key string) {
+		d.signal(0, &dbus.Signal{Sender: ":1.5", Name: notificationsInterface + ".ActionInvoked", Body: []any{nid, key}})
+	}
+	got := func(n int) []string {
+		t.Helper()
+		var all []string
+		for range n {
+			select {
+			case e := <-events:
+				all = append(all, e)
+			case <-time.After(5 * time.Second):
+				t.Fatalf("got %v, want %d events", all, n)
+			}
+		}
+		slices.Sort(all)
+		select {
+		case e := <-events:
+			t.Fatalf("extra event %q", e)
+		case <-time.After(50 * time.Millisecond):
+		}
+		return all
+	}
+
+	p := Payload{ID: "msg_l", Title: "Build failed", URL: "https://ci.example/7", Receipts: true, Actions: []histfile.Action{
+		{Label: "Logs", URL: "https://ci.example/7/logs"},
+		{Label: "Shell", URL: "file:///bin/sh"},
+		{Label: "Retry", URL: "http://ci.example/7/retry"},
+	}}
+	if err := d.show(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	args := bus.call(t)
+	if want := []string{openAction, "Open", "link:0", "Logs", "link:2", "Retry"}; !slices.Equal(args[5].([]string), want) {
+		t.Fatalf("actions %v, want %v", args[5], want)
+	}
+	click(1, "link:2")
+	if e := got(2); !slices.Equal(e, []string{"msg_l=opened", "open http://ci.example/7/retry"}) {
+		t.Fatalf("events %v", e)
+	}
+	click(1, "link:1") // not offered
+	click(1, "link:9")
+	click(1, openAction)
+	if e := got(2); !slices.Equal(e, []string{"msg_l=opened", "open https://ci.example/7"}) {
+		t.Fatalf("events %v", e)
+	}
+	// A service that keeps it showing still offers its buttons.
+	click(1, "link:0")
+	if e := got(2); !slices.Equal(e, []string{"msg_l=opened", "open https://ci.example/7/logs"}) {
+		t.Fatalf("events %v", e)
+	}
+
+	// Without receipts the click opens the link and reports nothing.
+	if err := d.show(context.Background(), Payload{ID: "msg_u", Title: "Deployed", URL: "https://app.example"}); err != nil {
+		t.Fatal(err)
+	}
+	bus.call(t)
+	click(2, openAction)
+	if e := got(1); !slices.Equal(e, []string{"open https://app.example"}) {
+		t.Fatalf("events %v", e)
+	}
+}
+
+func TestOpensOnlyWebLinks(t *testing.T) {
+	for link, want := range map[string]bool{
+		"https://ci.example/7": true, "http://10.0.0.2:8080/": true,
+		"https:ci.example": false, "javascript:alert(1)": false, "file:///etc/passwd": false,
+		"https://bank.example@evil.example/": false, "https://u:p@ci.example/": false,
+	} {
+		if webLink(link) != want {
+			t.Errorf("webLink(%q) = %v", link, !want)
+		}
+	}
+	for _, c := range []struct {
+		err  error
+		want bool
+	}{
+		{nil, false},
+		{errors.New("closed"), false},
+		{dbus.Error{Name: "org.freedesktop.DBus.Error.NameHasNoOwner"}, true},
+		{dbus.Error{Name: "org.freedesktop.DBus.Error.UnknownMethod"}, true},
+		{dbus.Error{Name: "org.freedesktop.portal.Error.NotAllowed"}, false},
+		{dbus.Error{Name: "org.freedesktop.DBus.Error.NoReply"}, false},
+	} {
+		if noPortal(c.err) != c.want {
+			t.Errorf("noPortal(%v) = %v", c.err, !c.want)
+		}
+	}
+}
+
+func TestPutsLinksInTheBodyWithoutActions(t *testing.T) {
+	now := time.Unix(testNow, 0)
+	p := Payload{ID: "msg_l", Title: "Build failed", Body: "red", URL: "https://ci.example/7",
+		Actions: []histfile.Action{{Label: "Logs", URL: "https://ci.example/7/logs"}, {Label: "x", URL: "javascript:1"}}}
+	n := notification(p, false, false, now)
+	if want := "red\n\nhttps://ci.example/7\nLogs: https://ci.example/7/logs"; n.body != want || len(n.actions) != 0 {
+		t.Fatalf("body %q, actions %v", n.body, n.actions)
+	}
+	// An open question keeps its buttons for the answers.
+	q := testQuestion
+	n = notification(Payload{ID: "msg_q", Title: "Deploy?", Body: "v7", URL: "https://ci.example/7", Reply: &q}, false, true, now)
+	if !slices.Equal(n.actions, []string{"0", "yes", "1", "no"}) || n.body != "v7\n\nhttps://ci.example/7" {
+		t.Fatalf("body %q, actions %v", n.body, n.actions)
+	}
+}
+
 func TestReportsShownWithoutActionsButNotWhenRefused(t *testing.T) {
 	bus := &fakeBus{calls: make(chan []any, 10)}
 	receipts := make(chan string, 10)
