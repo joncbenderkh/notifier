@@ -69,7 +69,8 @@ func (c *cli) askCmd(args, to, channels, options []string, high *bool, wait time
 	}
 	// Standard output is kept for the answer. Other members' devices count
 	// only when they may answer.
-	client, id, code := c.deliver(n, to, args[1:], c.stderr, anyone)
+	client, result, code := c.deliver(n, to, args[1:], c.stderr, anyone)
+	id := result.ID
 	if id == "" {
 		if code == exitUndelivered {
 			fmt.Fprintln(c.stderr, "notify: no device that may answer got the question")

@@ -21,11 +21,13 @@ type receiptServer struct {
 	sent   []Notification
 	polls  []string
 	states []any // a Receipts, or an HTTP status to fail with
+	// tracked is how many devices the send says report receipts.
+	tracked int
 }
 
 func newReceiptServer(t *testing.T, states ...any) *receiptServer {
 	t.Helper()
-	s := &receiptServer{states: states}
+	s := &receiptServer{states: states, tracked: 1}
 	s.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -34,7 +36,11 @@ func newReceiptServer(t *testing.T, states ...any) *receiptServer {
 			var n Notification
 			json.NewDecoder(r.Body).Decode(&n)
 			s.sent = append(s.sent, n)
-			json.NewEncoder(w).Encode(NotifyResult{ID: "msg_r", Deliveries: []Delivery{{DeviceID: "dev_phone", Status: "sent"}}})
+			result := NotifyResult{ID: "msg_r", Deliveries: []Delivery{{DeviceID: "dev_phone", Status: "sent"}}}
+			if n.Receipts {
+				result.Tracked = &s.tracked
+			}
+			json.NewEncoder(w).Encode(result)
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/notifications/msg_r":
 			s.polls = append(s.polls, r.URL.RawQuery)
 			state := s.states[0]
@@ -201,6 +207,32 @@ func TestWaitSeenRefusesASpacedDuration(t *testing.T) {
 	if code, _, stderr := s.run("send", "--wait-seen=10m", "300", "errors"); code != 0 || s.sent[2].Title != "300" {
 		t.Errorf("an explicit duration: exit %d, stderr %q, sent %+v", code, stderr, s.sent)
 	}
+	// Another flag in between: the word can only be the title.
+	if code, _, stderr := s.run("send", "--wait-seen", "--high", "5m", "errors"); code != 0 || s.sent[3].Title != "5m" {
+		t.Errorf("a flag in between: exit %d, stderr %q, sent %+v", code, stderr, s.sent)
+	}
+}
+
+func TestBareWaitSeenKeepsAnEarlierDuration(t *testing.T) {
+	var w seenWait
+	w.Set("1m")
+	w.Set(bareSeenWait)
+	if w.d != time.Minute {
+		t.Fatalf("got %s", w.d)
+	}
+}
+
+func TestWaitSeenStopsWhenNoDeviceReports(t *testing.T) {
+	s := newReceiptServer(t, receipts("pending"))
+	s.tracked = 0
+	code, stdout, stderr := s.run("send", "--wait-seen=10s", "Disk full")
+	if code != exitError || !strings.Contains(stderr, "no device reports receipts") || len(s.polls) != 0 || !strings.HasSuffix(stdout, "id: msg_r\n") {
+		t.Fatalf("exit %d, stdout %q, stderr %q, polls %q", code, stdout, stderr, s.polls)
+	}
+	// Without waiting it only warns.
+	if code, _, stderr := s.run("send", "--receipts", "Disk full"); code != 0 || !strings.Contains(stderr, "no device reports receipts") {
+		t.Fatalf("--receipts: exit %d, stderr %q", code, stderr)
+	}
 }
 
 func TestWaitSeenCountsAnOpeningStampedLateInATimelyAnswer(t *testing.T) {
@@ -247,6 +279,19 @@ func TestStatusPrintsEachDevice(t *testing.T) {
 	}
 }
 
+func TestStatusSaysWhenNoDeviceReports(t *testing.T) {
+	s := newReceiptServer(t, receipts("pending"))
+	if code, stdout, _ := s.run("status", "msg_r"); code != 0 || !strings.HasPrefix(stdout, "no device reports receipts") {
+		t.Fatalf("exit %d, stdout %q", code, stdout)
+	}
+	r := receipts("pending")
+	r.Members.Tracked = 2
+	s = newReceiptServer(t, r)
+	if code, stdout, _ := s.run("status", "msg_r"); code != 0 || stdout != "not shown on any device yet\n" {
+		t.Fatalf("exit %d, stdout %q", code, stdout)
+	}
+}
+
 func TestStatusExplainsAnUntrackedMessage(t *testing.T) {
 	s := newReceiptServer(t, &APIError{http.StatusNotFound, noReceipts})
 	if code, _, stderr := s.run("status", "msg_r"); code != exitError || !strings.Contains(stderr, "sent without --receipts") {
@@ -256,12 +301,5 @@ func TestStatusExplainsAnUntrackedMessage(t *testing.T) {
 	s = newReceiptServer(t, &APIError{http.StatusNotFound, "not found"})
 	if code, _, stderr := s.run("status", "msg_r"); code != exitError || strings.Contains(stderr, "sent without --receipts") {
 		t.Fatalf("exit %d, stderr %q", code, stderr)
-	}
-}
-
-func TestStatusSaysWhenNothingShowedIt(t *testing.T) {
-	s := newReceiptServer(t, receipts("pending"))
-	if code, stdout, _ := s.run("status", "msg_r"); code != 0 || stdout != "not shown on any device yet\n" {
-		t.Fatalf("exit %d, stdout %q", code, stdout)
 	}
 }

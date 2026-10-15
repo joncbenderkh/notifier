@@ -24,28 +24,32 @@ const (
 	// noReceipts is the server's answer for a message it has no receipts of
 	// (NO_RECEIPTS in server/src/app.ts), unlike a missing route's.
 	noReceipts = "no receipts for this message"
+
+	noTrackedHint = "no device reports receipts for this message: none of yours got it, " +
+		"and members' devices report only where the channel's owner requires receipts, " +
+		"or makes them optional and the member turns them on"
 )
 
 // bareSeenWait is what --wait-seen holds when given without a duration;
 // help shows it, and nobody types it.
 const bareSeenWait = "(10m)"
 
-// seenWait is --wait-seen's value; [bare] when it was given without one.
-type seenWait struct {
-	d    time.Duration
-	bare bool
-}
+// seenWait is --wait-seen's value.
+type seenWait struct{ d time.Duration }
 
 func (w *seenWait) Set(s string) error {
 	if s == bareSeenWait {
-		w.d, w.bare = defaultSeenWait, true
+		// Without a duration it keeps one given before.
+		if w.d == 0 {
+			w.d = defaultSeenWait
+		}
 		return nil
 	}
 	d, err := time.ParseDuration(s)
 	if err != nil {
 		return err
 	}
-	w.d, w.bare = d, false
+	w.d = d
 	return nil
 }
 
@@ -116,6 +120,20 @@ func (c *cli) awaitSeen(client *Client, id string, wait time.Duration) int {
 // 5min, 1.5 h; not a title such as "3 failed".
 var durationLike = regexp.MustCompile(`(?i)^\d+(\.\d+)?\s*(ns|us|µs|ms|s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?|d|days?)?$`)
 
+// waitSeenTakesTitle says whether a bare --wait-seen comes right before
+// [title] in the command line [raw], so the title may be its duration.
+func waitSeenTakesTitle(raw []string, title string) bool {
+	for i, a := range raw {
+		if a == "--" {
+			return false
+		}
+		if a == "--wait-seen" && i+1 < len(raw) && raw[i+1] == title {
+			return true
+		}
+	}
+	return false
+}
+
 // looksLikeDuration says whether a title [s] was perhaps meant as a
 // duration for --wait-seen.
 func looksLikeDuration(s string) bool {
@@ -169,6 +187,8 @@ func (c *cli) status(id string) int {
 	}
 	if m := r.Members; m.Shown+m.Opened > 0 {
 		fmt.Fprintf(c.stdout, "other members' devices: %d shown, %d opened\n", m.Shown, m.Opened)
+	} else if len(r.Devices) == 0 && m.Tracked == 0 {
+		fmt.Fprintln(c.stdout, noTrackedHint)
 	} else if len(r.Devices) == 0 {
 		fmt.Fprintln(c.stdout, "not shown on any device yet")
 	}

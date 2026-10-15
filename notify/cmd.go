@@ -94,7 +94,7 @@ func newRoot(c *cli) *cobra.Command {
 			w = &waitSeen.d
 			// The duration is optional, so "--wait-seen 5m TITLE" reads 5m as
 			// the title.
-			if waitSeen.bare && send.ArgsLenAtDash() != 0 && looksLikeDuration(args[0]) {
+			if waitSeenTakesTitle(c.args, args[0]) && looksLikeDuration(args[0]) {
 				fmt.Fprintln(c.stderr, "notify: --wait-seen takes its duration after =, as in --wait-seen=5m; put -- before a title that looks like a duration")
 				return exitUsage
 			}
@@ -182,6 +182,12 @@ func newRoot(c *cli) *cobra.Command {
 		n := len(strings.Fields(a.use)) - 1
 		channel.AddCommand(leaf(a.use, a.short, cobra.ExactArgs(n), func(args []string) int { return c.channel(action, args) }))
 	}
+	receiptsCmd := leaf("receipts NAME [SETTING]", "Show or set whether members' devices report receipts", cobra.RangeArgs(1, 2), c.channelReceipts)
+	receiptsCmd.Long = "Show or set whether other members' devices report when they show and open\n" +
+		"a message sent with receipts. The owner sets off (the default), optional\n" +
+		"(or on), or required; on an optional channel only members who turn them on\n" +
+		"report, for all their devices. Your own devices always report."
+	channel.AddCommand(receiptsCmd)
 
 	var every, grace, hbChannel string
 	hbCreate := leaf("create [--every 1d] [--grace 5m] [-c CHANNEL] NAME", "Create a heartbeat and print its ping URL, once", cobra.ExactArgs(1), func(args []string) int {

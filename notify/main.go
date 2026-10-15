@@ -77,12 +77,14 @@ type cli struct {
 	// givenToken and givenKey come from flags or the environment, not the
 	// config file; `config init` saves them.
 	givenToken, givenKey string
+	// args is the command line, for checks Cobra cannot make.
+	args []string
 }
 
 // run executes the command line and returns the exit code; transport is
 // nil outside tests.
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer, transport http.RoundTripper) int {
-	c := &cli{stdin: stdin, stdout: stdout, stderr: stderr, transport: transport}
+	c := &cli{stdin: stdin, stdout: stdout, stderr: stderr, transport: transport, args: args}
 	root := newRoot(c)
 	if cmd, rest, err := root.Find(args); err == nil {
 		if f := oldStyleFlag(cmd, rest); f != "" {
@@ -201,12 +203,20 @@ func (c *cli) sendCmd(args, to, channels []string, high *bool, receipts bool, wa
 	}
 	n, to := c.notification(args[0], to, channels, high)
 	n.Receipts = receipts || waitSeen != nil
-	client, id, code := c.deliver(n, to, args[1:], c.stdout, true)
+	client, result, code := c.deliver(n, to, args[1:], c.stdout, true)
+	id := result.ID
 	if id == "" || !n.Receipts {
 		return code
 	}
 	// For notify status, even while waiting: it may end undecided.
 	fmt.Fprintln(c.stdout, "id:", id)
+	if result.Tracked != nil && *result.Tracked == 0 {
+		fmt.Fprintln(c.stderr, "notify: "+noTrackedHint)
+		if waitSeen != nil {
+			// Waiting could only end in "not opened".
+			return exitError
+		}
+	}
 	if waitSeen == nil {
 		return code
 	}
@@ -293,13 +303,13 @@ func (c *cli) context() (context.Context, context.CancelFunc) {
 
 // deliver sends [n] with [body] (none, BODY or -) to [to] and its
 // channels, and reports each device on [out], or on stderr when it was
-// missed. It returns the message ID, if the message reached one of the
-// sender's devices or, when [members] counts them, another member's, and
-// the exit code.
-func (c *cli) deliver(n Notification, to []string, body []string, out io.Writer, members bool) (*Client, string, int) {
+// missed. It returns the server's result, if the message reached one of
+// the sender's devices or, when [members] counts them, another member's,
+// and the exit code.
+func (c *cli) deliver(n Notification, to []string, body []string, out io.Writer, members bool) (*Client, NotifyResult, int) {
 	client, ok := c.sendClient()
 	if !ok {
-		return nil, "", exitUsage
+		return nil, NotifyResult{}, exitUsage
 	}
 	if len(body) == 1 {
 		text, dropped := body[0], false
@@ -307,7 +317,7 @@ func (c *cli) deliver(n Notification, to []string, body []string, out io.Writer,
 			// Read before the timeout starts: the producer may be a long job.
 			b, more, err := readTail(c.stdin, stdinTailBytes)
 			if err != nil {
-				return nil, "", fail(c.stderr, err, c.sendCredName)
+				return nil, NotifyResult{}, fail(c.stderr, err, c.sendCredName)
 			}
 			text, dropped = strings.TrimRight(string(b), "\r\n"), more
 			if i := strings.IndexByte(text, '\n'); dropped && i >= 0 {
@@ -325,13 +335,13 @@ func (c *cli) deliver(n Notification, to []string, body []string, out io.Writer,
 	if len(to) > 0 {
 		devices, err := client.Devices(ctx)
 		if err != nil {
-			return nil, "", fail(c.stderr, err, c.sendCredName)
+			return nil, NotifyResult{}, fail(c.stderr, err, c.sendCredName)
 		}
 		if n.DeviceIDs, err = ResolveDevices(devices, to); errors.Is(err, ErrNoSuchDevice) {
 			fmt.Fprintln(c.stderr, "notify:", err)
-			return nil, "", exitUndelivered
+			return nil, NotifyResult{}, exitUndelivered
 		} else if err != nil {
-			return nil, "", fail(c.stderr, err, c.sendCredName)
+			return nil, NotifyResult{}, fail(c.stderr, err, c.sendCredName)
 		}
 	}
 
@@ -343,10 +353,10 @@ func (c *cli) deliver(n Notification, to []string, body []string, out io.Writer,
 		// No paired (or subscribed) phone, or one unpaired since name
 		// resolution: nothing was delivered.
 		fmt.Fprintln(c.stderr, "notify:", apiErr.Message)
-		return nil, "", exitUndelivered
+		return nil, NotifyResult{}, exitUndelivered
 	}
 	if err != nil {
-		return nil, "", fail(c.stderr, err, c.sendCredName)
+		return nil, NotifyResult{}, fail(c.stderr, err, c.sendCredName)
 	}
 	code, reached := 0, false
 	for _, d := range result.Deliveries {
@@ -371,9 +381,9 @@ func (c *cli) deliver(n Notification, to []string, body []string, out io.Writer,
 		reached = true
 	}
 	if !reached {
-		return client, "", exitUndelivered
+		return client, NotifyResult{}, exitUndelivered
 	}
-	return client, result.ID, code
+	return client, result, code
 }
 
 // delivered reports whether a device has the message or will get it: a
