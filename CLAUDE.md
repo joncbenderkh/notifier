@@ -395,18 +395,25 @@ See `README.md` for the user-facing setup and API table.
   /v1/notifications/<id>`, which lists their own devices and only counts
   other members'. An alarm deletes the box a day and an hour after
   sending. Opened means an explicit act: tapping the notification or a
-  history card (every card's tap reads it, expanding a long message; a tracked notification's tap goes through the
+  history card's "Mark seen" (not the card itself, so a tap that misses
+  Delete or an answer reports nothing; a snackbar confirms it; tracked
+  cards, like their notifications' sub text, say "read receipt"; Android
+  posts openings on their own thread, apart from shown reports, through
+  `ServerClient.sharedClient`'s pool; a tracked notification's tap goes through the
   non-exported `OpenedActivity`, since any app can fill in the exported
   `MainActivity`'s extras, with its own `PendingIntent` by data
   `notifier-open:<id>`), clicking it (notifyd
   adds the `default` action, labelled "Mark seen" since it opens nothing,
   only for tracked messages, and not to an open question, where it
-  would replace dunst's menu of answers; `pending` keeps at most 500,
-  evicting the oldest without an open question), or answering,
+  would replace dunst's menu of answers; a `default` the service sends
+  unoffered is ignored, since some send it on any click; `pending` keeps
+  at most 500, evicting the oldest without an open question; at most 4
+  shown receipts post at once, while opened ones skip that queue), or answering,
   which the server records itself in `POST /v1/replies/<id>` (also
   when the answer is refused as late or second). Listing
   the history does not count. Shown is reported once the notification is
-  posted (Android: only where the user lets it show, and once it is
+  posted (notifyd: once the service accepts it, even paused or in Do
+  Not Disturb; Android: only where the user lets it show, and once it is
   among the active notifications, since Android drops some). Clients report
   best-effort, once per process, and only for the pairing that received
   the message. `notify send --wait-seen` exits 4 when nothing was opened
@@ -415,7 +422,8 @@ See `README.md` for the user-facing setup and API table.
   counts only own devices' openings timed by the deadline, and exits 1
   when only another member's untimed opening was seen. A spaced
   `--wait-seen 5m TITLE` is refused (the duration is optional, so 5m
-  would be the title). An answer tapped after a tracked question
+  would be the title) when the word follows a bare `--wait-seen`
+  directly (`cli.args`). An answer tapped after a tracked question
   expired locally never reaches the server, so the client reports it
   opened itself (notifyd for every tracked answer button; Android from
   the button's `receipts` extra, not the history, which may be cleared).
@@ -427,15 +435,17 @@ See `README.md` for the user-facing setup and API table.
   Tracked targets are the sender's own devices, and other members'
   where the channel they get it through (`Target.channel`, the first
   requested one they subscribe to) has `channels.receipts` `required`,
-  or `optional` and the member has not set
-  `channel_members.receipts_declined` (migration 0008, additive). The
+  or `optional` and the member set `channel_members.receipts_accepted`
+  (opt-in; migration 0008, additive). The
   owner sets it (`PATCH /v1/channels/<id>`; `default` has no other
-  members, so it is refused there), `off` by default; a member declines
+  members, so it is refused there), `off` by default; a member accepts
   for all their devices, with the user token or a device's (`PATCH
   /v1/memberships/<id>`, `/v1/device/memberships/<id>`: the Android
-  channel list's switch), not where it is required (409). Untracked
-  members' devices get no `receipts`, so the server decides and clients
-  need no setting.
+  channel list's switch), and cannot turn it off where it is required
+  (409). Untracked members' devices get no `receipts`, so the server
+  decides and clients need no setting. The send answers `tracked` and
+  the poll `members.tracked`, so `notify` stops at once when no device
+  reports, rather than wait for a "not opened".
   **Rollback:** the `v3` DO migration means every later version must
   export `ReceiptBox`, as with `ReplyBox`. Migration 0008 is harmless to
   the previous Worker, which ignores the columns.

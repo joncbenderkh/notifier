@@ -43,7 +43,8 @@ export type Receipts =
       /** "opened" once any device opened the message. */
       status: "pending" | "opened";
       devices: DeviceReceipt[];
-      members: { shown: number; opened: number };
+      /** Other members' devices: how many report receipts, and how many did. */
+      members: { tracked: number; shown: number; opened: number };
     };
 
 /** What the API needs from a message's box; `now` is the caller's clock, in Unix seconds. */
@@ -104,12 +105,13 @@ export class ReceiptBox extends DurableObject<Env> implements ReceiptBook {
     }
     const all = this.ctx.storage.kv.get<Record<string, Times>>(TIMES_KEY) ?? {};
     const devices: DeviceReceipt[] = [];
-    const members = { shown: 0, opened: 0 };
+    const members = { tracked: 0, shown: 0, opened: 0 };
     for (const r of t.recipients) {
       const times = all[r.device_id] ?? {};
       if (r.own) {
         devices.push({ device_id: r.device_id, name: r.name ?? r.device_id, ...times });
       } else {
+        members.tracked++;
         if (times.shown_at !== undefined) members.shown++;
         if (times.opened_at !== undefined) members.opened++;
       }

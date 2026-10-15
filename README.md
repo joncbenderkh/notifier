@@ -287,22 +287,27 @@ to report when they show and open the message, then waits until one opens
 it: it prints which (`opened on Pixel`) and exits 0, or exits 4 when none
 did in time. If it heard from the server only after the deadline
 and only another member's device had opened the message by then, it cannot
-tell when, and exits 1. The duration follows `=` (`--wait-seen=5m`): a
-separate word is the title. `--receipts` asks for the reports without
+tell when, and exits 1. The duration follows `=` (`--wait-seen=5m`); a
+word right after a bare `--wait-seen` that looks like a duration is
+refused, so put `--` before such a title. `--receipts` asks for the reports without
 waiting. Both print the message ID; `notify status ID` then shows when
-each of your devices showed and opened it.
+each of your devices showed and opened it. When no device reports (none
+of yours got it, and no member's that reports did), both say so, and `--wait-seen`
+exits 1 at once instead of waiting.
 
 Your own devices always report. Other members' devices on a shared
 channel report only as its owner sets it: `notify channel receipts NAME
 off` (the default), `optional` (or `on`), or `required`. On an optional
-channel each member turns them off or on for all their devices, with
-`notify channel receipts NAME off|on` or the switch under the channel in
-the app; where the owner requires them, they cannot. You see only how
+channel only members who turn them on report, for all their devices,
+with `notify channel receipts NAME on|off` or the switch under the
+channel in the app; where the owner requires them, they cannot turn them
+off, and turning them on is refused where the owner does not offer them,
+so being required is never taken as consent. The app marks such messages "read receipt". You see only how
 many of their devices showed and opened a message, but on a channel with
 one other member that count tells you when they did.
 
 Opened means an explicit act: tapping the notification, answering its
-question, or tapping it in the Android app's history; on a desktop,
+question, or its "Mark seen" in the Android app's history; on a desktop,
 clicking the notification (or its "Mark seen" action). dunst's default
 left click only closes it; middle-click it, or set `mouse_left_click =
 do_action, close_current` in `dunstrc`. A desktop whose notification
@@ -507,7 +512,8 @@ answer with `notifyd reply ID ANSWER`: `notifyd history` shows the ID and
 the answers.
 
 A message sent with receipts (see [Receipts](#receipts)) is reported shown
-once the notification service takes it, and opened when you click it,
+once the notification service takes it (even when it is paused or in Do
+Not Disturb, which notifyd cannot tell), and opened when you click it,
 which needs a service with actions.
 
 High-priority messages are shown with critical urgency. A message sent to a
@@ -571,8 +577,8 @@ another user's device or key IDs answer 404.
 
 | Method & path                     | Auth                 | Body / notes |
 |-----------------------------------|----------------------|--------------|
-| `POST /v1/notifications`          | User or API key      | `{"title", "body"?, "priority"?: "default"\|"high", "channels"?: [names], "device_ids"?: [...]}` — reaches devices subscribed to the named channels (the caller's own) plus the listed devices, each once; with neither, the `default` channel. Returns per-device delivery status for the sender's own devices, and `members` (counts by status) for other members'. At most 60 a minute per user (429 after). An optional `"question": {"options": [1–3 answers], "key": <32 bytes, base64>, "expires_in"?: 10–86400 (600), "anyone"?: false}` asks for an answer: see [Replies](#replies). `"receipts": true` asks the devices to report when they show and open it. |
-| `GET /v1/notifications/{message id}?wait=N` | User or API key | For a message sent with `receipts`, within a day: waits up to N seconds (0–50) until a device opens it; `{"id", "status": "pending"\|"opened", "devices": [{"device_id", "name", "shown_at"?, "opened_at"?}], "members": {"shown", "opened"}}`, the sender's own devices listed and other members' counted |
+| `POST /v1/notifications`          | User or API key      | `{"title", "body"?, "priority"?: "default"\|"high", "channels"?: [names], "device_ids"?: [...]}` — reaches devices subscribed to the named channels (the caller's own) plus the listed devices, each once; with neither, the `default` channel. Returns per-device delivery status for the sender's own devices, and `members` (counts by status) for other members'. At most 60 a minute per user (429 after). An optional `"question": {"options": [1–3 answers], "key": <32 bytes, base64>, "expires_in"?: 10–86400 (600), "anyone"?: false}` asks for an answer: see [Replies](#replies). `"receipts": true` asks the devices to report when they show and open it, and adds `tracked`, how many devices that got it will. |
+| `GET /v1/notifications/{message id}?wait=N` | User or API key | For a message sent with `receipts`, within a day: waits up to N seconds (0–50) until a device opens it; `{"id", "status": "pending"\|"opened", "devices": [{"device_id", "name", "shown_at"?, "opened_at"?}], "members": {"tracked", "shown", "opened"}}`, the sender's own devices listed and other members' counted |
 | `GET /v1/replies/{message id}?wait=N` | User or API key  | Waits up to N seconds (0–50) for the answer; `{"status": "pending"\|"expired"}` or `{"status": "answered", "by", "replied_at", "n", "c"}` |
 | `GET /v1/devices`                 | User or API key      | `transport` (`fcm` or `ws`); activity timestamps only with a user token |
 | `POST /v1/pairings`               | User                 | Returns a single-use code valid for 10 minutes and its `notifier://pair` link (`uri`); `?qr=svg` adds `qr_svg`. At most 20 devices and 5 unused codes per user. |
@@ -583,12 +589,12 @@ another user's device or key IDs answer 404.
 | `DELETE /v1/keys/{id}`            | User                 | |
 | `GET /v1/user`                    | User                 | Who am I |
 | `POST /v1/channels`               | User                 | `{"name"}` (`[a-z0-9][a-z0-9_-]*`, ≤32); at most 20 besides `default`, and 50 owned or joined, per user |
-| `GET /v1/channels`                | User                 | Channels owned or joined, each with `receipts` (`off`, `optional`, `required`) and, for joined ones, `receipts_declined` |
+| `GET /v1/channels`                | User                 | Channels owned or joined, each with `receipts` (`off`, `optional`, `required`) and, for joined ones, `receipts_accepted` |
 | `PATCH /v1/channels/{id}`         | User (owner)         | `{"receipts": "off"\|"optional"\|"required"}`: whether other members' devices report receipts; not `default` |
 | `DELETE /v1/channels/{id}`        | User (owner)         | Not `default` |
 | `POST /v1/channels/{id}/invites`  | User (owner)         | Not `default`; single-use, 7 days; returns `uri` (`notifier://join?...`), `?qr=svg` adds `qr_svg` |
 | `POST /v1/memberships`            | User                 | `{"invite"}`: join a channel |
-| `PATCH /v1/memberships/{channel id}` | User (member)   | `{"receipts_declined": bool}`: decline receipts on an optional channel (409 where required) |
+| `PATCH /v1/memberships/{channel id}` | User (member)   | `{"receipts_accepted": bool}`: send receipts on an optional channel (409: `true` where not optional, `false` where required); returns `{"id", "receipts", "receipts_accepted"}` |
 | `GET /v1/channels/{id}/members`   | User (owner)         | Members, with `id`, `name`, `joined_at` |
 | `DELETE /v1/channels/{id}/members/{user_id}` | User (owner, or the member leaving) | Also unsubscribes that member's devices |
 | `PUT /v1/devices/{id}/channels`   | User                 | `{"channel_ids"}`: set a device's subscriptions (must include `default`) |

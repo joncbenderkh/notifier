@@ -72,6 +72,7 @@ interface Registration {
 interface NotifyResponse {
   id: string;
   deliveries: Delivery[];
+  tracked?: number;
 }
 
 let USER: string;
@@ -691,7 +692,9 @@ describe("channels", () => {
   it("subscribes new devices to the user's default channel", async () => {
     const reg = await pair("phone", "fcm-phone");
     const channels = await call<ChannelView[]>("GET", "/v1/device/channels", reg.device_token, undefined, 200);
-    expect(channels).toEqual([{ id: expect.stringMatching(/^ch_default_/) as string, name: "default", subscribed: true }]);
+    expect(channels).toEqual([
+      { id: expect.stringMatching(/^ch_default_/) as string, name: "default", subscribed: true, owned: true, receipts: "off" },
+    ]);
 
     await call("POST", "/v1/notifications", USER, { title: "hi" }, 200);
     expect((await payloadFor(reg, 0)).channel).toBe("default");
@@ -1552,7 +1555,7 @@ describe("receipts", () => {
     id: string;
     status: string;
     devices: { device_id: string; name: string; shown_at?: number; opened_at?: number }[];
-    members: { shown: number; opened: number };
+    members: { tracked: number; shown: number; opened: number };
   };
 
   const send = (body: object = {}, token = USER) =>
@@ -1564,9 +1567,11 @@ describe("receipts", () => {
 
   it("tracks only messages sent with receipts", async () => {
     const phone = await pair("phone", "fcm-phone");
-    const { id } = await send();
+    const { id, tracked } = await send();
+    expect(tracked).toBe(1);
     expect((await payloadFor(phone, 0)).receipts).toBe(true);
     const plain = await call<NotifyResponse>("POST", "/v1/notifications", USER, { title: "hi" }, 200);
+    expect(plain.tracked).toBeUndefined();
     expect((await payloadFor(phone, 1)).receipts).toBeUndefined();
     await mark(phone, plain.id, "shown", 404);
     expect(await read(plain.id, 0, USER, 404)).toEqual({ error: NO_RECEIPTS });
@@ -1575,8 +1580,11 @@ describe("receipts", () => {
       id,
       status: "pending",
       devices: [{ device_id: phone.device_id, name: "phone" }],
-      members: { shown: 0, opened: 0 },
+      members: { tracked: 0, shown: 0, opened: 0 },
     });
+    // A device the message never reached does not count.
+    sender.unregistered.add("fcm-phone");
+    expect((await send()).tracked).toBe(0);
   });
 
   it("keeps the first time of each state, and opening implies showing", async () => {
@@ -1619,11 +1627,68 @@ describe("receipts", () => {
     const bobPhone = await pair("phone", "fcm-bob", bob);
     const { code } = await call<{ code: string }>("POST", `/v1/channels/${homelab}/invites`, USER, undefined, 201);
     await call("POST", "/v1/device/memberships", bobPhone.device_token, { invite: code }, 201);
-    const { id } = await send({ channels: ["homelab"] });
-    expect((await payloadFor(bobPhone, 0)).receipts).toBe(true);
+    // Nothing reports: the channel's receipts are off, and none of the sender's devices get it.
+    expect((await send({ channels: ["homelab"] })).tracked).toBe(0);
+    await call("PATCH", `/v1/channels/${homelab}`, USER, { receipts: "required" }, 200);
+    const { id, tracked } = await send({ channels: ["homelab"] });
+    expect(tracked).toBe(1);
+    expect((await payloadFor(bobPhone, sender.sent.length - 1)).receipts).toBe(true);
     await mark(bobPhone, id, "opened");
-    expect(await read(id)).toEqual({ id, status: "opened", devices: [], members: { shown: 1, opened: 1 } });
+    expect(await read(id)).toEqual({ id, status: "opened", devices: [], members: { tracked: 1, shown: 1, opened: 1 } });
     await read(id, 0, bob, 404);
+  });
+
+  it("asks members' devices only as their channel's owner and the member choose", async () => {
+    const bob = await signup("bob");
+    const homelab = await channel("homelab");
+    const phone = await pair("phone", "fcm-phone");
+    const bobPhone = await pair("phone", "fcm-bob", bob);
+    const { code } = await call<{ code: string }>("POST", `/v1/channels/${homelab}/invites`, USER, undefined, 201);
+    await call("POST", "/v1/device/memberships", bobPhone.device_token, { invite: code }, 201);
+    const own = (await call<{ id: string; name: string }[]>("GET", "/v1/channels", USER, undefined, 200)).find(
+      (ch) => ch.name === "default",
+    );
+    await call("PUT", `/v1/devices/${phone.device_id}/channels`, USER, { channel_ids: [own?.id, homelab] }, 200);
+    const asked = async () => {
+      const { id } = await send({ channels: ["homelab"] });
+      const last = (token: string) => sender.sent.findLastIndex((m) => m.token === token);
+      const payloads = await Promise.all([payloadFor(phone, last("fcm-phone")), payloadFor(bobPhone, last("fcm-bob"))]);
+      await mark(bobPhone, id, "shown", payloads[1].receipts ? 204 : 404);
+      expect(payloads[0].receipts).toBe(true);
+      return payloads[1].receipts === true;
+    };
+    const accept = (accepted: boolean, status = 200, token = bob) =>
+      call("PATCH", `/v1/memberships/${homelab}`, token, { receipts_accepted: accepted }, status);
+
+    // Off until the owner offers receipts; the sender's own devices still report.
+    expect(await asked()).toBe(false);
+    // Consent only where offered.
+    await accept(true, 409);
+    await accept(false);
+    // Optional: only members who turn them on.
+    await call("PATCH", `/v1/channels/${homelab}`, USER, { receipts: "optional" }, 200);
+    expect(await asked()).toBe(false);
+    await accept(true);
+    expect(await call("GET", "/v1/channels", bob, undefined, 200)).toContainEqual(
+      expect.objectContaining({ id: homelab, receipts: "optional", receipts_accepted: true }),
+    );
+    expect(await asked()).toBe(true);
+    await call("PATCH", `/v1/device/memberships/${homelab}`, bobPhone.device_token, { receipts_accepted: false }, 200);
+    expect(await asked()).toBe(false);
+    // Required overrides the member's choice, which they cannot turn off while it holds.
+    await call("PATCH", `/v1/channels/${homelab}`, USER, { receipts: "required" }, 200);
+    expect(await asked()).toBe(true);
+    await accept(false, 409);
+    await accept(true, 409);
+    // Being required is no consent once it is optional again.
+    await call("PATCH", `/v1/channels/${homelab}`, USER, { receipts: "optional" }, 200);
+    expect(await asked()).toBe(false);
+
+    await call("PATCH", `/v1/channels/${homelab}`, bob, { receipts: "off" }, 404);
+    await call("PATCH", `/v1/channels/${homelab}`, USER, { receipts: "on" }, 400);
+    await call("PATCH", `/v1/channels/${own?.id}`, USER, { receipts: "required" }, 400);
+    await accept(true, 400, USER);
+    await call("PATCH", "/v1/memberships/ch_missing", bob, { receipts_accepted: true }, 404);
   });
 
   it("counts a late answer, after the question is gone, as opening it", async () => {

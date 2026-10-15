@@ -24,7 +24,7 @@ describe("ReceiptBox", () => {
     const opened = {
       status: "opened",
       devices: [{ device_id: "dev_a", name: "phone" }],
-      members: { shown: 1, opened: 1 },
+      members: { tracked: 1, shown: 1, opened: 1 },
     };
     expect(await Promise.all(polls)).toEqual([opened, opened]);
   });
@@ -36,7 +36,7 @@ describe("ReceiptBox", () => {
     expect(await box.wait("usr_a", 0)).toEqual({
       status: "pending",
       devices: [{ device_id: "dev_a", name: "phone", shown_at: NOW }],
-      members: { shown: 0, opened: 0 },
+      members: { tracked: 1, shown: 0, opened: 0 },
     });
   });
 
