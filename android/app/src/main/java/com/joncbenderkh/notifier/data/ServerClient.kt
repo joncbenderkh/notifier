@@ -39,7 +39,23 @@ private data class ErrorResponse(val error: String)
 
 /** A channel this device's user belongs to, named as they see it. */
 @Serializable
-data class DeviceChannel(val id: String, val name: String, val subscribed: Boolean = false)
+data class DeviceChannel(
+    val id: String,
+    val name: String,
+    val subscribed: Boolean = false,
+    val owned: Boolean = false,
+    /** Whether other members' devices report receipts: "off", "optional" or "required". */
+    val receipts: String = "off",
+    /** Whether this user turned receipts on here (they apply regardless where required). */
+    @SerialName("receipts_accepted") val receiptsAccepted: Boolean = false,
+)
+
+/** A membership's receipt settings, as the server records them. */
+@Serializable
+data class MembershipReceipts(
+    val receipts: String,
+    @SerialName("receipts_accepted") val receiptsAccepted: Boolean,
+)
 
 @Serializable
 private data class ReceiptRequest(@SerialName("message_id") val messageId: String, val state: String)
@@ -49,6 +65,9 @@ private data class SetChannelsRequest(@SerialName("channel_ids") val channelIds:
 
 @Serializable
 private data class JoinRequest(val invite: String)
+
+@Serializable
+private data class AcceptReceiptsRequest(@SerialName("receipts_accepted") val receiptsAccepted: Boolean)
 
 /** Blocking client for the device-facing half of the notifier API. */
 class ServerClient(private val http: OkHttpClient = sharedClient) {
@@ -82,6 +101,12 @@ class ServerClient(private val http: OkHttpClient = sharedClient) {
     fun setChannels(pairing: Pairing, channelIds: List<String>): List<DeviceChannel> {
         val body = json.encodeToString(SetChannelsRequest(channelIds)).toRequestBody(jsonType)
         return json.decodeFromString(execute(authorized(pairing, "v1/device/channels").put(body)))
+    }
+
+    /** Records whether this device's user accepts receipts on channel [channelId], which they joined. */
+    fun acceptReceipts(pairing: Pairing, channelId: String, accepted: Boolean): MembershipReceipts {
+        val body = json.encodeToString(AcceptReceiptsRequest(accepted)).toRequestBody(jsonType)
+        return json.decodeFromString(execute(authorized(pairing, "v1/device/memberships", channelId).patch(body)))
     }
 
     /** Joins a channel with an invite code, for this device's user, and subscribes this device. */
@@ -121,8 +146,9 @@ class ServerClient(private val http: OkHttpClient = sharedClient) {
             raw
         }
 
-    private companion object {
+    internal companion object {
+        /** One connection pool for the app; derive others with newBuilder(). */
         val sharedClient = OkHttpClient()
-        val EMPTY_BODY: RequestBody = ByteArray(0).toRequestBody()
+        private val EMPTY_BODY: RequestBody = ByteArray(0).toRequestBody()
     }
 }

@@ -67,7 +67,12 @@ object Notifications {
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(text.title)
             .setContentText(text.text)
-            .setSubText(payload.channel?.takeIf { route.groupId != null })
+            // Tells the user that opening it tells the sender.
+            .setSubText(
+                listOfNotNull(payload.channel?.takeIf { route.groupId != null }, "read receipt".takeIf { payload.receipts })
+                    .joinToString(" · ")
+                    .ifEmpty { null },
+            )
             .setStyle(NotificationCompat.BigTextStyle().bigText(text.text))
             .setSilent(text.settled)
             .setPriority(if (high) NotificationCompat.PRIORITY_HIGH else NotificationCompat.PRIORITY_DEFAULT)

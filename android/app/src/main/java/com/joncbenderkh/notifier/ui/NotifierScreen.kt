@@ -164,6 +164,7 @@ fun NotifierScreen(viewModel: MainViewModel = viewModel()) {
                         channels = state.channels,
                         enabled = !state.busy,
                         onToggle = viewModel::setSubscribed,
+                        onReceipts = viewModel::setSendsReceipts,
                     )
                     PairedActions(
                         enabled = !state.busy,
@@ -549,6 +550,7 @@ private fun ChannelList(
     channels: List<DeviceChannel>?,
     enabled: Boolean,
     onToggle: (String, Boolean) -> Unit,
+    onReceipts: (String, Boolean) -> Unit,
 ) {
     Column {
         Text("Channels", style = MaterialTheme.typography.labelLarge, modifier = Modifier.padding(bottom = 4.dp))
@@ -587,6 +589,33 @@ private fun ChannelList(
                         disabledCheckedThumbColor = MaterialTheme.colorScheme.surface,
                     ),
                 )
+            }
+            // Another user's channel whose owner asks for receipts.
+            if (!channel.owned && channel.receipts != "off") {
+                val required = channel.receipts == "required"
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.padding(bottom = 12.dp),
+                ) {
+                    Column(Modifier.weight(1f).padding(end = 16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text("Send read receipts", style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            if (required) "Required by the channel's owner"
+                            else "Lets the owner see when your devices show and open a message they ask about",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Switch(
+                        checked = required || channel.receiptsAccepted,
+                        onCheckedChange = { onReceipts(channel.id, it) },
+                        enabled = enabled && !required,
+                        colors = SwitchDefaults.colors(
+                            disabledCheckedTrackColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.45f),
+                            disabledCheckedThumbColor = MaterialTheme.colorScheme.surface,
+                        ),
+                    )
+                }
             }
             if (index < channels.lastIndex) HorizontalDivider()
         }

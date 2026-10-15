@@ -6,7 +6,6 @@ import android.util.Log
 import com.joncbenderkh.notifier.data.PairingStore
 import com.joncbenderkh.notifier.data.ServerClient
 import com.joncbenderkh.notifier.data.ServerException
-import okhttp3.OkHttpClient
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -23,8 +22,11 @@ object Receipts {
     private const val TAG = "Receipts"
 
     // Short: an expired answer reports within its button's ten seconds.
-    private val client = ServerClient(OkHttpClient.Builder().callTimeout(5, TimeUnit.SECONDS).build())
+    private val client = ServerClient(ServerClient.sharedClient.newBuilder().callTimeout(5, TimeUnit.SECONDS).build())
     private val background = Executors.newSingleThreadExecutor()
+
+    // Apart from [background], so a tap need not wait behind a burst of shown reports.
+    private val openings = Executors.newSingleThreadExecutor()
 
     // Apart from [background], so a slow report cannot delay the check
     // past the notification's dismissal.
@@ -62,7 +64,7 @@ object Receipts {
     /** [report], on a background thread. */
     fun reportLater(context: Context, id: String, state: String, deviceId: String? = null) {
         val app = context.applicationContext
-        background.execute { report(app, id, state, deviceId) }
+        (if (state == OPENED) openings else background).execute { report(app, id, state, deviceId) }
     }
 }
 

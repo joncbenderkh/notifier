@@ -102,7 +102,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun opened(entry: HistoryEntry) {
         // The pairing it was received under: the history belongs to it.
         val deviceId = _state.value.pairing?.deviceId ?: return
-        if (entry.receipts) Receipts.reportLater(getApplication(), entry.id, Receipts.OPENED, deviceId)
+        if (!entry.receipts) return
+        Receipts.reportLater(getApplication(), entry.id, Receipts.OPENED, deviceId)
+        _state.update { it.say("The sender can see you opened it.") }
     }
 
     /** Answers [entry]'s question with [option], and says what became of it. */
@@ -259,6 +261,29 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 throw e
             }
             if (generation == channelsGeneration) _state.update { it.copy(channels = updated) }
+        }
+    }
+
+    /** Sends this user's receipts on a channel they joined, where the owner offers them, or stops. */
+    fun setSendsReceipts(channelId: String, sends: Boolean) {
+        val pairing = _state.value.pairing ?: return
+        val name = _state.value.channels?.firstOrNull { it.id == channelId }?.name ?: return
+        run(if (sends) "Sending receipts on $name." else "No receipts on $name.") {
+            val generation = ++channelsGeneration
+            val got = try {
+                withContext(Dispatchers.IO) { client.acceptReceipts(pairing, channelId, sends) }
+            } catch (e: ServerException) {
+                // The owner may have changed the setting meanwhile.
+                runCatching { loadChannels(pairing) }
+                throw e
+            }
+            if (generation == channelsGeneration) {
+                _state.update { s ->
+                    s.copy(channels = s.channels?.map {
+                        if (it.id == channelId) it.copy(receipts = got.receipts, receiptsAccepted = got.receiptsAccepted) else it
+                    })
+                }
+            }
         }
     }
 

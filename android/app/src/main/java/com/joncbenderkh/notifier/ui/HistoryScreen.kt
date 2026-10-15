@@ -164,9 +164,38 @@ private fun roughly(seconds: Long): String = when {
     else -> "${seconds / 86400} d"
 }
 
+/** A small text button, as a card's "Read message". */
+@Composable
+private fun Link(text: String, onClick: () -> Unit) {
+    Text(
+        text,
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.primary,
+        modifier = Modifier
+            .padding(top = 4.dp)
+            .clickable(onClickLabel = text, onClick = onClick)
+            .padding(vertical = 8.dp, horizontal = 0.dp),
+    )
+}
+
+@Composable
+private fun Badge(text: String) {
+    Text(
+        text,
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onPrimaryContainer,
+        maxLines = 1,
+        modifier = Modifier
+            .background(MaterialTheme.colorScheme.primaryContainer, RoundedCornerShape(4.dp))
+            .padding(horizontal = 6.dp, vertical = 2.dp),
+    )
+}
+
 /**
  * One notification: its body collapses to two lines, it can be deleted, and
- * a question it asks can be answered until it expires.
+ * a question it asks can be answered until it expires. When its sender asked
+ * for receipts, only "Mark seen" (or answering) tells them it was opened, so
+ * a tap that misses another control never does.
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -186,16 +215,15 @@ private fun HistoryCard(
     val channel = entry.channel?.takeIf { entry.channelId?.let(ChannelRoute::isDefaultChannel) == false }
     val high = entry.priority == "high"
 
-    // Tapping a card reads it, as "Read message" does: it expands a long
-    // message, and tells a sender who asked for receipts it was opened.
+    // Tapping a long message's card expands it, as "Read message" does.
     Card(
         Modifier
             .fillMaxWidth()
             .clip(CardDefaults.shape)
-            .clickable(onClickLabel = if (expanded) "Collapse" else "Read message") {
-                if (!expanded) onOpen(entry)
-                if (expanded || overflows) expanded = !expanded
-            },
+            .then(
+                if (!expanded && !overflows) Modifier
+                else Modifier.clickable(onClickLabel = if (expanded) "Collapse" else "Read message") { expanded = !expanded },
+            ),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLowest),
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
     ) {
@@ -212,16 +240,9 @@ private fun HistoryCard(
                             // Shrinks before the badge does.
                             modifier = Modifier.weight(1f, fill = false),
                         )
-                        if (high) {
-                            Text(
-                                "High priority",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onPrimaryContainer,
-                                modifier = Modifier
-                                    .background(MaterialTheme.colorScheme.primaryContainer, RoundedCornerShape(4.dp))
-                                    .padding(horizontal = 6.dp, vertical = 2.dp),
-                            )
-                        }
+                        if (high) Badge("High priority")
+                        // Opening it tells the sender.
+                        if (entry.receipts) Badge("Read receipt")
                     }
                     Text(entry.title, style = MaterialTheme.typography.titleMedium)
                     // Queued or delayed on the way: say how much earlier it was sent.
@@ -247,19 +268,11 @@ private fun HistoryCard(
                     onTextLayout = { if (!expanded) overflows = it.hasVisualOverflow },
                     modifier = Modifier.padding(top = 8.dp, end = 12.dp),
                 )
-                if (expanded || overflows) {
-                    Text(
-                        if (expanded) "Collapse" else "Read message",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier
-                            .padding(top = 4.dp)
-                            .clickable(onClickLabel = if (expanded) "Collapse" else "Read message") {
-                                if (!expanded) onOpen(entry)
-                                expanded = !expanded
-                            }
-                            .padding(vertical = 8.dp, horizontal = 0.dp),
-                    )
+                Row(horizontalArrangement = Arrangement.spacedBy(24.dp)) {
+                    if (expanded || overflows) {
+                        Link(if (expanded) "Collapse" else "Read message") { expanded = !expanded }
+                    }
+                    if (entry.receipts) Link("Mark seen") { onOpen(entry) }
                 }
             }
             val reply = entry.reply
