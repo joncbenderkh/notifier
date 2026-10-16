@@ -7,6 +7,8 @@ import com.joncbenderkh.notifier.push.Reply
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.time.LocalDateTime
+import java.time.ZoneId
 
 class HistoryTest {
     private val now = 1_800_000_000L
@@ -91,6 +93,131 @@ class HistoryTest {
     }
 
     @Test
+    fun keepsReminders() {
+        val history = History().add(entry("a"), now).add(entry("b"), now).remind("a", now + 900)
+        assertEquals(listOf("a"), history.reminders().map { it.id })
+        assertEquals(now + 900, History.decode(history.encode()).entries.first { it.id == "a" }.remindAt)
+        assertEquals(emptyList<HistoryEntry>(), history.remind("a", null).reminders())
+        assertEquals(history, history.remind("gone", now))
+        // Cleared only if still the time it fired for.
+        assertEquals(now + 900, history.remind("a", null) { it.remindAt == now + 60 }.reminders().single().remindAt)
+        assertEquals(emptyList<HistoryEntry>(), history.remind("a", null) { it.remindAt == now + 900 }.reminders())
+    }
+
+    @Test
+    fun keepsASnoozedMessagePastTheEntryLimit() {
+        var history = History().add(entry("snoozed", now), now).remind("snoozed", now + 3600)
+        for (i in 1..History.MAX_ENTRIES + 5) history = history.add(entry("m$i", now + i), now + i)
+        assertEquals(History.MAX_ENTRIES + 1, history.entries.size)
+        assertEquals("snoozed", history.entries.last().id)
+    }
+
+    @Test
+    fun decidesWhatAReminderDoes() {
+        val keyed = entry("a").copy(key = "disk", channelId = "ch_1", remindAt = now + 600, arrival = 1)
+        var history = History().add(keyed, now)
+        assertEquals(Reminder.None, history.reminder("gone", now, 60))
+        assertEquals(Reminder.Later(now + 600), history.reminder("a", now, 60))
+        assertEquals(Reminder.Show(keyed, now + 600), history.reminder("a", now + 550, 60))
+        // Another key or channel does not count; a newer message with its key does.
+        history = history.add(entry("b", now + 1).copy(key = "disk", channelId = "ch_2"), now + 1)
+            .add(entry("c", now + 1).copy(key = "load", channelId = "ch_1"), now + 1)
+        assertEquals(Reminder.Show(keyed, now + 600), history.reminder("a", now + 600, 60))
+        // Snoozed after a newer message with its key came.
+        history = history.add(entry("d", now + 2).copy(key = "disk", channelId = "ch_1"), now + 2).remind("a", now + 600)
+        assertEquals(Reminder.Drop(now + 600), history.reminder("a", now + 600, 60))
+        assertEquals(Reminder.None, History().add(entry("e"), now).reminder("e", now, 60))
+    }
+
+    @Test
+    fun saysWhatRecordingDid() {
+        val snoozed = History().add(entry("a"), now).remind("a", now + 600)
+        assertEquals(snoozed to Recorded(snoozed = true), snoozed.record(entry("a"), now + 1))
+        assertEquals(Recorded(), snoozed.record(entry("b", now + 1), now + 1).second)
+        // A newer message with its key drops its reminder.
+        val keyed = History().add(entry("k").copy(key = "disk", channelId = "ch_1"), now).remind("k", now + 600)
+        val (replaced, dropping) = keyed.record(entry("n", now + 1).copy(key = "disk", channelId = "ch_1"), now + 1)
+        assertEquals(Recorded(dropped = listOf("k")), dropping)
+        assertEquals(emptyList<HistoryEntry>(), replaced.reminders())
+        // An older one waits behind it.
+        val older = entry("o", now - 60).copy(sentAt = now - 60, key = "disk", channelId = "ch_1")
+        val (behind, waiting) = keyed.record(older, now + 1)
+        assertEquals(Recorded(behindReminder = true), waiting)
+        assertEquals(listOf("k"), behind.reminders().map { it.id })
+    }
+
+    @Test
+    fun dropsAReminderWhenANewerMessageWithItsKeyArrives() {
+        val keyed = entry("a").copy(key = "disk", channelId = "ch_1")
+        var history = History().add(keyed, now).remind("a", now + 600)
+        history = history.add(entry("b", now + 1).copy(key = "disk", channelId = "ch_1"), now + 1)
+        assertEquals(emptyList<HistoryEntry>(), history.reminders())
+        // So pruning the newer one cannot bring it back.
+        for (i in 2..History.MAX_ENTRIES + 5) history = history.add(entry("m$i", now + i), now + i)
+        assertEquals(Reminder.None, history.reminder("a", now + 600, 60))
+    }
+
+    @Test
+    fun countsALaterArrivalInTheSameSecondAsReplacing() {
+        val a = entry("a").copy(key = "disk", channelId = "ch_1")
+        val b = entry("b").copy(key = "disk", channelId = "ch_1")
+        var history = History().add(a, now).remind("a", now + 600).add(b, now)
+        assertEquals(emptyList<HistoryEntry>(), history.reminders())
+        assertEquals(setOf("a"), history.replacedIds())
+        // One arriving after a newer message with its key was replaced from the start.
+        history = History().add(b, now).add(a.copy(sentAt = now - 1), now).remind("a", now + 600)
+        assertEquals(setOf("a"), history.replacedIds())
+        assertEquals(Reminder.Drop(now + 600), history.reminder("a", now + 600, 60))
+    }
+
+    @Test
+    fun listsTheDueReminders() {
+        val history = History().add(entry("a"), now).add(entry("b"), now).add(entry("c"), now)
+            .remind("a", now + 30).remind("b", now + 120)
+        assertEquals(listOf("a"), history.due(now, 60).map { it.id })
+        assertEquals(setOf("a", "b"), history.due(now + 120, 60).map { it.id }.toSet())
+    }
+
+    @Test
+    fun aShownReminderCountsAsReceivedThen() {
+        val old = now - History.MAX_AGE_SECONDS + 10
+        val later = now + 3600
+        var history = History().add(entry("a", old), old).add(entry("b", now), now).remind("a", later)
+        // Still for that time only.
+        assertEquals(history, history.reminded("a", later + 1, later))
+        history = history.reminded("a", later, later).pruned(later)
+        assertEquals(listOf("a", "b"), history.entries.map { it.id })
+        assertEquals(later, history.entries.first().receivedAt)
+        assertTrue(history.entries.first().reminded)
+        assertEquals(emptyList<HistoryEntry>(), history.reminders())
+    }
+
+    @Test
+    fun ordersSameSecondReplacementsByArrivalNotTheClock() {
+        val a = entry("a").copy(key = "disk", channelId = "ch_1")
+        // The clock was set back between the two.
+        val b = entry("b", now - 100).copy(sentAt = now, key = "disk", channelId = "ch_1")
+        val history = History().add(a, now).add(b, now - 100)
+        assertEquals(listOf(1L, 2L), listOf("a", "b").map { id -> history.entries.first { it.id == id }.arrival })
+        assertEquals(setOf("a"), history.replacedIds())
+    }
+
+    @Test
+    fun ignoresAKeyTheServerWouldRefuse() {
+        val a = entry("a").copy(key = "bad key", channelId = "ch_1")
+        val history = History().add(a, now).remind("a", now + 600).add(entry("b", now + 1).copy(key = "bad key", channelId = "ch_1"), now + 1)
+        assertEquals(listOf("a"), history.reminders().map { it.id })
+        assertEquals(emptySet<String>(), history.replacedIds())
+    }
+
+    @Test
+    fun keepsASnoozedMessagePastTheAgeLimit() {
+        val old = now - History.MAX_AGE_SECONDS + 10
+        val history = History().add(entry("a", old), old).add(entry("b", old), old).remind("a", now)
+        assertEquals(listOf("a"), history.pruned(now + 60).entries.map { it.id })
+    }
+
+    @Test
     fun roundTripsAndToleratesNewFields() {
         val history = History().add(entry("a").copy(channel = "homelab", channelId = "ch_x"), now)
         assertEquals(history, History.decode(history.encode()))
@@ -104,5 +231,29 @@ class HistoryTest {
         for (bad in listOf("", "not json", "{}", """[{"id":1}]""")) {
             assertTrue(bad, History.decode(bad.encodeToByteArray()).entries.isEmpty())
         }
+    }
+
+    @Test
+    fun anOlderMessageWaitsBehindASnoozedNewerOne() {
+        val b = entry("b").copy(key = "disk", channelId = "ch_1", remindAt = now + 600)
+        val history = History().add(b, now).add(entry("a", now - 60).copy(sentAt = now - 60, key = "disk", channelId = "ch_1"), now + 1)
+        assertTrue(history.behindReminder(history.entries.first { it.id == "a" }))
+        assertEquals(false, history.behindReminder(history.entries.first { it.id == "b" }))
+        val shown = history.reminded("b", now + 600, now + 600)
+        assertEquals(false, shown.behindReminder(shown.entries.first { it.id == "a" }))
+    }
+
+    @Test
+    fun movesTheMorningWithTheTimeZone() {
+        val berlin = ZoneId.of("Europe/Berlin")
+        val nine = LocalDateTime.of(2027, 1, 15, 9, 0)
+        val history = History().add(entry("a"), now).add(entry("b"), now)
+            .remind("a", nine.atZone(berlin).toEpochSecond(), nine)
+            .remind("b", now + 900)
+        val moved = history.inZone(ZoneId.of("America/New_York"))
+        assertEquals(nine.atZone(ZoneId.of("America/New_York")).toEpochSecond(), moved.entries.first { it.id == "a" }.remindAt)
+        assertEquals(now + 900, moved.entries.first { it.id == "b" }.remindAt)
+        // Cleared with its time.
+        assertEquals(null, moved.remind("a", null).entries.first { it.id == "a" }.remindLocal)
     }
 }
