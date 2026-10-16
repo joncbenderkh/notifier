@@ -4,7 +4,6 @@ package com.joncbenderkh.notifier.push
 import android.util.Log
 import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
-import com.joncbenderkh.notifier.data.HistoryStore
 import com.joncbenderkh.notifier.data.PairingStore
 import com.joncbenderkh.notifier.data.ServerClient
 import java.io.IOException
@@ -32,14 +31,11 @@ class PushService : FirebaseMessagingService() {
             return
         }
         // Recorded even when notifications are not allowed: it was received.
-        // The history is a convenience copy; no failure of it may cost the notification.
-        try {
-            val store = PairingStore(this)
-            HistoryStore.get(this).record(payload) { store.load()?.deviceId == pairing.deviceId }
-        } catch (e: Exception) {
-            Log.w(TAG, "could not record the message in the history", e)
+        // Delivered again after it was put off, it waits for its reminder.
+        val store = PairingStore(this)
+        val shown = Reminders.receive(this, payload, { store.load()?.deviceId == pairing.deviceId }) {
+            Notifications.show(this, payload, pairing.deviceId, Answers.settled(this, payload.id))
         }
-        val shown = Notifications.show(this, payload, pairing.deviceId, Answers.settled(this, payload.id))
         if (shown && payload.receipts) Receipts.reportShownLater(this, payload.id, pairing.deviceId)
     }
 
