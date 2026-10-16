@@ -328,6 +328,44 @@ never reaches the other. On a phone or desktop, a question whose answer
 is on its way keeps its place for the outcome, and an update arriving
 meanwhile shows beside it.
 
+### Snooze
+
+A notification you cannot deal with yet can be put off; it is shown
+again later, by the device alone (the server is not involved). On a
+phone, "Snooze" on the notification (when a button is free: Android
+shows three) or "Remind me" on its history card offers 15 minutes, 1
+hour or 9:00 (this morning when snoozed before then, else tomorrow); the
+card shows the reminder and can cancel it. The reminder alerts like a
+new message, without answer buttons and without telling a sender who
+asked for receipts. It comes on time once you allow the app "Alarms &
+reminders" ("On time…" in the snooze dialog, off by default since
+Android 14); without that, Android may deliver it up to ten minutes
+late while the phone is awake, and later (up to an hour on Android 12
+and newer) while it sleeps. After a reboot or a force stop, it is set
+again when the phone or the app starts. With notifications turned off
+it cannot be snoozed; if they are turned off after, it waits for the
+next start that can show it, and the card says it is overdue. Once
+shown, the message counts as received then, so it stays another 30
+days. An open question is answered
+rather than snoozed. Deleting the message from the history, or clearing
+it, cancels its reminder; a snoozed message stays in the history, past
+its 30 days and 500 messages, until its reminder shows. A reminder for a
+message sent with `--replace` is dropped if a newer one with the same
+key came meanwhile, and such a message cannot be snoozed once replaced.
+9:00 is 9:00 wherever the phone is: after a change of time zone the
+reminder moves with it.
+
+On a desktop it is opt-in: `notifyd run --snooze 1h` (1m to 24h) adds a
+"Snooze 1 h" action to messages; one that had no action also gets a
+default that does nothing, so dunst's middle click still dismisses it
+rather than snooze it (dunst invokes a lone action). The time is kept in
+the history file, so a reminder survives a restart of notifyd, and it is
+checked every minute, so it also comes once a suspended laptop wakes.
+`notifyd history`, the history window and the i3blocks viewer show it.
+A notification service without actions offers no Snooze. Update the
+history window (`cmd/notifyd-history`) with notifyd: an older one drops
+every pending reminder from the history file when it deletes a message.
+
 ### Receipts
 
 A script can wait until someone has seen a message, and escalate if not:
@@ -588,7 +626,10 @@ for messages, a more insistent one for high priority, and one for open
 questions. `notifyd run` writes them to `$XDG_CACHE_HOME/notifier/sounds/`.
 The outcome of an answer is silent. Services that play sounds use the
 hint; others, such as dunst, ignore it. `notifyd run --no-sound` leaves the
-hint out, so the service's own sound settings apply.
+hint out, so the service's own sound settings apply. `--snooze D` adds a
+Snooze action (see [Snooze](#snooze)); add it to the unit's `ExecStart`.
+A unit copied from an earlier release lacks `6` in `RestartPreventExitStatus`:
+copy it again, or a mistyped `--snooze` restarts it every 10 s.
 
 For i3blocks, `notifyd/contrib/i3blocks/` has a status bar block:
 - `NTF 3` counts the messages the history window has not listed yet, and
@@ -615,11 +656,13 @@ file refuses to start while it is running, since the server keeps one
 connection per device and would hand it to the newcomer; `notifyd` alone
 only prints its usage.
 
-`notifyd` stops, and systemd does not restart it, in three cases:
+`notifyd` stops, and systemd does not restart it, in four cases:
 - the device was unpaired on the server (exit status 4); pair it again
   with `notifyd pair --force LINK`;
 - another `notifyd` connected as the same device (exit status 5);
-- it is not paired at all (exit status 4).
+- it is not paired at all (exit status 4);
+- its command line is wrong, such as a `--snooze` out of range (exit
+  status 6).
 
 A message the notification service refuses outright is logged and
 dropped, so it cannot hold up the ones behind it. A message in a newer
