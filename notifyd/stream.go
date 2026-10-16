@@ -10,6 +10,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
@@ -46,6 +47,9 @@ type streamer struct {
 	logf    func(format string, args ...any)
 	seen    *recentIDs
 	history *history // nil: keep none
+	// showing, if set, is held while a message is recorded and shown, so a
+	// reminder cannot show between the two over a newer message with its key.
+	showing sync.Locker
 
 	pingInterval time.Duration
 	readTimeout  time.Duration
@@ -189,17 +193,8 @@ func (s *streamer) handle(ctx context.Context, conn *websocket.Conn, data []byte
 		case err != nil:
 			s.logf("dropping message %s: %v", f.ID, err)
 		default:
-			// Before showing, so a message the desktop refuses is still kept.
-			if s.history != nil {
-				if err := s.history.record(p); err != nil {
-					s.logf("could not record message %s in the history: %v", f.ID, err)
-				}
-			}
-			if err := s.desktop.Notify(ctx, p); errors.Is(err, errRejected) {
-				// Retrying cannot help, and would hold up the messages queued behind it.
-				s.logf("dropping message %s: %v", f.ID, err)
-			} else if err != nil {
-				return fmt.Errorf("show notification: %w", err)
+			if err := s.show(ctx, p); err != nil {
+				return err
 			}
 		}
 		s.seen.add(f.ID)
@@ -209,6 +204,31 @@ func (s *streamer) handle(ctx context.Context, conn *websocket.Conn, data []byte
 		return err
 	}
 	return conn.Write(ctx, websocket.MessageText, ack)
+}
+
+// show records p and shows it.
+func (s *streamer) show(ctx context.Context, p Payload) error {
+	if s.showing != nil {
+		s.showing.Lock()
+		defer s.showing.Unlock()
+	}
+	// Before showing, so a message the desktop refuses is still kept.
+	if s.history != nil {
+		snoozed, err := s.history.record(p)
+		if err != nil {
+			s.logf("could not record message %s in the history: %v", p.ID, err)
+		}
+		if snoozed {
+			return nil
+		}
+	}
+	if err := s.desktop.Notify(ctx, p); errors.Is(err, errRejected) {
+		// Retrying cannot help, and would hold up the messages queued behind it.
+		s.logf("dropping message %s: %v", p.ID, err)
+	} else if err != nil {
+		return fmt.Errorf("show notification: %w", err)
+	}
+	return nil
 }
 
 func (s *streamer) open(f frame) (Payload, error) {

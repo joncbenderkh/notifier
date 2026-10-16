@@ -50,7 +50,7 @@ func ids(entries []historyEntry) string {
 func TestHistoryKeepsTheNewestFirstAndEachMessageOnce(t *testing.T) {
 	h, now := testHistory(t)
 	for _, id := range []string{"a", "b", "a", "c"} {
-		if err := h.record(Payload{ID: id, Title: id}); err != nil {
+		if _, err := h.record(Payload{ID: id, Title: id}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -224,7 +224,7 @@ func TestNeverAppendsToAReadableFile(t *testing.T) {
 	h, _ := testHistory(t)
 	os.MkdirAll(filepath.Dir(h.path), 0o700)
 	os.WriteFile(h.path, nil, 0o644)
-	if err := h.record(Payload{ID: "secret"}); err != nil {
+	if _, err := h.record(Payload{ID: "secret"}); err != nil {
 		t.Fatal(err)
 	}
 	if info, _ := os.Stat(h.path); info.Mode().Perm() != 0o600 {
@@ -235,7 +235,7 @@ func TestNeverAppendsToAReadableFile(t *testing.T) {
 func TestDropsMessagesOfAReplacedPairing(t *testing.T) {
 	h, _ := testHistory(t)
 	h.current = func() bool { return false } // paired anew since this daemon started
-	if err := h.record(Payload{ID: "old_account"}); err != nil {
+	if _, err := h.record(Payload{ID: "old_account"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(h.path); !os.IsNotExist(err) {
