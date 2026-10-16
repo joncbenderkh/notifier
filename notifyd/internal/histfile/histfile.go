@@ -43,6 +43,18 @@ type Entry struct {
 	// URL is the link a tap on the message opens; Actions its buttons.
 	URL     string   `json:"url,omitempty"`
 	Actions []Action `json:"actions,omitempty"`
+	// RemindAt is when a snoozed message is shown again; 0 for none.
+	RemindAt int64 `json:"remind_at,omitempty"`
+	// Key is its key: a later message with the same key, in the same
+	// channel, replaces it.
+	Key string `json:"key,omitempty"`
+	// Seq is its place in the order of arrival, 1 for the first; 0 in
+	// histories from before it was kept. ReceivedAt follows the clock,
+	// which can be set back.
+	Seq int64 `json:"seq,omitempty"`
+	// Reminded: it was snoozed and shown again, ReceivedAt then, so it
+	// was not delayed on the way.
+	Reminded bool `json:"reminded,omitempty"`
 }
 
 // Action is a button that opens its link.
@@ -117,27 +129,42 @@ func Read(path string, now time.Time) ([]Entry, error) {
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
-	cutoff := now.Add(-MaxAge).Unix()
 	// The first copy of a message is when it arrived; later ones are
 	// replays (shown again after the desktop failed to).
 	seen := make(map[string]bool, len(all))
 	var kept []Entry
 	for _, e := range all {
-		if seen[e.ID] {
-			continue
-		}
-		seen[e.ID] = true
-		if e.ReceivedAt > cutoff {
+		if !seen[e.ID] {
+			seen[e.ID] = true
 			kept = append(kept, e)
 		}
 	}
 	// Later lines first, so same-second ties stay newest first after sorting.
 	slices.Reverse(kept)
 	slices.SortStableFunc(kept, func(a, b Entry) int { return cmp.Compare(b.ReceivedAt, a.ReceivedAt) })
-	if len(kept) > MaxEntries {
-		kept = kept[:MaxEntries]
+	// A snoozed message stays until its reminder shows, past MaxAge and
+	// MaxEntries; not one a newer message replaced, whose reminder never will.
+	waiting := make([]bool, len(kept))
+	for i, e := range kept {
+		waiting[i] = e.RemindAt != 0 && !Replaced(kept, i)
 	}
-	return kept, nil
+	cutoff := now.Add(-MaxAge).Unix()
+	others := 0
+	var out []Entry
+	for i, e := range kept {
+		if !waiting[i] {
+			// Its reminder never shows, even once what replaced it is pruned.
+			e.RemindAt = 0
+			if e.ReceivedAt <= cutoff {
+				continue
+			}
+			if others++; others > MaxEntries {
+				continue
+			}
+		}
+		out = append(out, e)
+	}
+	return out, nil
 }
 
 // Write replaces the file at path with entries, given newest first as Read
@@ -168,6 +195,97 @@ func Delete(path string, now time.Time, ids ...string) (int, error) {
 		return 0, nil
 	}
 	return removed, Write(path, kept)
+}
+
+// SetReminder sets when the entry with ID id is shown again (0: never)
+// and reports whether it did: not when the history no longer holds it, or
+// a later message replaced it. Like a compaction, it also drops what Read
+// would not return. Callers hold the lock.
+func SetReminder(path string, now time.Time, id string, at int64) (bool, error) {
+	return setReminder(path, now, id, at, func(entries []Entry, i int) bool { return !Replaced(entries, i) })
+}
+
+// Replaced reports whether a later message with the key of entries[i], in
+// its channel, took its place: sent later, or in the same second and
+// arrived later, by Seq, or failing that (from before it was kept), by
+// the order of entries, newest first as Read returns them. By sending
+// time first, so a replay pruned from the history replaces nothing.
+func Replaced(entries []Entry, i int) bool {
+	e := entries[i]
+	if e.Key == "" {
+		return false
+	}
+	for j, n := range entries {
+		if j == i || n.Key != e.Key || n.ChannelID != e.ChannelID {
+			continue
+		}
+		if n.SentAt != e.SentAt {
+			if n.SentAt > e.SentAt {
+				return true
+			}
+			continue
+		}
+		if n.Seq != e.Seq && n.Seq > e.Seq || n.Seq == e.Seq && j < i {
+			return true
+		}
+	}
+	return false
+}
+
+// DropReplacedReminders clears the reminders that e, about to be recorded,
+// replaces among entries, as Read returned them from path, and reports
+// whether it rewrote the file: when it arrives, not when they come, as
+// the entry limit may remove e first. A replay of a recorded message
+// replaces nothing, nor does one sent before the reminder's. Callers hold
+// the lock.
+func DropReplacedReminders(path string, entries []Entry, e Entry) (bool, error) {
+	if e.Key == "" {
+		return false, nil
+	}
+	entries = slices.Clone(entries)
+	if slices.ContainsFunc(entries, func(o Entry) bool { return o.ID == e.ID }) {
+		return false, nil
+	}
+	changed := false
+	for i, o := range entries {
+		if o.RemindAt != 0 && o.Key == e.Key && o.ChannelID == e.ChannelID && o.SentAt <= e.SentAt {
+			entries[i].RemindAt = 0
+			changed = true
+		}
+	}
+	if !changed {
+		return false, nil
+	}
+	return true, Write(path, entries)
+}
+
+// Reminded records that the reminder of the entry with ID id showed at
+// now, if it is still at, and reports whether it did: one set again
+// meanwhile stays. The entry counts as received then, so it stays its
+// MaxAge, and a snooze from the reminder finds it.
+// Callers hold the lock.
+func Reminded(path string, now time.Time, id string, at int64) (bool, error) {
+	return setReminder(path, now, id, 0, func(entries []Entry, i int) bool {
+		if entries[i].RemindAt != at {
+			return false
+		}
+		entries[i].ReceivedAt = now.Unix()
+		entries[i].Reminded = true
+		return true
+	})
+}
+
+func setReminder(path string, now time.Time, id string, at int64, ok func([]Entry, int) bool) (bool, error) {
+	entries, err := Read(path, now)
+	if err != nil {
+		return false, err
+	}
+	i := slices.IndexFunc(entries, func(e Entry) bool { return e.ID == id })
+	if i < 0 || !ok(entries, i) {
+		return false, nil
+	}
+	entries[i].RemindAt = at
+	return true, Write(path, entries)
 }
 
 // Clear removes the history file; a missing one is already clear. Callers

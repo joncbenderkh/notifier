@@ -44,17 +44,22 @@ func When(t, now time.Time) string {
 	return t.Format("2 Jan 2006")
 }
 
-// Timing describes when e was received, and when it was sent if it arrived
-// noticeably later.
+// Timing describes when e was received, when it was sent if it arrived
+// noticeably later (not a reminder, received when shown again), and when
+// it is shown again if it was snoozed.
 func Timing(e histfile.Entry) string {
 	const layout = "Mon 2 Jan 2006, 15:04"
 	received := time.Unix(e.ReceivedAt, 0)
 	delay := time.Duration(e.ReceivedAt-e.SentAt) * time.Second
-	if e.SentAt == 0 || delay < Delayed {
-		return "Received " + received.Format(layout)
+	timing := "Received " + received.Format(layout)
+	if e.SentAt != 0 && delay >= Delayed && !e.Reminded {
+		sent := time.Unix(e.SentAt, 0)
+		timing = fmt.Sprintf("Sent %s · received %s (delayed %s)", sent.Format(layout), received.Format(layout), Duration(delay))
 	}
-	sent := time.Unix(e.SentAt, 0)
-	return fmt.Sprintf("Sent %s · received %s (delayed %s)", sent.Format(layout), received.Format(layout), Duration(delay))
+	if e.RemindAt != 0 {
+		timing += " · reminder " + time.Unix(e.RemindAt, 0).Format(layout)
+	}
+	return timing
 }
 
 // Duration renders d coarsely: "2 h 28 min", "3 d 4 h", "45 s".

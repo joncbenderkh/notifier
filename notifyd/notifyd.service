@@ -21,7 +21,7 @@ ExecStart=%h/go/bin/notifyd run
 Restart=on-failure
 RestartSec=10
 # 4: unpaired, 5: another notifyd took over; restarting cannot help.
-RestartPreventExitStatus=4 5
+RestartPreventExitStatus=4 5 6
 
 [Install]
 WantedBy=graphical-session.target
