@@ -146,8 +146,9 @@ See `README.md` for the user-facing setup and API table.
   `notifyd.json` keeps the seal key in the clear beside it.
 
   Reading deduplicates by ID, keeping the first arrival, and returns the
-  newest first: at most 500, none older than 30 days. Past 600 lines the
-  file is rewritten to that. Pairing and unpairing clear it.
+  newest first: at most 500, none older than 30 days, besides at most
+  100 waiting for a reminder. Past 700 lines the file is rewritten to
+  that. Pairing and unpairing clear it.
   `notifyd history delete ID…` and the history window
   (`cmd/notifyd-history`, issue #64) change it under the same lock; the
   file code is shared in `internal/histfile`.
@@ -158,8 +159,12 @@ See `README.md` for the user-facing setup and API table.
 
   Close 4001, 401/404 on connect, or no state file exits 4; close 4000
   exits 5. The
-  unit's `RestartPreventExitStatus=4 5` stops systemd from looping on
-  them. Notify mapping: summary = title, body = body (markup-escaped when
+  unit's `RestartPreventExitStatus=4 5 6` stops systemd from looping on
+  them and on errors in `run`'s command line (a bad or unparsable
+  `--snooze`, an unknown or single-dash flag, or an argument in
+  `ExecStart`), which exit
+  6, not 2 like Cobra's other errors: Go exits 2 on a panic too, and a
+  crashed daemon must restart. Notify mapping: summary = title, body = body (markup-escaped when
   the server advertises `body-markup`), urgency normal/critical by
   priority, and `category` `notifier.<channel label>`.
 
@@ -411,7 +416,7 @@ See `README.md` for the user-facing setup and API table.
   shown receipts post at once, while opened ones skip that queue), or answering,
   which the server records itself in `POST /v1/replies/<id>` (also
   when the answer is refused as late or second). Listing
-  the history does not count. Shown is reported once the notification is
+  the history does not count, nor does snoozing it. Shown is reported once the notification is
   posted (notifyd: once the service accepts it, even paused or in Do
   Not Disturb; Android: only where the user lets it show, and once it is
   among the active notifications, since Android drops some). Clients report
@@ -519,6 +524,157 @@ See `README.md` for the user-facing setup and API table.
   shown anew. One whose answer is on its way (`answering`, by
   connection) is left for its outcome, which then holds the key unless
   a newer message took it.
+- **Snooze (issue #38):** on the device only. The time a message shows
+  again is kept in its history entry (`remind_at`, Unix s; Android
+  `HistoryEntry.remindAt`, notifyd `histfile.Entry.RemindAt` set by
+  `SetReminder` under the lock), so deleting the entry or clearing the
+  history cancels it, and a reminder outlives a reboot or restart; such
+  an entry is exempt from both the 30-day prune and the 500-entry limit
+  until it shows, and then counts as received at that time
+  (`receivedAt`/`ReceivedAt`), so it stays and a snooze from the reminder
+  finds it. Showing one clears its time only if it still holds the time
+  that fired, so a snooze from the reminder itself stays. A
+  reminder is the entry shown again under its message ID and its key
+  (both histories keep it): it alerts, with its links but no answers or
+  receipts. A newer message with its key and channel (on Android, as
+  `NotificationTag` orders them: sent later, or in the same second and
+  received later) drops the reminder when it is recorded, not when the
+  reminder fires, since pruning may remove it first; snoozing a message
+  already replaced, or one the history no longer holds, is refused.
+  Never offered on an open question; on Android a question settled while
+  showing gains it (notifyd's outcomes carry no actions). The morning is
+  9:00 local wherever the phone is: Android keeps
+  the local time (`remindLocal`) and moves `remindAt` to it on a change
+  of time zone (`BootReceiver`) and at every reschedule.
+
+  Android: a "Snooze" button when fewer than three buttons are used,
+  opening the non-exported `SnoozeActivity` (15 min, 1 h, 9:00 local
+  in the phone's format, 24-hour if so set: this morning before then, else tomorrow, and
+  1 min in debug builds
+  for testing; `Snooze`, unit-tested; the morning is the one the dialog
+  offered when it opened, unless 9:00 passed before the tap, which then
+  sets the next, as the confirmation's weekday says), and "Remind me" on the history card
+  (not on a replaced message, nor one a newer message with its key
+  keeps out of the tray, `Notifications.keptOut`, which choosing a time
+  refuses since the card does not check it; at most 100 wait,
+  since each takes three of the 500 alarms Android allows an app).
+  Entries recorded before this version have no `key`, so for up to 30
+  days one already replaced can still be snoozed, its reminder showing
+  beside the newer message. Same-second replacements are ordered by `HistoryEntry.arrival`, not
+  `receivedAt`, which a clock set back would reorder. Snoozing is refused while notifications
+  are off for the app or for the channel or group the reminder would
+  show in; a reminder not shown a minute past its time (past its
+  10-minute window without exact alarms) reads "overdue" on its card, and
+  one shown again (`reminded`) no longer says how late it was sent. The
+  minutes and hours count from the tap, the morning from when the
+  dialog opened. A message FCM delivers again while snoozed waits for
+  its reminder, as does one older than a snoozed message with its key
+  (`History.behindReminder`), which no notification may hold by then
+  (cancelling or deleting the snoozed one does not bring it back: the
+  newer message superseded it):
+  `Reminders.receive` records and shows a message under
+  the reminder lock, so a snooze cannot fall between. A reminder posted
+  again while it shows alerts only once.
+  `Reminders` sets an inexact `setAndAllowWhileIdle` alarm, which
+  Android may delay by three quarters of the wait (at most an hour
+  since Android 12; nearly ten minutes for 15 in testing), a
+  `setWindow` alarm with a 10-minute window (the shortest since Android
+  12; not while idle), and, when the user allows exact alarms
+  (`SCHEDULE_EXACT_ALARM`, "Alarms & reminders", off by default since
+  Android 14; the dialogs offer "On time…" until it is), an exact one
+  beside it, since turning the permission off cancels exact alarms
+  without telling the app. All reach the non-exported
+  `ReminderReceiver`; `History.reminder` (unit-tested) decides: too
+  early, set again; replaced by a newer message with its key and
+  channel, dropped; else shown, dated now, and cleared once Android
+  takes the post for a channel the user lets show (HIDDEN keeps it for
+  the next start; a post Android then drops, too many showing, is lost
+  rather than repeated, since `posted` can miss a slow post; dropped
+  when a newer message holds its key's notification, which the history
+  may no longer hold). Shown, it is
+  posted in its channel's group only if that still exists (and without
+  renaming it to the entry's label), so a channel left since stays gone
+  from the settings. Each alarm also
+  shows up to four other reminders due (already due: only its own may
+  come a minute early), as Doze spaces an app's inexact
+  alarms minutes apart (and the broadcast has a deadline). One that cannot show (`canRemind`, or
+  HIDDEN) loses its alarms and waits for the next start, opening of
+  the history, the app seeing notifications allowed (its prompt, or on
+  return to it), or (Android 9 and newer) the app's, a channel's or a
+  group's notifications being let through again, which set a single
+  alarm for an overdue one that can. An alarm whose own reminder fails
+  (the history unreadable for a moment) sets one more a minute later,
+  which is not retried.
+  "On time…" leaves the chooser to come back to. A snooze whose alarm
+  Android refuses keeps the reminder set before. A notification offering
+  answers carries `EXTRA_ANSWERS`, so its expiry tells them from Snooze
+  even when an answer is called "Snooze". Every reminder operation, recording a message
+  (`Reminders.record`, which cancels the alarms of the reminders it
+  replaced), deleting one and clearing the history runs under one
+  lock.
+  `BootReceiver` (boot, an app update, a change of time zone, the
+  permission granted, which it heeds only from Android 12, a change to
+  which notifications are blocked, only from Android 9, where only the
+  system can send them) and `NotifierApp` (any
+  start, so after a force stop) set the alarms again, as does opening
+  the history, so one kept back while notifications were off shows.
+
+  notifyd: opt-in `run --snooze D` (whole minutes, 1m–24h) adds the `snooze` action,
+  and a `default` that does nothing to a message with no other action
+  (or, for one whose only action is a link button, opens that link)
+  (dunst invokes a lone action on middle click); Snooze alone does not
+  stop a keyed update replacing in place (`question.clicks`). Snoozing
+  forgets the notification's key mapping, so an update does not take
+  its place, and closes it once the reminder is saved unless the
+  service closed it meanwhile (its ID may be reused; dunst keeps a
+  critical one after an action); when saving fails, "Could not snooze
+  it" (saying why when 100 already wait or the message is not in the
+  history) takes its place, or shows anew once the service closed it.
+  `snoozer` (`snooze.go`) arms a timer per message, re-arms the
+  history's reminders at start (and every minute until it can read
+  them), does not show a message the server delivers again while it is
+  snoozed (`history.record` reports it; its ack was lost), nor one
+  older than a snoozed message with its key (`histfile.BehindReminder`,
+  as Android's `History.behindReminder`), recorded all the same, never
+  returns a replaced message's reminder (`histfile.Replaced`, which
+  orders messages by sending time, so a replay pruned from the history
+  replaces nothing, then by arrival, `Entry.Seq`, taken from the clock
+  when the history cannot be read, never `ReceivedAt`, which a clock set
+  back would reorder), even if dropping it failed, and prunes such an
+  entry like any other, clearing its reminder for good (entries recorded
+  before this version have no key, so, as on Android, one already
+  replaced can still be snoozed); the minute check forgets the timers of
+  reminders the history no longer holds, checks them against the clock every
+  minute while one is armed,
+  re-reading the history file each time (at most 700 lines)
+  (a timer does not count a suspend, and one
+  that fires before its time, the clock set back, is armed again),
+  shows one at a time, holding the lock the stream takes to record and
+  show a message (`streamer.showing`), so a reminder never shows over a
+  newer message with its key, and retries a minute later when the desktop
+  cannot show one. It reads the entry again under the history lock
+  and shows it while holding that lock (`history.whileWaiting`), so a
+  delete or clear in another process cannot slip in before the reminder
+  shows; a snooze from the signal loop waits for it on its own
+  goroutine. A hung notification service thus holds the lock for up to
+  two D-Bus timeouts (20 s) per attempt (after one fails, no reminder
+  is tried for a minute, timers and the minute check alike), stalling the
+  history window's delete and clear, `history clear`, `pair` and
+  `unpair` meanwhile; delivery stalls on it anyway. At most 100
+  reminders wait (`histfile.MaxReminders`, as on Android), so
+  compaction, past 700 lines, leaves at most 600; past that, Snooze says
+  so. A reminder of an expired question says "The question has
+  expired", as on Android. A reminder shown whose time could not be
+  cleared is not shown again while clearing is retried. A retry never replaces the
+  timer of a snooze made since (`rearm`). A reminder shown is marked
+  `reminded`, so neither the window nor `notifyd history` calls it
+  delayed. Reminders and the stream call `Notify` in turn
+  (`fireMu`); `connMu` keeps any other caller from reconnecting
+  beside them. A history window built
+  before this drops `remind_at`, `key` and `seq` when it deletes a
+  message (Go's JSON ignores unknown fields), cancelling every reminder:
+  update it with notifyd, and never roll notifyd back past it with
+  reminders pending.
 - **Wire format (envelope v1):** FCM data `{"v":"1","n":<b64 nonce>,"c":<b64
   ciphertext>}`; AES-256-GCM, 12-byte nonce, 128-bit tag, per-device key,
   AAD = device ID. Plaintext is the JSON `Payload` (`server/src/app.ts`,
@@ -536,8 +692,18 @@ See `README.md` for the user-facing setup and API table.
   since `PushService` and the UI both write. It encrypts the history under
   its own Keystore key (`notifier-history`) into `files/history.bin`
   (`AtomicFile`), which is excluded from backups. Every failure surfaces
-  as an `IOException`. Unreadable data is moved aside
-  (`history.unreadable.bin`) and a new history starts.
+  as an `IOException`. Data still unreadable on a second try (the
+  Keystore can fail for a moment) is moved aside
+  (`history.unreadable.bin`), losing its reminders, and a new history
+  starts, but only by the
+  push service or the UI, and not in the first 5 minutes after boot,
+  when the Keystore may not be ready (a push then is shown but not
+  recorded): reminders, read in the background at every
+  start, boot and alarm, fail instead (`requireReadable`); at boot and
+  app start that sets an alarm to try again a minute later, up to five
+  times (`rescheduleAllOrRetry`).
+  `rescheduleAll` takes the reminder lock one reminder at a time, so a
+  message arriving during a cold start need not wait for them all.
 
   `PushService` records before showing, so messages arrive in the history
   even without the notification permission, and it catches any failure,
@@ -592,7 +758,8 @@ See `README.md` for the user-facing setup and API table.
   exit codes), `state.go` (`notifyd.json`, atomic
   writes), `history.go` (the history file), `reply.go` (answering questions), `open.go` (opening links), `link.go`
   (`notifier://pair` parsing), `seal.go` (envelope v1 open, pinned by the
-  shared vector), `stream.go` (connection loop), `desktop.go` (D-Bus),
+  shared vector), `stream.go` (connection loop), `desktop.go` (D-Bus), `snooze.go`
+  (reminders),
   `notifyd.service` (systemd user unit), `internal/sounds` (the
   synthesized sounds, and `gen`, which writes the Android copies),
   `internal/histfile` (the
@@ -616,8 +783,10 @@ See `README.md` for the user-facing setup and API table.
     `ChannelRoute` (pure JVM, unit-tested), `Notifications` (Android
     channels and groups), `Answers` and `ReplyReceiver` (answering
     questions), `Receipts` (reporting shown and opened; `ReceiptLedger`
-    is pure JVM, unit-tested) and `OpenedActivity` (the non-exported
-    trampoline a tracked notification's tap goes through).
+    is pure JVM, unit-tested), `OpenedActivity` (the non-exported
+    trampoline a tracked notification's tap goes through), and
+    `Snooze`, `Reminders`, `SnoozeActivity`, `ReminderReceiver` and
+    `BootReceiver` (snoozing).
   - `ui/` — `MainViewModel`, `NotifierScreen`, `HistoryScreen`, theme.
 
 ## Commands
