@@ -3,6 +3,7 @@ package com.joncbenderkh.notifier.ui
 
 import android.app.Application
 import android.os.Build
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.google.firebase.messaging.FirebaseMessaging
@@ -21,6 +22,8 @@ import com.joncbenderkh.notifier.push.ChannelRoute
 import com.joncbenderkh.notifier.push.Notifications
 import com.joncbenderkh.notifier.push.OpenedActivity
 import com.joncbenderkh.notifier.push.Receipts
+import com.joncbenderkh.notifier.push.Reminders
+import com.joncbenderkh.notifier.push.Snooze
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -89,15 +92,41 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _state.update { it.copy(showHistory = true) }
         // Drops what expired while the app stayed open.
         editHistory { historyStore.load() }
+        // A reminder kept from showing (notifications were off) shows now if it can.
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                Reminders.rescheduleAll(getApplication())
+            } catch (e: Exception) {
+                Log.w("MainViewModel", "could not set the reminders again", e)
+            }
+        }
     }
 
     fun closeHistory() {
         _state.update { it.copy(showHistory = false) }
     }
 
-    fun deleteHistory(id: String) = editHistory("Notification deleted.") { historyStore.delete(id) }
+    fun deleteHistory(id: String) = editHistory("Notification deleted.") {
+        Reminders.delete(getApplication(), id)
+    }
 
-    fun clearHistory() = editHistory("History cleared.") { historyStore.clear() }
+    fun clearHistory() = editHistory("History cleared.") { Reminders.clearHistory(getApplication()) }
+
+    /** Shows [entry] again at the time [choice] named when offered at [offeredAt] (Unix seconds). */
+    fun snooze(entry: HistoryEntry, choice: Snooze, offeredAt: Long) {
+        viewModelScope.launch {
+            try {
+                val at = withContext(Dispatchers.IO) { Reminders.snooze(getApplication(), entry.id, choice, offeredAt) }
+                val time = Reminders.time(getApplication(), at)
+                _state.update { it.say("Reminder at $time.") }
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                _state.update { it.say("Could not set the reminder: ${e.message}") }
+            }
+        }
+    }
+
+    fun cancelReminder(entry: HistoryEntry) = editHistory("Reminder cancelled.") { Reminders.cancel(getApplication(), entry.id) }
 
     /** Tells the sender of [entry], if they asked for receipts, that it was opened. */
     fun opened(entry: HistoryEntry) {
@@ -337,7 +366,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             store.clear()
             // The next pairing may be another account: its history starts empty.
-            withContext(Dispatchers.IO) { historyStore.clear() }
+            withContext(Dispatchers.IO) { Reminders.clearHistory(getApplication()) }
             _state.update { UiState(messages = it.messages).say(message) }
         }
     }

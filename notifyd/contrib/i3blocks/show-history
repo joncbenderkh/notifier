@@ -43,6 +43,7 @@ while :; do
 		"",
 		((.body // "") | split("\n") | map(gsub($re; "")) | join("\n")),
 		(if .url then "\nLink: " + (.url | gsub($re; "")) else empty end),
-		((.actions // [])[] | (.label | gsub($re; "")) + ": " + (.url | gsub($re; "")))' <<<"$json" |
+		((.actions // [])[] | (.label | gsub($re; "")) + ": " + (.url | gsub($re; ""))),
+		(if .remind_at then "Reminder: " + (.remind_at | strflocaltime("%Y-%m-%d %H:%M")) else empty end)' <<<"$json" |
 		zenity --text-info --title "$TITLE" --width 800 --height 500 2>/dev/null
 done

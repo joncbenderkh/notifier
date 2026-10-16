@@ -3,6 +3,11 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Sets snoozed messages' alarms again after a reboot. -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- Shows snoozed messages on time, once the user allows it ("Alarms &
+         reminders"); without it they may come late. -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
 
     <!-- allowBackup is off: pairing secrets are wrapped by an Android Keystore
          key that never leaves the device, so a restored copy is unreadable. -->
@@ -60,6 +65,31 @@
         <receiver
             android:name=".push.ReplyReceiver"
             android:exported="false" />
+
+        <!-- "Snooze" on a notification: asks when to show it again. -->
+        <activity
+            android:name=".push.SnoozeActivity"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|uiMode|keyboardHidden"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <receiver
+            android:name=".push.ReminderReceiver"
+            android:exported="false" />
+
+        <!-- Exported for the system's boot and update broadcasts only. -->
+        <receiver
+            android:name=".push.BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <action android:name="android.intent.action.TIMEZONE_CHANGED" />
+                <action android:name="android.app.action.SCHEDULE_EXACT_ALARM_PERMISSION_STATE_CHANGED" />
+            </intent-filter>
+        </receiver>
 
         <service
             android:name=".push.PushService"

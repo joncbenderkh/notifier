@@ -117,6 +117,8 @@ fun NotifierScreen(viewModel: MainViewModel = viewModel()) {
                 onAnswer = viewModel::answer,
                 onOpen = viewModel::opened,
                 onLink = viewModel::openLink,
+                onSnooze = viewModel::snooze,
+                onCancelReminder = viewModel::cancelReminder,
             )
         }
         return

@@ -22,7 +22,9 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import com.joncbenderkh.notifier.MainActivity
 import com.joncbenderkh.notifier.R
+import com.joncbenderkh.notifier.data.HistoryEntry
 import com.joncbenderkh.notifier.data.Links
+import com.joncbenderkh.notifier.data.PairingStore
 
 object Notifications {
     /** Set on the intent a tapped notification opens: show the history. */
@@ -33,6 +35,9 @@ object Notifications {
 
     /** The message a notification shows, whose ID its tag is not when it has a key (see [NotificationTag]). */
     private const val EXTRA_MESSAGE_ID = "com.joncbenderkh.notifier.SHOWN_MESSAGE_ID"
+
+    /** When its message was sent (ms), which a reminder's shown time is not. */
+    private const val EXTRA_SENT_AT = "com.joncbenderkh.notifier.SENT_AT"
 
     /** Guards each lookup of a notification and the post that follows it, and [showing]. */
     private val lock = Any()
@@ -51,6 +56,12 @@ object Notifications {
     private val replaced = object : LinkedHashMap<String, Unit>() {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Unit>) = size > MAX_SHOWING
     }
+
+    /** As many buttons as Android shows on a notification. */
+    private const val MAX_BUTTONS = 3
+
+    /** The label of the button that snoozes a message. */
+    private const val SNOOZE = "Snooze"
 
     private const val POSTED_CHECKS = 10
     private const val POSTED_PAUSE_MS = 100L
@@ -76,14 +87,36 @@ object Notifications {
      * it show, or a newer message with its key shows; Android can still
      * drop it (see [posted]).
      */
-    fun show(context: Context, payload: Payload, deviceId: String, outcome: String?): Boolean {
+    fun show(context: Context, payload: Payload, deviceId: String, outcome: String?): Boolean =
+        post(context, payload, deviceId, outcome) == Posted.SHOWN
+
+    /** What became of a notification: shown, not shown, or kept out by a newer one with its key. */
+    enum class Posted { SHOWN, HIDDEN, REPLACED }
+
+    /**
+     * Posts [payload]: dated [shownAt] (ms) rather than when sent, if given;
+     * without [regroup], in its channel's group only while that still
+     * exists, else as a direct message would be.
+     */
+    private fun post(
+        context: Context,
+        payload: Payload,
+        deviceId: String,
+        outcome: String?,
+        shownAt: Long? = null,
+        regroup: Boolean = true,
+    ): Posted {
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
             PackageManager.PERMISSION_GRANTED
-        ) return false
+        ) return Posted.HIDDEN
 
         val high = payload.priority == "high"
-        val route = ChannelRoute.of(payload)
-        if (route.groupId != null) createGroup(context, route.groupId, route.groupName ?: route.groupId)
+        val route = route(context, payload, regroup)
+        if (route.groupId != null) {
+            // A reminder's label may be out of date: it leaves the name as it is.
+            if (regroup) createGroup(context, route.groupId, route.groupName ?: route.groupId)
+            else createKinds(context, context.getSystemService(NotificationManager::class.java), route.groupId)
+        }
         val text = NotificationText.of(payload, outcome)
         val channelId = channelFor(context, route)
         val builder = NotificationCompat.Builder(context, channelId)
@@ -99,7 +132,7 @@ object Notifications {
             .setStyle(NotificationCompat.BigTextStyle().bigText(text.text))
             .setSilent(text.settled)
             .setPriority(if (high) NotificationCompat.PRIORITY_HIGH else NotificationCompat.PRIORITY_DEFAULT)
-            .setWhen(payload.sentAt * 1000)
+            .setWhen(shownAt ?: (payload.sentAt * 1000))
             .setShowWhen(true)
             .setContentIntent(open(context, payload, deviceId, Links.web(payload.url), "notifier-open"))
             .setAutoCancel(true)
@@ -107,10 +140,12 @@ object Notifications {
                 Bundle().apply {
                     putString(EXTRA_QUESTION, payload.title)
                     putString(EXTRA_MESSAGE_ID, payload.id)
+                    putLong(EXTRA_SENT_AT, payload.sentAt * 1000)
                 },
             )
         val reply = payload.reply?.takeUnless { text.settled }
         val answers = reply != null && addAnswers(context, builder, payload.id, reply, deviceId, payload.receipts)
+        var buttons = 0
         // The server sends none with a question, whose answers are the buttons.
         if (payload.reply == null) {
             payload.actions.forEachIndexed { i, action ->
@@ -118,20 +153,26 @@ object Notifications {
                 if (action.label.isBlank()) return@forEachIndexed
                 // Where it leads, as the history shows it: the sender chose both.
                 builder.addAction(0, "${action.label} · ${Links.host(link)}", open(context, payload, deviceId, link, "notifier-link", "/$i"))
+                buttons++
             }
         }
+        // Not for an open question, nor in place of a link: Android shows
+        // three buttons, and the history card offers it too.
+        if (!answers && buttons < MAX_BUTTONS) builder.addAction(0, SNOOZE, snooze(context, payload.id))
         val manager = NotificationManagerCompat.from(context)
         val shows = allowed(context, channelId)
         var tag = NotificationTag.of(payload, deviceId)
         synchronized(lock) {
+            // A reminder posted again, when it was not known to show: once is enough.
+            if (shownAt != null && active(manager, payload.id) != null) builder.setOnlyAlertOnce(true)
             if (tag != payload.id) {
                 val shown = manager.activeNotifications.firstOrNull { it.tag == tag && it.id == 0 }?.notification
                 val current = showing[tag]?.first ?: shown?.extras?.getString(EXTRA_MESSAGE_ID)
-                val shownAt = showing[tag]?.second ?: shown?.`when`
+                val sentAt = showing[tag]?.second ?: shown?.let { it.extras.getLong(EXTRA_SENT_AT, it.`when`) }
                 // FCM may deliver out of order, or twice: an older message
                 // keeps out of a newer one's place.
-                if (payload.id in replaced) return false
-                if (shownAt != null && NotificationTag.newer(shownAt, payload.sentAt)) return false
+                if (payload.id in replaced) return Posted.REPLACED
+                if (sentAt != null && NotificationTag.newer(sentAt, payload.sentAt)) return Posted.REPLACED
                 if (current != null && current != payload.id && Answers.isAnswering(current)) {
                     // Its outcome is about to take its place: this one shows apart.
                     tag = payload.id
@@ -145,7 +186,7 @@ object Notifications {
             manager.notify(tag, 0, builder.build())
         }
         if (answers && reply != null) expireAt(context, payload.id, reply)
-        return shows
+        return if (shows) Posted.SHOWN else Posted.HIDDEN
     }
 
     /**
@@ -213,9 +254,11 @@ object Notifications {
         val manager = NotificationManagerCompat.from(context)
         synchronized(lock) {
             val shown = active(manager, id) ?: return
-            if (shown.notification.actions.isNullOrEmpty()) return
+            // Answered, or posted expired: only Snooze, nothing to remove.
+            if (shown.notification.actions.orEmpty().all { it.title == SNOOZE }) return
             val notification = Notification.Builder.recoverBuilder(context, shown.notification)
-                .setActions()
+                // An expired question can be put off, as one that arrived expired.
+                .setActions(Notification.Action.Builder(null, SNOOZE, snooze(context, id)).build())
                 .setOnlyAlertOnce(true)
                 .build()
             manager.notify(shown.tag, 0, notification)
@@ -245,6 +288,7 @@ object Notifications {
                     Bundle().apply {
                         putString(EXTRA_QUESTION, question)
                         putString(EXTRA_MESSAGE_ID, id)
+                        putLong(EXTRA_SENT_AT, extras.getLong(EXTRA_SENT_AT, shown.notification.`when`))
                     },
                 )
                 .setSubText(shown.notification.extras.getCharSequence(NotificationCompat.EXTRA_SUB_TEXT))
@@ -255,6 +299,8 @@ object Notifications {
                 .setContentIntent(shown.notification.contentIntent ?: openHistory(context))
                 .setAutoCancel(true)
             val answers = retry != null && addAnswers(context, builder, id, retry.first, retry.second, receipts)
+            // Settled, it can be put off, as one that arrives settled.
+            if (!answers) builder.addAction(0, SNOOZE, snooze(context, id))
             manager.notify(shown.tag, 0, builder.build())
             if (answers && retry != null) expireAt(context, id, retry.first)
         }
@@ -278,6 +324,85 @@ object Notifications {
         if (part.isNotEmpty()) intent.putExtra(OpenedActivity.EXTRA_DISMISS, payload.id)
         return PendingIntent.getActivity(context, 0, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
     }
+
+    /**
+     * Shows [entry] again, as its reminder: without answers or receipts,
+     * dated now, with what became of its question, and under its key, so
+     * a newer message with the key replaces it. [posted] tells whether
+     * Android shows it.
+     */
+    fun remind(context: Context, entry: HistoryEntry): Posted {
+        val deviceId = PairingStore(context).load()?.deviceId ?: return Posted.HIDDEN
+        // A channel left since keeps its group gone from the system settings.
+        return post(context, reminder(entry), deviceId, outcome = null, shownAt = System.currentTimeMillis(), regroup = false)
+    }
+
+    /**
+     * Whether a reminder of [entry] could show: the user lets the app, and
+     * the channel and group it would show in, post notifications.
+     */
+    fun canRemind(context: Context, entry: HistoryEntry): Boolean {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) return false
+        val manager = context.getSystemService(NotificationManager::class.java)
+        if (!manager.areNotificationsEnabled()) return false
+        val channelId = channelFor(context, route(context, reminder(entry), regroup = false))
+        // One not created yet is, when it shows.
+        return manager.getNotificationChannel(channelId) == null || allowed(context, channelId)
+    }
+
+    /**
+     * Whether a newer message showing with [entry]'s key would keep its
+     * reminder out, as [post] decides; the history may no longer hold it.
+     */
+    fun keptOut(context: Context, entry: HistoryEntry): Boolean {
+        val deviceId = PairingStore(context).load()?.deviceId ?: return false
+        val payload = reminder(entry)
+        val tag = NotificationTag.of(payload, deviceId)
+        if (tag == payload.id) return false
+        val manager = NotificationManagerCompat.from(context)
+        synchronized(lock) {
+            if (payload.id in replaced) return true
+            val shown = manager.activeNotifications.firstOrNull { it.tag == tag && it.id == 0 }?.notification
+            val sentAt = showing[tag]?.second ?: shown?.let { it.extras.getLong(EXTRA_SENT_AT, it.`when`) }
+            return sentAt != null && NotificationTag.newer(sentAt, payload.sentAt)
+        }
+    }
+
+    /** Where [payload] shows: without [regroup], in its channel's group only while that still exists. */
+    private fun route(context: Context, payload: Payload, regroup: Boolean): ChannelRoute {
+        val route = ChannelRoute.of(payload)
+        if (regroup || route.groupId == null) return route
+        val groups = context.getSystemService(NotificationManager::class.java).notificationChannelGroups
+        return if (groups.any { it.id == route.groupId }) route else ChannelRoute.of(payload.copy(channel = null, channelId = null))
+    }
+
+    /** The message [entry] holds, as a reminder shows it. */
+    private fun reminder(entry: HistoryEntry) = Payload(
+        id = entry.id,
+        title = entry.title,
+        // Only a settled or expired question is snoozed.
+        body = listOfNotNull(
+            entry.outcome ?: "The question has expired".takeIf { entry.reply != null },
+            entry.body.ifEmpty { null },
+        ).joinToString("\n"),
+        priority = entry.priority,
+        sentAt = entry.sentAt,
+        channel = entry.channel,
+        channelId = entry.channelId,
+        url = entry.url,
+        actions = entry.actions,
+        key = entry.key,
+    )
+
+    /** The "Snooze" button: asks when to show message [id] again. */
+    private fun snooze(context: Context, id: String): PendingIntent = PendingIntent.getActivity(
+        context,
+        0,
+        Intent(context, SnoozeActivity::class.java).setData(Uri.fromParts("notifier-snooze", id, null)),
+        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+    )
 
     /**
      * Opens the history; for [tracked], a message ID and the device that

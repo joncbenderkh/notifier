@@ -11,11 +11,14 @@ object NotificationTag {
     fun of(payload: Payload, deviceId: String): String {
         // What the server accepts; anything else, which only another server
         // could send, could make two scopes' tags alike.
-        val key = payload.key?.takeIf { KEY.matches(it) } ?: return payload.id
+        val key = payload.key?.takeIf(::validKey) ?: return payload.id
         return "key:$deviceId/${payload.channelId ?: "direct"}/$key"
     }
 
     private val KEY = Regex("[A-Za-z0-9._:-]{1,64}")
+
+    /** Whether [key] is one the server accepts, so a message is posted under it. */
+    fun validKey(key: String) = KEY.matches(key)
 
     /**
      * Whether a notification shown with time [shownAt] (ms) came from a

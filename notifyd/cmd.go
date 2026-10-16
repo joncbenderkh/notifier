@@ -77,6 +77,20 @@ func (a *app) newRoot() *cobra.Command {
 	// Never the default: a second daemon would replace the service's.
 	run := leaf("run", "Receive and show messages until stopped (the systemd service)", cobra.NoArgs, none(a.listen))
 	run.Flags().BoolVar(&a.noSound, "no-sound", false, "give notifications no sound of notifier's own")
+	run.Flags().DurationVar(&a.snooze, "snooze", 0, "offer a Snooze action that shows a message again after `duration` (1m to 24h; 0: none)")
+	// The service's command line: restarting cannot mend it, and a crash
+	// exits 2 too (exitConfig).
+	misconfigured := func(cmd *cobra.Command, err error) error {
+		fmt.Fprintln(cmd.ErrOrStderr(), "notifyd:", err)
+		return exitCode(exitConfig)
+	}
+	run.SetFlagErrorFunc(misconfigured)
+	run.Args = func(cmd *cobra.Command, args []string) error {
+		if err := cobra.NoArgs(cmd, args); err != nil {
+			return misconfigured(cmd, err)
+		}
+		return nil
+	}
 
 	root.AddCommand(
 		pair,

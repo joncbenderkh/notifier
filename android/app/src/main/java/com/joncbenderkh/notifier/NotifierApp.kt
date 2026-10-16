@@ -2,14 +2,25 @@
 package com.joncbenderkh.notifier
 
 import android.app.Application
+import android.util.Log
 import com.google.firebase.FirebaseApp
 import com.google.firebase.FirebaseOptions
 import com.joncbenderkh.notifier.push.Notifications
+import com.joncbenderkh.notifier.push.Reminders
+import kotlin.concurrent.thread
 
 class NotifierApp : Application() {
     override fun onCreate() {
         super.onCreate()
         Notifications.createChannels(this)
+        // A force stop clears the app's alarms, and any later start comes here.
+        thread(name = "reminders") {
+            try {
+                Reminders.rescheduleAll(this)
+            } catch (e: Exception) {
+                Log.w("NotifierApp", "could not reschedule the reminders", e)
+            }
+        }
         if (firebaseConfigured) {
             FirebaseApp.initializeApp(
                 this,

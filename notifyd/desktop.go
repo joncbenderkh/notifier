@@ -42,6 +42,21 @@ const notificationsInterface = "org.freedesktop.Notifications"
 // what became of it, to show in place of the question.
 type AnswerFunc func(id string, q histfile.Reply, option string) string
 
+// SnoozeFunc has the message [id] shown again later, and reports whether
+// it will be. It is called off the signal loop.
+type SnoozeFunc func(id string) bool
+
+// desktopHooks is what the desktop calls back, and how it shows messages.
+type desktopHooks struct {
+	answer  AnswerFunc
+	receipt ReceiptFunc
+	open    OpenFunc
+	snooze  SnoozeFunc
+	// snoozeFor, if set, offers [snoozeAction] on messages.
+	snoozeFor time.Duration
+	sounds    map[string]string
+}
+
 // ReceiptFunc reports that the message [id] was shown or opened (see
 // [receiptShown], [receiptOpened]). It is called off the signal loop.
 type ReceiptFunc func(id, state string)
@@ -53,6 +68,8 @@ const (
 	openAction = "default"
 	// linkAction prefixes the key of a button that opens a link, by index.
 	linkAction = "link:"
+	// snoozeAction shows the message again later.
+	snoozeAction = "snooze"
 )
 
 // question is a shown notification with actions: buttons that answer its
@@ -67,9 +84,13 @@ type question struct {
 	// by index, "" for one not offered.
 	url   string
 	links []string
-	// markable: it was offered [openAction].
-	markable bool
-	shown    time.Time
+	// markable: it was offered [openAction]; snoozable, [snoozeAction];
+	// clicks, any action but [snoozeAction] and a [openAction] that does
+	// nothing.
+	markable  bool
+	snoozable bool
+	clicks    bool
+	shown     time.Time
 	// owner is the service instance that showed it, which alone numbers
 	// it and may answer it; "" when a service was started to show it.
 	owner string
@@ -105,16 +126,20 @@ func keyScope(p Payload) string {
 // dunst, mako, GNOME, KDE and others implement. A question's answers become
 // actions (buttons) when the service supports them.
 type dbusDesktop struct {
-	answer  AnswerFunc
-	receipt ReceiptFunc
-	open    OpenFunc
-	now     func() time.Time
+	answer    AnswerFunc
+	receipt   ReceiptFunc
+	open      OpenFunc
+	snooze    SnoozeFunc
+	snoozeFor time.Duration
+	now       func() time.Time
 	// sounds are the sound files by name (see [sound]); none, no sound hint.
 	sounds map[string]string
 
 	// showMu makes a signal wait for a Notify call in flight, so an action
 	// on a question just shown finds it registered.
 	showMu sync.Mutex
+	// connMu makes one caller of Notify reconnect at a time.
+	connMu sync.Mutex
 	mu     sync.Mutex
 	conn   *dbus.Conn
 	// object addresses the service by a bus name: its current owner's
@@ -136,13 +161,19 @@ type dbusDesktop struct {
 	// ID, the connection they were shown over. The outcome takes their
 	// place, so a keyed message does not.
 	answering map[uint32]uint64
+	// snoozing holds the notifications being snoozed and not yet closed:
+	// by ID, the owner that showed them.
+	snoozing map[uint32]string
 	// gen counts connections; signals still queued from an earlier one
 	// would name owners and notification IDs a new bus may reuse.
 	gen uint64
 }
 
-func connectDesktop(ctx context.Context, answer AnswerFunc, receipt ReceiptFunc, open OpenFunc, sounds map[string]string) (Desktop, error) {
-	d := &dbusDesktop{answer: answer, receipt: receipt, open: open, now: time.Now, sounds: sounds, pending: map[uint32]question{}, keyed: map[string]keyedNote{}}
+func connectDesktop(ctx context.Context, h desktopHooks) (Desktop, error) {
+	d := &dbusDesktop{
+		answer: h.answer, receipt: h.receipt, open: h.open, snooze: h.snooze, snoozeFor: h.snoozeFor, sounds: h.sounds,
+		now: time.Now, pending: map[uint32]question{}, keyed: map[string]keyedNote{},
+	}
 	if err := d.connect(ctx); err != nil {
 		return nil, err
 	}
@@ -205,6 +236,7 @@ func (d *dbusDesktop) connect(ctx context.Context) error {
 	clear(d.pending)
 	clear(d.keyed)
 	clear(d.answering)
+	clear(d.snoozing)
 	d.gen++
 	gen := d.gen
 	d.mu.Unlock()
@@ -227,14 +259,19 @@ func capabilities(ctx context.Context, obj dbus.BusObject) (markup, actions bool
 }
 
 func (d *dbusDesktop) Notify(ctx context.Context, p Payload) error {
+	// Messages and reminders arrive concurrently: one reconnects, and the
+	// other then finds the connection up.
+	d.connMu.Lock()
 	d.mu.Lock()
 	connected := d.conn.Connected()
 	d.mu.Unlock()
 	if !connected {
 		if err := d.connect(ctx); err != nil {
+			d.connMu.Unlock()
 			return err
 		}
 	}
+	d.connMu.Unlock()
 	return d.show(ctx, p)
 }
 
@@ -304,6 +341,25 @@ func (d *dbusDesktop) showOnce(ctx context.Context, p Payload) error {
 	}
 	now := d.now()
 	n := notification(p, markup, actions, now)
+	// Whether a click on it does more than snooze it.
+	clicks := len(n.actions) > 0
+	// The link a lone link button opens, which dunst's middle click invoked.
+	var loneLink string
+	if actions && d.snoozeFor > 0 && d.snooze != nil && !openQuestion(p, now) {
+		switch {
+		case !clicks:
+			// Alone, Snooze is what dunst's middle click invokes ("the only
+			// available action"): a default that does nothing keeps that a
+			// dismissal.
+			n.actions = append(n.actions, openAction, "Dismiss")
+		case len(n.actions) == 2 && strings.HasPrefix(n.actions[0], linkAction):
+			// Beside Snooze, a default keeps the middle click opening it.
+			i, _ := strconv.Atoi(strings.TrimPrefix(n.actions[0], linkAction))
+			loneLink = p.Actions[i].URL
+			n.actions = append(n.actions, openAction, n.actions[1])
+		}
+		n.actions = append(n.actions, snoozeAction, "Snooze "+snoozeLabel(d.snoozeFor))
+	}
 	if path, ok := d.sounds[sound(p, now)]; ok {
 		n.hints["sound-file"] = dbus.MakeVariant(path)
 	}
@@ -311,15 +367,17 @@ func (d *dbusDesktop) showOnce(ctx context.Context, p Payload) error {
 	var replaces, closing uint32
 	d.mu.Lock()
 	if k, ok := d.keyed[scope]; ok && scope != "" && k.owner == owner && k.gen == d.gen {
-		_, offers := d.pending[k.nid]
+		old, offers := d.pending[k.nid]
 		g, answering := d.answering[k.nid]
 		switch {
 		case answering && g == d.gen: // its outcome takes its place
-		case offers || len(n.actions) > 0:
+		case offers && old.clicks || clicks:
 			// Actions are keyed by index alone, so a click on the old one
 			// still queued would reach this one in its place, and a close
 			// of the old one still queued would take this one's actions:
-			// it is closed instead, and this one shown anew.
+			// it is closed instead, and this one shown anew. Snooze alone
+			// is no reason: at worst a late click snoozes the newer message
+			// with the same key, or a late close drops its Snooze.
 			closing = k.nid
 		default:
 			replaces = k.nid
@@ -345,11 +403,15 @@ func (d *dbusDesktop) showOnce(ctx context.Context, p Payload) error {
 	}
 	if err == nil && len(n.actions) > 0 {
 		q := question{
-			id: p.ID, title: n.summary, receipts: p.Receipts, markable: slices.Contains(n.actions, openAction),
+			id: p.ID, title: n.summary, receipts: p.Receipts, markable: clicks && slices.Contains(n.actions, openAction),
+			snoozable: slices.Contains(n.actions, snoozeAction), clicks: clicks,
 			shown: now, owner: owner, gen: d.gen, scope: scope,
 		}
 		if webLink(p.URL) {
 			q.url = p.URL
+		}
+		if loneLink != "" {
+			q.url = loneLink
 		}
 		for _, a := range p.Actions {
 			link := ""
@@ -497,6 +559,9 @@ func (d *dbusDesktop) signal(gen uint64, sig *dbus.Signal) {
 				delete(d.keyed, scope)
 			}
 		}
+		if owner, ok := d.snoozing[nid]; ok && owner == sig.Sender {
+			delete(d.snoozing, nid)
+		}
 	}
 	q, found := d.pending[nid]
 	if gen != d.gen || !found || sig.Sender != q.owner {
@@ -513,12 +578,53 @@ func (d *dbusDesktop) signal(gen uint64, sig *dbus.Signal) {
 		if !q.markable {
 			return
 		}
-		// Offered only without answers; its link buttons, if any, stay
-		// clickable where the service keeps it showing.
-		if !slices.ContainsFunc(q.links, func(l string) bool { return l != "" }) {
+		// Offered only without answers; its link buttons and Snooze, if
+		// any, stay clickable where the service keeps it showing.
+		if !q.snoozable && !slices.ContainsFunc(q.links, func(l string) bool { return l != "" }) {
 			delete(d.pending, nid)
 		}
 		d.opened(q, q.url)
+		return
+	}
+	if key == snoozeAction {
+		if !q.snoozable {
+			return
+		}
+		delete(d.pending, nid)
+		// A keyed update arriving before the close below must not take its
+		// place: it would be closed instead.
+		for scope, k := range d.keyed {
+			if k.nid == nid && k.owner == q.owner {
+				delete(d.keyed, scope)
+			}
+		}
+		obj := d.target(q.owner)
+		if d.snoozing == nil {
+			d.snoozing = map[uint32]string{}
+		}
+		d.snoozing[nid] = q.owner
+		go func() {
+			saved := d.snooze(q.id)
+			d.mu.Lock()
+			_, open := d.snoozing[nid]
+			delete(d.snoozing, nid)
+			d.mu.Unlock()
+			if !saved {
+				// Most services have closed it on the click: say so in its
+				// place, rather than let it go silently.
+				d.showOutcome(nid, q, "Could not snooze it")
+				return
+			}
+			// Put off, it goes until its reminder: some services keep a
+			// notification after an action, dunst a critical one. Not once
+			// closed: the service may have given its ID to another.
+			if !open {
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), dbusTimeout)
+			defer cancel()
+			obj.CallWithContext(ctx, notificationsInterface+".CloseNotification", 0, nid)
+		}()
 		return
 	}
 	if l, ok := strings.CutPrefix(key, linkAction); ok {
@@ -673,7 +779,7 @@ func notification(p Payload, markup, actions bool, now time.Time) notifyArgs {
 		n.hints["category"] = dbus.MakeVariant("notifier." + dropNUL(p.Channel))
 	}
 	q := p.Reply
-	open := q != nil && len(q.Options) > 0 && now.Unix() < q.ExpiresAt
+	open := openQuestion(p, now)
 	// An open question's answers report the opening (the server records
 	// it), and a default action would take the place of dunst's menu of them.
 	switch {
@@ -712,6 +818,23 @@ func notification(p Payload, markup, actions bool, now time.Time) notifyArgs {
 		n.body = escapeMarkup(n.body)
 	}
 	return n
+}
+
+// openQuestion reports whether p asks a question that may still be answered.
+func openQuestion(p Payload, now time.Time) bool {
+	q := p.Reply
+	return q != nil && len(q.Options) > 0 && now.Unix() < q.ExpiresAt
+}
+
+// snoozeLabel renders d for a button: "1 h", "15 min".
+func snoozeLabel(d time.Duration) string {
+	switch {
+	case d%time.Hour == 0:
+		return fmt.Sprintf("%d h", int(d.Hours()))
+	case d%time.Minute == 0:
+		return fmt.Sprintf("%d min", int(d.Minutes()))
+	}
+	return d.String()
 }
 
 // withLinks adds a message's links to body, for a service that shows no

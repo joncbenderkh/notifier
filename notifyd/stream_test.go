@@ -12,6 +12,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -28,6 +29,8 @@ const (
 type fakeDesktop struct {
 	shown chan Payload
 	fail  atomic.Int32 // fail this many calls first
+	// onShow, if set, runs as a message is shown.
+	onShow func()
 }
 
 func newFakeDesktop() *fakeDesktop { return &fakeDesktop{shown: make(chan Payload, 10)} }
@@ -38,6 +41,9 @@ func (d *fakeDesktop) Notify(_ context.Context, p Payload) error {
 	}
 	if p.Title == "poison" {
 		return errRejected
+	}
+	if d.onShow != nil {
+		d.onShow()
 	}
 	d.shown <- p
 	return nil
@@ -352,5 +358,25 @@ func TestStreamURL(t *testing.T) {
 		if got := streamURL(in); got != want {
 			t.Errorf("streamURL(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestShowsUnderTheReminderLock(t *testing.T) {
+	desktop := newFakeDesktop()
+	s := newStreamer(State{}, desktop, http.DefaultClient, t.Logf)
+	var mu sync.Mutex
+	s.showing = &mu
+	mu.Lock()
+	done := make(chan error, 1)
+	go func() { done <- s.show(context.Background(), Payload{ID: "msg_1", Title: "Disk 95%", Key: "disk"}) }()
+	select {
+	case p := <-desktop.shown:
+		t.Fatalf("shown while a reminder showed: %+v", p)
+	case <-time.After(50 * time.Millisecond):
+	}
+	mu.Unlock()
+	desktop.next(t)
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }
