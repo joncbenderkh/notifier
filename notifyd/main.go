@@ -37,6 +37,9 @@ const (
 	exitUnpaired = 4
 	// Another notifyd is connected as this device.
 	exitReplaced = 5
+	// run's command line is wrong: restarting cannot help. Not exitUsage,
+	// which a crash shares (Go exits 2 on a panic).
+	exitConfig = 6
 )
 
 type app struct {
@@ -45,11 +48,13 @@ type app struct {
 	historyPath    string
 	now            func() time.Time
 	http           *http.Client
-	desktop        func(context.Context, AnswerFunc, ReceiptFunc, OpenFunc, map[string]string) (Desktop, error)
+	desktop        func(context.Context, desktopHooks) (Desktop, error)
 	hostname       func() (string, error)
 	signals        func() (context.Context, context.CancelFunc)
 	// noSound keeps run from giving notifications a sound.
 	noSound bool
+	// snooze, if set, is how long run's snooze action puts a message off.
+	snooze time.Duration
 }
 
 func main() {
@@ -77,6 +82,9 @@ func (a *app) run(args []string) int {
 	if cmd, rest, err := root.Find(args); err == nil {
 		if f := oldStyleFlag(cmd, rest); f != "" {
 			fmt.Fprintf(a.stderr, "notifyd: unknown flag -%s; long flags take two dashes since 0.4.0: --%s\n", f, f)
+			if cmd.Name() == "run" { // the service's command line: see exitConfig
+				return exitConfig
+			}
 			return exitUsage
 		}
 	}
@@ -209,6 +217,11 @@ func (a *app) pair(arg string, o pairOptions) int {
 }
 
 func (a *app) listen() int {
+	// Whole minutes, which the button names.
+	if a.snooze != 0 && (a.snooze < minSnooze || a.snooze > maxSnooze || a.snooze%time.Minute != 0) {
+		fmt.Fprintln(a.stderr, "notifyd: --snooze must be whole minutes, 1m to 24h")
+		return exitConfig
+	}
 	st, err := loadState(a.statePath)
 	if errors.Is(err, errNotPaired) {
 		// Nothing to run until it is paired: don't let systemd retry.
@@ -225,32 +238,44 @@ func (a *app) listen() int {
 	defer release()
 	ctx, stop := a.signals()
 	defer stop()
-	posting := make(chan struct{}, maxReceiptPosts)
-	desktop, err := a.desktop(ctx, func(id string, q histfile.Reply, option string) string {
-		outcome, _ := a.answer(st, id, q, option)
-		return outcome
-	}, func(id, state string) {
-		// A backlog of queued messages must not open a connection each;
-		// a click, at human pace, need not wait behind them.
-		if state == receiptShown {
-			posting <- struct{}{}
-			defer func() { <-posting }()
-		}
-		a.receipt(st, id, state)
-	}, func(link string) {
-		if err := openLink(ctx, link, a.logf); err != nil {
-			a.logf("could not open %s: %v", link, err)
-		}
-	}, a.sounds())
-	if err != nil {
-		return a.fail(fmt.Errorf("cannot reach the desktop's notification service: %w", err))
-	}
-	s := newStreamer(st, desktop, a.http, a.logf)
-	s.history = newHistory(a.historyPath, a.now)
-	s.history.current = func() bool {
+	h := newHistory(a.historyPath, a.now)
+	h.current = func() bool {
 		saved, err := loadState(a.statePath)
 		return err == nil && saved.DeviceID == st.DeviceID
 	}
+	// Reminders are shown even when snoozing is off now: they were asked for.
+	snoozer := newSnoozer(ctx, h, a.snooze, a.now, a.logf)
+	posting := make(chan struct{}, maxReceiptPosts)
+	desktop, err := a.desktop(ctx, desktopHooks{
+		answer: func(id string, q histfile.Reply, option string) string {
+			outcome, _ := a.answer(st, id, q, option)
+			return outcome
+		},
+		receipt: func(id, state string) {
+			// A backlog of queued messages must not open a connection each;
+			// a click, at human pace, need not wait behind them.
+			if state == receiptShown {
+				posting <- struct{}{}
+				defer func() { <-posting }()
+			}
+			a.receipt(st, id, state)
+		},
+		open: func(link string) {
+			if err := openLink(ctx, link, a.logf); err != nil {
+				a.logf("could not open %s: %v", link, err)
+			}
+		},
+		snooze:    snoozer.snooze,
+		snoozeFor: a.snooze,
+		sounds:    a.sounds(),
+	})
+	if err != nil {
+		return a.fail(fmt.Errorf("cannot reach the desktop's notification service: %w", err))
+	}
+	snoozer.desktop = desktop
+	snoozer.start()
+	s := newStreamer(st, desktop, a.http, a.logf)
+	s.history, s.showing = h, &snoozer.fireMu
 	err = s.run(ctx)
 	switch {
 	case errors.Is(err, errUnpaired):
@@ -455,8 +480,8 @@ func formatEntry(e historyEntry) string {
 	if e.Priority == "high" {
 		b.WriteString("  (high)")
 	}
-	// Queued or delayed on the way: say when it was sent.
-	if e.ReceivedAt-e.SentAt > 60 {
+	// Queued or delayed on the way, not snoozed: say when it was sent.
+	if e.ReceivedAt-e.SentAt > 60 && !e.Reminded {
 		b.WriteString("  (sent " + time.Unix(e.SentAt, 0).Format(layout) + ")")
 	}
 	b.WriteString("\n")
@@ -477,6 +502,9 @@ func formatEntry(e historyEntry) string {
 	}
 	for _, a := range e.Actions {
 		b.WriteString("    " + printable(a.Label, false) + ": " + printable(a.URL, false) + "\n")
+	}
+	if e.RemindAt != 0 {
+		b.WriteString("    reminder: " + time.Unix(e.RemindAt, 0).Format(layout) + "\n")
 	}
 	return b.String()
 }

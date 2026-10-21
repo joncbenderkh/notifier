@@ -167,7 +167,7 @@ func newTestApp(t *testing.T) (*app, *bytes.Buffer, *bytes.Buffer) {
 		historyPath: filepath.Join(dir, "state", "notifyd-history.jsonl"),
 		now:         func() time.Time { return time.Unix(testNow, 0) },
 		http:        &http.Client{CheckRedirect: refuseRedirect},
-		desktop: func(context.Context, AnswerFunc, ReceiptFunc, OpenFunc, map[string]string) (Desktop, error) {
+		desktop: func(context.Context, desktopHooks) (Desktop, error) {
 			return newFakeDesktop(), nil
 		},
 		hostname: func() (string, error) { return "workstation", nil },
@@ -260,7 +260,6 @@ func TestPairUsageErrors(t *testing.T) {
 		{"pair", "--server", "http://notifier.example", "CODE"},
 		{"pair", "--server", "https://x.example", "notifier://pair?server=https://x.example&code=C"},
 		{"pair", "notifier://join?server=https://x.example&code=C"},
-		{"run", "extra"},
 		{"bogus"},
 		{},
 	} {
@@ -327,8 +326,8 @@ func TestRunReportsReceiptsAsItsDevice(t *testing.T) {
 	api.status["POST /v1/device/receipts"] = http.StatusNoContent
 	a, _, stderr := newTestApp(t)
 	var receipt ReceiptFunc
-	a.desktop = func(_ context.Context, _ AnswerFunc, r ReceiptFunc, _ OpenFunc, _ map[string]string) (Desktop, error) {
-		receipt = r
+	a.desktop = func(_ context.Context, h desktopHooks) (Desktop, error) {
+		receipt = h.receipt
 		return newFakeDesktop(), nil
 	}
 	saveState(a.statePath, State{URL: api.URL, DeviceID: testDevice, DeviceToken: "nd_1", SealKey: testKey})

@@ -2,6 +2,7 @@
 package com.joncbenderkh.notifier.data
 
 import android.content.Context
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.util.AtomicFile
 import com.joncbenderkh.notifier.push.Payload
@@ -10,6 +11,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.io.File
 import java.io.IOException
+import java.time.LocalDateTime
+import java.time.ZoneId
 
 /**
  * The on-device [History], encrypted at rest under its own Keystore key and
@@ -38,20 +41,60 @@ class HistoryStore private constructor(context: Context) {
      * that [clear] takes, so a message that arrives while the phone is being
      * unpaired cannot reappear in the next pairing's history.
      */
-    fun record(payload: Payload, stillPaired: () -> Boolean) {
+    fun record(payload: Payload, stillPaired: () -> Boolean): Recorded {
         val now = now()
         synchronized(lock) {
-            if (stillPaired()) update { it.add(HistoryEntry.of(payload, now), now) }
+            val (after, recorded) = current().record(HistoryEntry.of(payload, now), now)
+            if (recorded.snoozed) return recorded
+            if (!stillPaired()) return Recorded()
+            update { after }
+            return recorded
         }
     }
 
     /** What became of the answer to [id]'s question, if it is settled. */
-    fun outcome(id: String): String? = synchronized(lock) {
-        val current = history ?: read().also {
+    fun outcome(id: String): String? = entry(id)?.outcome
+
+    /** The history as it stands. */
+    fun history(): History = current()
+
+    private fun current(): History = synchronized(lock) {
+        history ?: read().also {
             history = it
             _entries.value = it.entries
         }
-        current.entries.firstOrNull { it.id == id }?.outcome
+    }
+
+    /** The entry for message [id], if the history still holds it. */
+    fun entry(id: String): HistoryEntry? = current().entries.firstOrNull { it.id == id }
+
+    /** The entries waiting to be shown again. */
+    fun reminders(): List<HistoryEntry> = current().reminders()
+
+    /**
+     * Sets when message [id] is shown again, or never for null, at the
+     * [local] time wherever the phone is if given; false if the history no
+     * longer holds it.
+     */
+    fun remind(id: String, at: Long?, local: LocalDateTime? = null): Boolean = synchronized(lock) {
+        if (entry(id) == null) return false
+        update { it.remind(id, at, local) }
+        true
+    }
+
+    /** Moves the reminders set for a local time to that time in [zone]; see [History.inZone]. */
+    fun inZone(zone: ZoneId) {
+        update { it.inZone(zone) }
+    }
+
+    /** Records that message [id]'s reminder for [at] showed; see [History.reminded]. */
+    fun reminded(id: String, at: Long) {
+        update { it.reminded(id, at, now()) }
+    }
+
+    /** Clears message [id]'s reminder if it is still [at]: one set again meanwhile stays. */
+    fun clearReminder(id: String, at: Long) {
+        update { history -> history.remind(id, null) { it.remindAt == at } }
     }
 
     fun settled(id: String, outcome: String) {
@@ -81,12 +124,38 @@ class HistoryStore private constructor(context: Context) {
         }
     }
 
-    private fun read(): History {
+    /**
+     * Reads the history now if not read yet, for a caller in the background:
+     * one that cannot be read fails, and is left for the push service or the
+     * UI to set aside.
+     */
+    fun requireReadable() {
+        synchronized(lock) {
+            if (history == null) {
+                history = read(setAside = false)
+                _entries.value = history!!.entries
+            }
+        }
+    }
+
+    private fun read(setAside: Boolean = true): History {
         if (!file.baseFile.exists()) return History()
         val sealed = file.readFully()
         return try {
             History.decode(cipher.decrypt(sealed))
+        } catch (_: Exception) {
+            // The Keystore can fail for a moment: once more before giving up.
+            Thread.sleep(RETRY_MS)
+            readAgain(sealed, setAside)
+        }
+    }
+
+    private fun readAgain(sealed: ByteArray, setAside: Boolean): History {
+        return try {
+            History.decode(cipher.decrypt(sealed))
         } catch (e: Exception) {
+            // Just after boot the Keystore may not be ready yet: keep it, and its reminders, for a later read.
+            if (!setAside || SystemClock.elapsedRealtime() < SET_ASIDE_AFTER_BOOT_MS) throw IOException("history unreadable", e)
             // E.g. the Keystore key is gone after a lock-screen reset. Start a
             // new history, but set the old one aside in case the failure passes.
             Log.w(TAG, "history unreadable; starting a new one", e)
@@ -111,6 +180,8 @@ class HistoryStore private constructor(context: Context) {
         private const val UNREADABLE_FILE_NAME = "history.unreadable.bin"
         private const val KEY_ALIAS = "notifier-history"
         private const val TAG = "HistoryStore"
+        private const val RETRY_MS = 200L
+        private const val SET_ASIDE_AFTER_BOOT_MS = 5 * 60 * 1000L
 
         @Volatile private var instance: HistoryStore? = null
 

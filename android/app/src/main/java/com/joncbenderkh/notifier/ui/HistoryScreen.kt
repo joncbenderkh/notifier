@@ -46,14 +46,20 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.LifecycleResumeEffect
 import com.joncbenderkh.notifier.R
+import com.joncbenderkh.notifier.data.History
 import com.joncbenderkh.notifier.data.HistoryEntry
 import com.joncbenderkh.notifier.data.Links
 import com.joncbenderkh.notifier.push.ChannelRoute
+import com.joncbenderkh.notifier.push.Reminders
+import com.joncbenderkh.notifier.push.Snooze
+import java.time.ZoneId
 import kotlinx.coroutines.delay
 
 /** Notifications this phone received, newest first; only this phone has them. */
@@ -69,6 +75,8 @@ fun HistoryScreen(
     onAnswer: (HistoryEntry, String) -> Unit,
     onOpen: (HistoryEntry) -> Unit,
     onLink: (HistoryEntry, String) -> Unit,
+    onSnooze: (HistoryEntry, Snooze, Long) -> Unit,
+    onCancelReminder: (HistoryEntry) -> Unit,
 ) {
     BackHandler(onBack = onBack)
     var confirmClear by rememberSaveable { mutableStateOf(false) }
@@ -123,6 +131,15 @@ fun HistoryScreen(
                 OutlinedButton(onClick = onBack) { Text("Back to home") }
             }
         } else {
+            // A replaced message would never show again: its reminder is dropped.
+            val replaced = remember(entries) { History(entries).replacedIds() }
+            // Once per screen, not per card: asked again on return from the settings.
+            val context = LocalContext.current
+            var exact by remember { mutableStateOf(Reminders.exact(context)) }
+            LifecycleResumeEffect(Unit) {
+                exact = Reminders.exact(context)
+                onPauseOrDispose {}
+            }
             LazyColumn(
                 modifier = Modifier.padding(padding).fillMaxSize(),
                 contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 16.dp),
@@ -135,7 +152,9 @@ fun HistoryScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
-                items(entries, key = { it.id }) { HistoryCard(it, onDelete, it.id in answering, onAnswer, onOpen, onLink) }
+                items(entries, key = { it.id }) {
+                    HistoryCard(it, onDelete, it.id in answering, onAnswer, onOpen, onLink, it.id !in replaced, onSnooze, onCancelReminder, Reminders.lateAfterMs(exact))
+                }
             }
         }
     }
@@ -209,8 +228,13 @@ private fun HistoryCard(
     onAnswer: (HistoryEntry, String) -> Unit,
     onOpen: (HistoryEntry) -> Unit,
     onLink: (HistoryEntry, String) -> Unit,
+    snoozable: Boolean,
+    onSnooze: (HistoryEntry, Snooze, Long) -> Unit,
+    onCancelReminder: (HistoryEntry) -> Unit,
+    late: Long,
 ) {
     var expanded by rememberSaveable(entry.id) { mutableStateOf(false) }
+    var choosing by rememberSaveable(entry.id) { mutableStateOf(false) }
     var overflows by remember(entry.id) { mutableStateOf(false) }
     val now = System.currentTimeMillis()
     val received =
@@ -249,9 +273,26 @@ private fun HistoryCard(
                         if (entry.receipts) Badge("Read receipt")
                     }
                     Text(entry.title, style = MaterialTheme.typography.titleMedium)
+                    entry.remindAt?.let { at ->
+                        // Past due when it could not show: it shows on the next start that can.
+                        val time = Reminders.time(LocalContext.current, at)
+                        // Turns to "overdue" on time, even while the screen stays open.
+                        var overdue by remember(entry.id, at) { mutableStateOf(at * 1000 < now - late) }
+                        LaunchedEffect(entry.id, at, overdue) {
+                            if (!overdue) {
+                                delay(at * 1000 + late - System.currentTimeMillis())
+                                overdue = true
+                            }
+                        }
+                        Text(
+                            if (overdue) "Reminder overdue since $time" else "Reminder $time",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                    }
                     // Queued or delayed on the way: say how much earlier it was sent.
                     val delay = entry.receivedAt - entry.sentAt
-                    if (delay > 60) {
+                    if (delay > 60 && !entry.reminded) {
                         Text(
                             "Sent ${roughly(delay)} earlier",
                             style = MaterialTheme.typography.labelSmall,
@@ -276,24 +317,71 @@ private fun HistoryCard(
             val url = Links.web(entry.url)
             val actions = entry.actions.filter { Links.web(it.url) != null && it.label.isNotBlank() }
             val readMore = entry.body.isNotEmpty() && (expanded || overflows)
-            if (readMore || entry.receipts || url != null || actions.isNotEmpty()) {
-                FlowRow(Modifier.padding(end = 12.dp), horizontalArrangement = Arrangement.spacedBy(24.dp)) {
-                    if (readMore) Link(if (expanded) "Collapse" else "Read message") { expanded = !expanded }
-                    if (url != null) Link("Open ${Links.host(url)}") { onLink(entry, url) }
-                    actions.forEach { a -> Link("${a.label} · ${Links.host(a.url)}") { onLink(entry, a.url) } }
-                    if (entry.receipts) Link("Mark seen") { onOpen(entry) }
-                }
-            }
             val reply = entry.reply
+            // Turns to "expired" on time, even while the screen stays open.
+            var expired by remember(entry.id) { mutableStateOf(reply != null && now / 1000 >= reply.expiresAt) }
             if (reply != null) {
-                // Turns to "expired" on time, even while the screen stays open.
-                var expired by remember(entry.id) { mutableStateOf(now / 1000 >= reply.expiresAt) }
                 LaunchedEffect(entry.id, expired) {
                     if (!expired) {
                         delay(reply.expiresAt * 1000 - System.currentTimeMillis())
                         expired = true
                     }
                 }
+            }
+            // An open question is answered, not put off.
+            val asking = reply != null && entry.outcome == null && !expired
+            FlowRow(Modifier.padding(end = 12.dp), horizontalArrangement = Arrangement.spacedBy(24.dp)) {
+                if (readMore) Link(if (expanded) "Collapse" else "Read message") { expanded = !expanded }
+                if (url != null) Link("Open ${Links.host(url)}") { onLink(entry, url) }
+                actions.forEach { a -> Link("${a.label} · ${Links.host(a.url)}") { onLink(entry, a.url) } }
+                if (entry.receipts) Link("Mark seen") { onOpen(entry) }
+                if (entry.remindAt != null) Link("Cancel reminder") { onCancelReminder(entry) }
+                else if (!asking && snoozable) Link("Remind me") { choosing = true }
+            }
+            if (choosing) {
+                // The time the labels name; a morning that passed before the tap moves to the next.
+                val offeredAt = remember { System.currentTimeMillis() / 1000 }
+                val context = LocalContext.current
+                AlertDialog(
+                    onDismissRequest = { choosing = false },
+                    title = { Text("Remind me") },
+                    text = {
+                        Column {
+                            Snooze.choices().forEach { choice ->
+                                Text(
+                                    choice.label(offeredAt, ZoneId.systemDefault()) { Reminders.clock(context, it) },
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable {
+                                            choosing = false
+                                            onSnooze(entry, choice, offeredAt)
+                                        }
+                                        .padding(vertical = 12.dp),
+                                )
+                            }
+                        }
+                    },
+                    confirmButton = {},
+                    dismissButton = {
+                        // Asked again on return from the settings.
+                        var exact by remember { mutableStateOf(Reminders.exact(context)) }
+                        LifecycleResumeEffect(Unit) {
+                            exact = Reminders.exact(context)
+                            onPauseOrDispose {}
+                        }
+                        Row {
+                            // Inexact, a reminder may come late.
+                            if (!exact) {
+                                // Still open on return, to choose a time.
+                                TextButton(onClick = { Reminders.openSettings(context) }) { Text("On time…") }
+                            }
+                            TextButton(onClick = { choosing = false }) { Text("Cancel") }
+                        }
+                    },
+                )
+            }
+            if (reply != null) {
                 val settled = entry.outcome ?: "The question has expired".takeIf { expired }
                 if (settled != null) {
                     Text(

@@ -97,7 +97,7 @@ fun NotifierScreen(viewModel: MainViewModel = viewModel()) {
         viewModel.messageShown(notice.id)
     }
 
-    val permission = rememberNotificationPermission()
+    val permission = rememberNotificationPermission(onGranted = viewModel::remindAgain)
     LaunchedEffect(state.askNotifications, permission.granted) {
         if (state.askNotifications && permission.granted) viewModel.notificationsAsked()
     }
@@ -117,6 +117,8 @@ fun NotifierScreen(viewModel: MainViewModel = viewModel()) {
                 onAnswer = viewModel::answer,
                 onOpen = viewModel::opened,
                 onLink = viewModel::openLink,
+                onSnooze = viewModel::snooze,
+                onCancelReminder = viewModel::cancelReminder,
             )
         }
         return
@@ -250,18 +252,23 @@ private fun rememberQrScanner(onScanned: (String) -> Unit, onScanFailed: (String
 private class NotificationPermission(val granted: Boolean, val request: () -> Unit)
 
 @Composable
-private fun rememberNotificationPermission(): NotificationPermission {
+private fun rememberNotificationPermission(onGranted: () -> Unit): NotificationPermission {
     val context = LocalContext.current
     fun check() = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
         ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) ==
         PackageManager.PERMISSION_GRANTED
     var granted by remember { mutableStateOf(check()) }
     // The user may change it in system settings while the app is in the background.
+    // Granted, it lets through the reminders held back meanwhile.
     LifecycleResumeEffect(Unit) {
+        if (check() && !granted) onGranted()
         granted = check()
         onPauseOrDispose {}
     }
-    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted = it }
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
+        if (it && !granted) onGranted()
+        granted = it
+    }
     return NotificationPermission(granted) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) launcher.launch(Manifest.permission.POST_NOTIFICATIONS)
     }

@@ -109,7 +109,7 @@ func TestReplyAnswersFromTheHistory(t *testing.T) {
 		{ID: "msg_q", Title: "Deploy?", Priority: "default", SentAt: testNow, Reply: &q},
 		{ID: "msg_plain", Title: "Hi", Priority: "default", SentAt: testNow},
 	} {
-		if err := h.record(p); err != nil {
+		if _, err := h.record(p); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -122,7 +122,7 @@ func TestReplyAnswersFromTheHistory(t *testing.T) {
 		t.Fatalf("exit %d: %s%s", code, stdout, stderr)
 	}
 	q.Options = []string{"--help", "-n"}
-	if err := h.record(Payload{ID: "msg_dash", Title: "Flags?", Priority: "default", SentAt: testNow, Reply: &q}); err != nil {
+	if _, err := h.record(Payload{ID: "msg_dash", Title: "Flags?", Priority: "default", SentAt: testNow, Reply: &q}); err != nil {
 		t.Fatal(err)
 	}
 	api.status["POST /v1/replies/msg_dash"] = http.StatusCreated

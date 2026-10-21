@@ -55,6 +55,15 @@ func TestTiming(t *testing.T) {
 	if got := Timing(e); got != "Sent Wed 14 Oct 2026, 07:12 · received Wed 14 Oct 2026, 09:40 (delayed 2 h 28 min)" {
 		t.Errorf("delayed: %q", got)
 	}
+	e = histfile.Entry{SentAt: sent, ReceivedAt: sent, RemindAt: sent + 3600}
+	if got := Timing(e); got != "Received Wed 14 Oct 2026, 07:12 · reminder Wed 14 Oct 2026, 08:12" {
+		t.Errorf("snoozed: %q", got)
+	}
+	// Received when its reminder showed, not delayed.
+	e = histfile.Entry{SentAt: sent, ReceivedAt: sent + 3600, Reminded: true}
+	if got := Timing(e); got != "Received Wed 14 Oct 2026, 08:12" {
+		t.Errorf("reminded: %q", got)
+	}
 }
 
 func TestSearch(t *testing.T) {
